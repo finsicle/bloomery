@@ -160,6 +160,11 @@ class TestTrain:
         assert "not both" in plain(result.stdout)
 
     def test_sequence_longer_than_corpus_is_a_clear_error(self) -> None:
+        """--force skips the memory guard so the corpus check is what is tested.
+
+        Without it the pre-flight estimate rejects a 500k sequence first, which
+        is correct behaviour but a different error from the one this covers.
+        """
         result = _invoke(
             "train",
             "--data",
@@ -172,6 +177,7 @@ class TestTrain:
             "500000",
             "--device",
             "cpu",
+            "--force",
         )
         assert result.exit_code == 1
         assert "not enough" in plain(result.stdout) or "shorter --seq" in plain(result.stdout)
@@ -638,3 +644,140 @@ class TestTrainOnMixture:
         assert result.exit_code == 0, plain(result.stdout)
         # v1 is a single component, so no mixture line is printed.
         assert "replay share" not in plain(result.stdout)
+
+
+class TestMemoryGuard:
+    """The pre-flight check that stops a run before it OOMs partway through."""
+
+    @pytest.fixture(autouse=True)
+    def prepared(self, isolated_home: Path) -> None:
+        assert (
+            _invoke("prepare", "--name", "d", "--synthetic", "600", "--vocab", "300").exit_code == 0
+        )
+
+    def test_reports_the_estimate_before_training(self) -> None:
+        result = _invoke(
+            "train",
+            "--data",
+            "d",
+            "--name",
+            "r",
+            "--depth",
+            "1",
+            "--steps",
+            "2",
+            "--batch",
+            "2",
+            "--seq",
+            "32",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        assert "memory" in plain(result.stdout)
+        assert "GiB needed of" in plain(result.stdout)
+
+    def test_refuses_a_configuration_that_cannot_fit(self) -> None:
+        result = _invoke(
+            "train",
+            "--data",
+            "d",
+            "--name",
+            "r",
+            "--depth",
+            "64",
+            "--steps",
+            "2",
+            "--batch",
+            "64",
+            "--seq",
+            "8192",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 1
+        out = plain(result.stdout)
+        assert "needs about" in out
+        assert "is available" in out
+
+    def test_the_refusal_offers_a_concrete_fix(self) -> None:
+        result = _invoke(
+            "train",
+            "--data",
+            "d",
+            "--name",
+            "r",
+            "--depth",
+            "48",
+            "--steps",
+            "2",
+            "--batch",
+            "32",
+            "--seq",
+            "4096",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 1
+        out = plain(result.stdout)
+        assert "try one of" in out
+        # Checkpointing is off by default, so it is the largest single saving.
+        assert "--grad-checkpoint" in out
+
+    def test_force_overrides_the_refusal(self) -> None:
+        """The estimate is conservative, so there has to be a way past it."""
+        result = _invoke(
+            "train",
+            "--data",
+            "d",
+            "--name",
+            "r",
+            "--depth",
+            "10",
+            "--steps",
+            "1",
+            "--batch",
+            "8",
+            "--seq",
+            "256",
+            "--device",
+            "cpu",
+            "--force",
+        )
+        # Either it trained, or it failed for a real reason rather than the guard.
+        assert "--force given" in plain(result.stdout) or result.exit_code == 0
+
+    def test_guard_judges_a_cpu_run_against_ram_not_vram(self) -> None:
+        """A GPU on the box is irrelevant when --device cpu was asked for."""
+        from bloomery.capability import check_fit
+        from bloomery.probe.types import (
+            CpuInfo,
+            DiskInfo,
+            GpuInfo,
+            HostInfo,
+            HostReport,
+            MemoryInfo,
+            Platform,
+            Vendor,
+        )
+
+        gib = 1024**3
+        report = HostReport(
+            host=HostInfo(
+                platform=Platform.LINUX,
+                system="Linux",
+                release="6.8",
+                machine="x86_64",
+                python_version="3.12",
+            ),
+            cpu=CpuInfo(physical_cores=8, logical_cores=16),
+            memory=MemoryInfo(total=4 * gib, available=4 * gib),
+            disk=DiskInfo(path="/tmp", total=100 * gib, free=90 * gib),
+            gpus=[GpuInfo(index=0, vendor=Vendor.NVIDIA, name="A100", vram_total=80 * gib)],
+        )
+        from bloomery.capability import LADDER_BY_KEY
+
+        on_gpu = check_fit(report, LADDER_BY_KEY["1b"], batch=4, seq=1024, device_type="cuda")
+        on_cpu = check_fit(report, LADDER_BY_KEY["1b"], batch=4, seq=1024, device_type="cpu")
+        assert on_gpu.fits
+        assert not on_cpu.fits

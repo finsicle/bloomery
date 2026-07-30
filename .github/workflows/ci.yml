@@ -24,27 +24,11 @@ jobs:
   # exactly why the vendor parsers are fixture-driven.
   test:
     runs-on: ${{ matrix.os }}
-    # Windows on 3.13 is kept in the matrix but not allowed to block, because it
-    # is *intermittently* fatal. One run died with a native illegal-instruction
-    # fault (Windows exception 0xc000001d) partway into a training step; the next
-    # run of the same commit passed. It is a hard crash in the wheel rather than
-    # an assertion failure, and nothing in this codebase reaches it — Windows
-    # 3.11 and 3.12 have never shown it on the same runner image.
-    #
-    # Non-blocking rather than removed: deleting the entry would hide a real
-    # flake, while letting it block would stall merges on something we cannot fix
-    # here. If it starts failing consistently rather than occasionally, that is
-    # worth an upstream report — capture the faulthandler traceback first.
-    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.11", "3.12", "3.13"]
-        include:
-          - os: windows-latest
-            python: "3.13"
-            experimental: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -92,9 +76,33 @@ jobs:
           python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__)"
           python -c "import sys; assert sys.version_info[:2] == tuple(int(p) for p in '${{ matrix.python }}'.split('.')), sys.version_info"
 
+      # PyTorch on Windows intermittently dies with a native illegal-instruction
+      # fault (Windows exception 0xc000001d) partway into a training step. It has
+      # been seen on 3.11 and 3.13, passes on a re-run of the same commit, and is
+      # a crash inside the wheel rather than anything this codebase reaches.
+      #
+      # Retried only for the fault signals, listed explicitly rather than as
+      # "128 and above". Cancellation surfaces as 130 (SIGINT) or 143 (SIGTERM),
+      # and this workflow sets cancel-in-progress, so a blanket threshold would
+      # rerun the whole suite on a run that is already being cancelled. An
+      # ordinary test failure exits 1 and is never retried, so a real regression
+      # fails on the first attempt and two consecutive crashes fail the job.
       - name: test
         shell: bash
-        run: pytest -q
+        run: |
+          set +e
+          pytest -q
+          status=$?
+          set -e
+          case "$status" in
+            0) exit 0 ;;
+            # 132 SIGILL, 134 SIGABRT, 136 SIGFPE, 138 SIGBUS, 139 SIGSEGV
+            132|134|136|138|139)
+              echo "::warning::pytest crashed with status $status (native fault); retrying once"
+              pytest -q
+              ;;
+            *) exit "$status" ;;
+          esac
 
       # A real invocation on a real machine. Exit 1 is legitimate — it means an
       # error-level issue such as low disk was found — so only a crash fails
