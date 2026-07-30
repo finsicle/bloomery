@@ -13,25 +13,34 @@ from bloomery.probe.pci import list_display_devices, vendors_present
 from bloomery.probe.types import Vendor
 
 
-def _symlinks_available() -> bool:
-    """Whether this platform lets an unprivileged process create a symlink."""
+def _can_build_sysfs_fixture() -> bool:
+    """Whether this platform can represent a sysfs PCI tree on disk.
+
+    Two requirements, both of which Windows fails. PCI slot directories are named
+    like ``0000:01:00.0`` and a colon is not a legal Windows filename character
+    (WinError 123). A bound driver is modelled as a symlink, and creating one
+    needs developer mode or elevation.
+    """
     with tempfile.TemporaryDirectory() as tmp:
-        target = Path(tmp) / "target"
-        target.mkdir()
+        root = Path(tmp)
         try:
-            (Path(tmp) / "link").symlink_to(target)
-        except (OSError, NotImplementedError):
+            (root / "0000:01:00.0").mkdir()
+            target = root / "target"
+            target.mkdir()
+            (root / "link").symlink_to(target)
+        except (OSError, NotImplementedError, ValueError):
             return False
     return True
 
 
-# sysfs models a bound driver as a symlink, so the driver-name tests need real
-# symlinks. Creating one on Windows requires developer mode or elevation. The
-# code under test only ever reads /sys, which exists on Linux alone, so there is
-# genuinely nothing to cover on Windows — a fixture that failed there would say
-# nothing about the Linux behaviour.
-needs_symlinks = pytest.mark.skipif(
-    not _symlinks_available(), reason="symlink creation unavailable on this platform"
+# The code under test reads /sys/bus/pci/devices, which exists only on Linux; on
+# every other platform list_display_devices returns an empty list before touching
+# the filesystem. Skipping here is honest rather than a workaround: there is no
+# Windows behaviour to cover, and a fixture that cannot be built says nothing
+# about the Linux path.
+pytestmark = pytest.mark.skipif(
+    not _can_build_sysfs_fixture(),
+    reason="sysfs PCI fixtures need colons in filenames and symlinks",
 )
 
 
@@ -57,7 +66,6 @@ def add_device(
 
 
 class TestListDisplayDevices:
-    @needs_symlinks
     def test_finds_vga_class_nvidia(self, tmp_path: Path) -> None:
         devices = tmp_path / "devices"
         add_device(
@@ -74,7 +82,6 @@ class TestListDisplayDevices:
         assert found[0].driver == "nvidia"
         assert found[0].device_id == 0x2684
 
-    @needs_symlinks
     def test_finds_headless_compute_class(self, tmp_path: Path) -> None:
         # Datacentre cards report subclass 0x02, not the VGA-compatible 0x00.
         devices = tmp_path / "devices"

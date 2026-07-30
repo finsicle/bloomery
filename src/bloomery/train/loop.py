@@ -317,7 +317,7 @@ def train(
             for group in optimizer.param_groups:
                 group["lr"] = lr
 
-            began = time.monotonic()
+            began = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
 
@@ -342,7 +342,7 @@ def train(
 
             tokens_seen += config.tokens_per_step
             final_loss = step_loss
-            rate = throughput.update(config.tokens_per_step, time.monotonic() - began)
+            rate = throughput.update(config.tokens_per_step, time.perf_counter() - began)
 
             if config.log_every and (step + 1) % config.log_every == 0:
                 record(
