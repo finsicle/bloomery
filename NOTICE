@@ -28,9 +28,11 @@ includes or adapts their source directly, that is noted.
 nanochat — https://github.com/karpathy/nanochat
 MIT License, Copyright (c) 2025 Andrej Karpathy
 
-Bloomery's from-scratch pretraining path is modelled on nanochat, and adapts
-source from it. Adapted files carry their own attribution header alongside the
-bloomery notice.
+An influence, not a dependency. Bloomery's "depth dial" — deriving width, head
+count, MLP size and learning rate from a single layer count — is borrowed in
+spirit from nanochat. No nanochat source is included or adapted; bloomery builds
+on the Llama implementation in `transformers` instead. Credited because the idea
+is worth crediting.
 
 -------------------------------------------------------------------------------
 PyTorch — https://github.com/pytorch/pytorch

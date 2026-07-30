@@ -105,7 +105,7 @@ if ($WithTraining) {
     # --torch-backend=auto inspects the CUDA driver, AMD GPU version and Intel
     # GPU presence and resolves the matching wheel index. It is only available
     # on `uv pip`, which is why this is not a `uv sync`.
-    uv pip install --torch-backend=auto -e ".[train,serve]"
+    uv pip install --torch-backend=auto -e ".[train]"
     Write-Info 'verifying torch can see the hardware'
     Write-Host ''
     & $Bloomery doctor
@@ -113,7 +113,7 @@ if ($WithTraining) {
     Write-Host @'
 Core is installed. To add PyTorch and the training stack:
 
-  uv pip install --torch-backend=auto -e ".[train,serve]"
+  uv pip install --torch-backend=auto -e ".[train]"
 
 or re-run this script with -WithTraining.
 '@

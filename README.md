@@ -2,8 +2,38 @@
 
 **Train a language model from nothing, on your own machine.**
 
-> ⚠️ **Status: pre-alpha.** `bloomery doctor` works today. Nothing trains yet.
-> See [Roadmap](#roadmap) for what's being built and in what order.
+> ⚠️ **Status: pre-alpha.** Pretraining from scratch works today, end to end:
+> tokenizer, packing, training, checkpoint, generation. No web UI yet, and no
+> support for adapting existing models. See [Roadmap](#roadmap).
+
+```bash
+bloomery demo
+```
+
+Trains a language model from random weights on your machine in about a minute,
+then talks to it. No download, no GPU required.
+
+```
+1/4 generated 6,000 synthetic documents
+2/4 trained a 486-token vocabulary
+3/4 packed 125,482 training tokens
+4/4 training 3M params on mps (bfloat16)
+
+  step  300  loss 0.680  15,828 tok/s
+
+trained in 614,400 tokens · final loss 0.680 · val 0.668
+
+samples (the model has never seen these prompts)
+
+  Ana found a shy ball in the river. The bear wanted it too. They shared it and felt calm.
+  One morning Ben walked to the forest. A clever bear was waiting there. Hugo felt proud.
+  The sleepy cat lost its key. Ben looked in the forest and found it. The dog was excited.
+```
+
+That is a 3-million-parameter model that did not exist a minute earlier. It is a
+toy trained on a synthetic grammar — note that it loses track of *who* the story
+is about, which is exactly what 3M parameters buys you — but every step of the
+path is the real one.
 
 ---
 
@@ -30,52 +60,63 @@ libraries. There is nothing that is both.
 | LLaMA-Factory          |      ❌       |           ✅           |    ✅     |     ✅     |
 | Oumi                   |      ✅       |           ✅           |    ✅     |     ❌     |
 | nanochat               |      ✅       |           ✅           |    ✅     |     ❌     |
-| **bloomery**           |    **✅**     |         **✅**         |  **✅**   |   **✅**   |
+| **bloomery**           |    **✅**     |          M4           |    M4    |    M3     |
 
 The tools with the capability are CLI and YAML. The tools with the interface
 start from someone else's weights. Bloomery is from-scratch first, with
-fine-tuning as the natural next step rather than the headline.
+fine-tuning as the natural next step rather than the headline. Cells marked with
+a milestone are not built yet — see [Roadmap](#roadmap).
 
-## Planned capabilities
+### Working today
 
-- **Pretrain from random init** — train your own tokenizer, shard a corpus,
-  pick a size, watch loss come down. A ~10M-parameter model on a laptop in
-  minutes; GPT-2 class on a single consumer GPU overnight.
-- **Continued pretraining** on an existing base model, with **replay mixtures**
-  as a first-class versioned object so adding a new corpus doesn't silently
-  degrade everything the model already knew.
-- **Instruction tuning and preference optimization** — SFT, DPO, ORPO, KTO,
-  full or LoRA/QLoRA.
-- **Honest pre-flight estimates** — VRAM, wall clock, and token budget computed
-  from *your* detected hardware, shown before you start, not discovered at hour
-  six.
-- **Explicit resource allocation** — choose which GPUs, how many CPU cores, how
-  much RAM a job may use.
-- **Export anywhere** — safetensors, GGUF with quantization, Ollama, MLX.
+- **Pretrain from random init** — train your own byte-level BPE tokenizer, pack a
+  corpus, pick a size with one dial, watch loss come down, then generate from the
+  result. Checkpoints are standard Hugging Face directories.
+- **Honest pre-flight estimates** — VRAM and token budget computed from *your*
+  measured hardware, before you start rather than at hour six.
+- **Measured throughput** — `bench` runs real training steps instead of guessing
+  from a peak-FLOPS table.
+- **CPU thread caps** — `--cores` works identically on every platform.
+
+### Not built yet
+
+- **Replay mixtures** (M2) — weighted, versioned dataset blends, so adding a
+  corpus doesn't silently degrade what the model already knew.
+- **Web UI and job queue** (M3), including per-job memory limits and GPU choice.
+- **Continued pretraining, SFT and preference optimization** (M4).
+- **Export to GGUF, Ollama, MLX** (M5).
 
 ## Hardware
 
-| Platform                 | Status  |
-| ------------------------ | ------- |
-| Linux + NVIDIA           | primary |
-| Linux + AMD (ROCm)       | primary |
-| Windows + NVIDIA (WSL2)  | planned |
-| Windows + AMD (WSL2)     | planned |
-| macOS (Apple Silicon)    | planned, small models only |
-| CPU only                 | toy models only |
+| Platform                | Status                                                    |
+| ----------------------- | --------------------------------------------------------- |
+| macOS (Apple Silicon)   | training verified on an M1 via Metal, small models only    |
+| CPU only                | training verified; toy models only                         |
+| Linux + NVIDIA          | detection covered by tests; training not yet run on real hardware |
+| Linux + AMD (ROCm)      | detection covered by tests; training not yet run on real hardware |
+| Windows (WSL2)          | detection covered by tests; supported path on Windows      |
+| Windows (native)        | best-effort                                                |
+
+Being precise rather than optimistic: the GPU probe is exercised against captured
+vendor output on every CI run across three operating systems, but only Metal and
+CPU have had a real model trained on them so far. If you have NVIDIA or AMD
+hardware, `bloomery doctor --json` in an issue is genuinely useful.
 
 ## Roadmap
 
-| Milestone | Scope                                                          |
-| --------- | -------------------------------------------------------------- |
-| **M0**    | `bloomery doctor` — hardware probe and install script           |
-| **M1**    | Vertical slice: train a tiny model from scratch, then chat with it |
-| **M2**    | Job queue, cancel, resume, resource limits, crash recovery      |
-| **M3**    | Data layer — ingest, tokenize, shard, mixture builder           |
-| **M4**    | Continued pretraining and SFT engine                            |
-| **M5**    | Export — GGUF, quantization, Ollama, Hugging Face               |
-| **M6**    | AMD hardening, Windows, macOS MPS                               |
-| **M7**    | Evaluation and inference playground                             |
+| Milestone | Scope                                                             | Status |
+| --------- | ----------------------------------------------------------------- | ------ |
+| **M0**    | `bloomery doctor` — hardware probe, capability estimator, installers | done |
+| **M1**    | Pretrain from scratch end to end, then generate from it            | done |
+| **M2**    | Replay mixtures — weighted, versioned dataset blends               | next |
+| **M3**    | Web UI, job queue, cancel/resume, resource limits                  |        |
+| **M4**    | Continued pretraining and SFT on existing models                   |        |
+| **M5**    | Export — GGUF, quantization, Ollama                                |        |
+| **M6**    | AMD hardening on real hardware, Windows, evaluation                |        |
+
+M2 is the mixture builder rather than the web UI, because weighted replay is what
+makes "keep adding datasets" work instead of quietly degrading the model — and
+it is the part no comparable tool has.
 
 ## Install
 
@@ -95,12 +136,41 @@ step, and there is no point spending that download before you know which backend
 you need:
 
 ```bash
-uv pip install --torch-backend=auto -e ".[train,serve]"
+uv pip install --torch-backend=auto -e ".[train]"
 ```
 
 `--torch-backend=auto` inspects your CUDA driver, AMD GPU version or Intel GPU
 and resolves the matching wheel index by itself. That one flag is most of what
 made dropping Docker viable.
+
+## Training something real
+
+```bash
+bloomery prepare --name mine --source ./my-text --vocab 8192
+bloomery train   --data mine --depth 8 --steps 5000
+bloomery chat    --run run1
+```
+
+`prepare` trains a byte-level BPE tokenizer on your corpus and packs it into
+memory-mapped token shards. Do it once per corpus; every model you train on it
+reuses the result.
+
+`train` starts from random weights. **`--depth` is the only shape knob you need**
+— width, head count, MLP size and learning rate are all derived from it, so
+there are not twelve numbers to get wrong. `--size d12` picks a named preset
+instead.
+
+Checkpoints are ordinary Hugging Face directories. `AutoModelForCausalLM.from_pretrained`
+loads them, which is the whole reason bloomery emits a Llama-architecture model
+rather than inventing one — GGUF conversion, vLLM and Ollama all work without a
+bespoke converter.
+
+```bash
+bloomery bench --size d12
+```
+
+Measures real training throughput on your machine and tells you what a
+compute-optimal run would actually cost in hours.
 
 ## `bloomery doctor`
 

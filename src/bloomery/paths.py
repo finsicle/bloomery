@@ -44,6 +44,34 @@ def cache_dir() -> Path:
     return home() / "cache"
 
 
+def dataset_dir(name: str) -> Path:
+    """Everything produced by `prepare` for one named corpus."""
+    return datasets_dir() / _slug(name)
+
+
+def tokenizer_dir(name: str) -> Path:
+    return dataset_dir(name) / "tokenizer"
+
+
+def tokens_dir(name: str) -> Path:
+    return dataset_dir(name) / "tokens"
+
+
+def run_dir(name: str) -> Path:
+    return runs_dir() / _slug(name)
+
+
+def _slug(name: str) -> str:
+    """Make a user-supplied name safe to use as a directory.
+
+    Names come from the CLI and will later come from a web form, so this must
+    never allow a path to escape the bloomery home.
+    """
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in name.strip())
+    cleaned = cleaned.strip(".-") or "unnamed"
+    return cleaned[:64]
+
+
 def db_path() -> Path:
     return home() / "bloomery.db"
 

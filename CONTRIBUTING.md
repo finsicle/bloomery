@@ -40,11 +40,10 @@ uv venv
 uv pip install -e ".[dev]"
 ```
 
-Once the training path exists, add the framework layer with the backend
-resolved for your GPU:
+To run the training tests you also need PyTorch, resolved for your GPU:
 
 ```bash
-uv pip install --torch-backend=auto -e ".[dev,train,serve]"
+uv pip install --torch-backend=auto -e ".[dev,train]"
 ```
 
 ## Checks

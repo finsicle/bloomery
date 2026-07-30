@@ -44,15 +44,22 @@ dependencies = [
 # Torch itself is resolved by `uv pip install --torch-backend=auto`, which
 # detects CUDA / ROCm / XPU / CPU and picks the matching wheel. These extras
 # carry the framework layer that sits on top of whichever build got selected.
+# Pretraining from scratch. Kept minimal — this is the install a first-time user
+# pays for, and nothing here is optional to that path.
 train = [
     "torch>=2.6",
     "transformers>=4.44",
+    "tokenizers>=0.20",
+    "safetensors>=0.4",
+    "numpy>=1.26",
+]
+# Adapting an existing model: LoRA, QLoRA, preference optimization. Heavier, and
+# not needed to train your first model, so it is a separate opt-in.
+adapt = [
     "accelerate>=0.34",
     "peft>=0.13",
     "trl>=0.11",
     "datasets>=3.0",
-    "tokenizers>=0.20",
-    "safetensors>=0.4",
 ]
 serve = [
     "fastapi>=0.115",
@@ -93,17 +100,31 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 # Test fixtures are verbatim captures of vendor tool output. Rewrapping them to
 # fit a line limit would stop them being faithful samples.
 "tests/*" = ["E501"]
+# typer declares CLI options as argument defaults; that is the framework's
+# documented idiom, not the mutable-default bug B008 exists to catch.
+"src/bloomery/cli.py" = ["B008"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [tool.mypy]
-python_version = "3.11"
+# Deliberately not pinned to 3.11. numpy's bundled stubs use `type` statements,
+# which mypy only accepts when told it is checking 3.12 or newer — so pinning to
+# our minimum runtime version makes numpy itself unanalysable. Runtime support
+# for 3.11 is verified by the CI test matrix instead.
 warn_unused_ignores = true
 warn_redundant_casts = true
 
-# torch lives in an optional extra, so it is legitimately absent when the core
-# package is type-checked. The probe already guards the import at runtime.
+# Optional extras and untyped third parties. torch and transformers are legitimately
+# absent when the core package alone is installed; the probe guards those imports at
+# runtime. tokenizers ships no py.typed marker.
 [[tool.mypy.overrides]]
-module = ["torch", "torch.*"]
+module = [
+    "torch",
+    "torch.*",
+    "transformers",
+    "transformers.*",
+    "tokenizers",
+    "tokenizers.*",
+]
 ignore_missing_imports = true

@@ -34,11 +34,24 @@ jobs:
       - name: set up python
         run: uv python install ${{ matrix.python }}
 
+      # The train extra is not optional here. conftest.py skips the training
+      # suite when torch is missing, so installing only [dev] would quietly drop
+      # two thirds of the tests and report green.
       - name: install
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install --system --torch-backend=auto -e ".[dev,train]"
 
+      # A skip here is a failure, not a pass: it means torch is missing and the
+      # training suite silently did not run. Checked in the same invocation
+      # rather than a second one, so CI does not pay for the suite twice.
       - name: test
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q 2>&1 | tee pytest-out.txt
+          if grep -qE '[0-9]+ skipped' pytest-out.txt; then
+            echo "::error::tests were skipped — the train extra is probably missing"
+            exit 1
+          fi
 
       # A real invocation on a real machine. Exit 1 is legitimate — it means an
       # error-level issue such as low disk was found — so only a crash fails
@@ -70,7 +83,7 @@ jobs:
         with:
           enable-cache: true
 
-      - run: uv pip install --system -e ".[dev]"
+      - run: uv pip install --system --torch-backend=auto -e ".[dev,train]"
 
       - name: ruff check
         run: ruff check .
