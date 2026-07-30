@@ -81,9 +81,12 @@ jobs:
       # been seen on 3.11 and 3.13, passes on a re-run of the same commit, and is
       # a crash inside the wheel rather than anything this codebase reaches.
       #
-      # Retried only for signal-level exits (128 and above). An ordinary test
-      # failure exits 1 and is never retried, so a real regression still fails on
-      # the first attempt and two consecutive crashes still fail the job.
+      # Retried only for the fault signals, listed explicitly rather than as
+      # "128 and above". Cancellation surfaces as 130 (SIGINT) or 143 (SIGTERM),
+      # and this workflow sets cancel-in-progress, so a blanket threshold would
+      # rerun the whole suite on a run that is already being cancelled. An
+      # ordinary test failure exits 1 and is never retried, so a real regression
+      # fails on the first attempt and two consecutive crashes fail the job.
       - name: test
         shell: bash
         run: |
@@ -91,14 +94,15 @@ jobs:
           pytest -q
           status=$?
           set -e
-          if [ "$status" -eq 0 ]; then
-            exit 0
-          fi
-          if [ "$status" -lt 128 ]; then
-            exit "$status"
-          fi
-          echo "::warning::pytest crashed with status $status (native fault); retrying once"
-          pytest -q
+          case "$status" in
+            0) exit 0 ;;
+            # 132 SIGILL, 134 SIGABRT, 136 SIGFPE, 138 SIGBUS, 139 SIGSEGV
+            132|134|136|138|139)
+              echo "::warning::pytest crashed with status $status (native fault); retrying once"
+              pytest -q
+              ;;
+            *) exit "$status" ;;
+          esac
 
       # A real invocation on a real machine. Exit 1 is legitimate — it means an
       # error-level issue such as low disk was found — so only a crash fails
