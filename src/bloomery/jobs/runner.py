@@ -161,6 +161,10 @@ def build_environment(request: ResourceRequest) -> dict[str, str]:
     # being explicit keeps the captured log free of escape sequences.
     env["NO_COLOR"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
+    # Belt and braces with the CLI's own stream reconfiguration. Redirected
+    # output on Windows otherwise defaults to the locale codec, which cannot
+    # encode the arrows the reports use.
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 

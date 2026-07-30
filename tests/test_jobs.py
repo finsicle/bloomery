@@ -603,3 +603,52 @@ class TestRealJob:
         assert done.exit_code == 0
         # The job really did the work, not just exit zero.
         assert (home / "datasets" / "queued-corpus" / "tokens" / "meta.json").is_file()
+
+
+class TestOutputEncoding:
+    """Redirected output must not depend on the platform's locale codec.
+
+    Windows uses cp1252 whenever stdout is not a console, which is exactly the
+    case when output is redirected to a file or captured by the job runner. The
+    reports contain "→" and "×", none of which cp1252 can encode, so commands
+    died with UnicodeEncodeError partway through printing instead of doing their
+    work. Reproducible anywhere by forcing the codec.
+    """
+
+    def test_reports_survive_a_legacy_codec(self, tmp_path: Path) -> None:
+        import subprocess
+
+        env = dict(**__import__("os").environ)
+        env["PYTHONIOENCODING"] = "cp1252"
+        env["BLOOMERY_HOME"] = str(tmp_path / "home")
+        env["NO_COLOR"] = "1"
+        log = tmp_path / "out.log"
+
+        with log.open("wb") as handle:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "bloomery.cli",
+                    "prepare",
+                    "--name",
+                    "enc",
+                    "--synthetic",
+                    "200",
+                    "--vocab",
+                    "300",
+                ],
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                env=env,
+                check=False,
+                timeout=300,
+            )
+
+        output = log.read_text(encoding="utf-8", errors="replace")
+        assert result.returncode == 0, output
+        assert "UnicodeEncodeError" not in output
+
+    def test_the_runner_pins_the_child_encoding(self) -> None:
+        env = runner.build_environment(ResourceRequest())
+        assert env["PYTHONIOENCODING"] == "utf-8"
