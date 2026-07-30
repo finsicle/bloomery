@@ -18,13 +18,17 @@ jobs:
   # exactly why the vendor parsers are fixture-driven.
   test:
     runs-on: ${{ matrix.os }}
-    # Windows on 3.13 is kept in the matrix but not allowed to block. PyTorch
-    # crashes there with a native illegal-instruction fault (0xc000001d) partway
-    # into a training step — not an assertion failure, and not reachable from
-    # this codebase. Windows 3.11 and 3.12 pass on the same runner image, so the
-    # fault is specific to the cp313 wheel. Keeping the entry means we find out
-    # when upstream fixes it; making it non-blocking means it does not hold up
-    # every merge until then.
+    # Windows on 3.13 is kept in the matrix but not allowed to block, because it
+    # is *intermittently* fatal. One run died with a native illegal-instruction
+    # fault (Windows exception 0xc000001d) partway into a training step; the next
+    # run of the same commit passed. It is a hard crash in the wheel rather than
+    # an assertion failure, and nothing in this codebase reaches it — Windows
+    # 3.11 and 3.12 have never shown it on the same runner image.
+    #
+    # Non-blocking rather than removed: deleting the entry would hide a real
+    # flake, while letting it block would stall merges on something we cannot fix
+    # here. If it starts failing consistently rather than occasionally, that is
+    # worth an upstream report — capture the faulthandler traceback first.
     continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
