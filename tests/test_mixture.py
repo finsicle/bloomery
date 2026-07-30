@@ -230,6 +230,50 @@ class TestLineage:
         chain = mix.lineage(mix.load("b", 2))
         assert len(chain) <= 2
 
+    def test_mismatched_filename_and_payload_cannot_loop(self) -> None:
+        """The cycle guard must key on requested versions, not reported ones.
+
+        With v1.json claiming version 100 and v2.json claiming 200, a guard that
+        records the *payload* version never sees the values the parent pointers
+        actually reference, so it follows 1 -> 2 -> 1 forever. Reproduced as an
+        unbounded loop before load() started rejecting the mismatch.
+        """
+        import json
+
+        directory = mix.mixture_dir("b")
+        directory.mkdir(parents=True)
+        for name, version, parent in (("v1.json", 100, 2), ("v2.json", 200, 1)):
+            (directory / name).write_text(
+                json.dumps(
+                    {
+                        "name": "b",
+                        "version": version,
+                        "parent_version": parent,
+                        "components": [{"dataset": "a", "weight": 1}],
+                    }
+                )
+            )
+        with pytest.raises(MixtureError, match="must agree"):
+            mix.load("b", 1)
+
+    def test_load_rejects_a_payload_that_disagrees_with_its_filename(self) -> None:
+        import json
+
+        directory = mix.mixture_dir("b")
+        directory.mkdir(parents=True)
+        (directory / "v1.json").write_text(
+            json.dumps(
+                {
+                    "name": "b",
+                    "version": 7,
+                    "parent_version": None,
+                    "components": [{"dataset": "a", "weight": 1}],
+                }
+            )
+        )
+        with pytest.raises(MixtureError, match="v1.json contains version 7"):
+            mix.load("b", 1)
+
     def test_self_referential_parent_terminates(self) -> None:
         import json
 

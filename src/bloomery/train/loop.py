@@ -254,9 +254,12 @@ def train(
     start_step = 0
     tokens_seen = 0
     best_val: float | None = None
+    resume_state: checkpoint.ResumeState | None = None
     if resume_from is not None:
-        state = checkpoint.load_resume_state(resume_from, optimizer)
-        start_step, tokens_seen, best_val = state.step, state.tokens_seen, state.best_val_loss
+        resume_state = checkpoint.load_resume_state(resume_from, optimizer)
+        start_step = resume_state.step
+        tokens_seen = resume_state.tokens_seen
+        best_val = resume_state.best_val_loss
 
     # fp16 needs loss scaling to keep small gradients from flushing to zero.
     # bf16 has the exponent range to avoid this, so the scaler stays disabled.
@@ -272,7 +275,13 @@ def train(
     except (ValueError, FileNotFoundError, KeyError):
         val_sampler = None
 
+    # Seeded from the checkpoint when resuming, so a component that was already
+    # regressing before the interruption keeps its history instead of having its
+    # first post-resume reading mistaken for a baseline.
     tracker = ForgettingTracker()
+    if resume_state is not None:
+        tracker.best.update(resume_state.component_best)
+        tracker.first.update(resume_state.component_first)
     last_per_component: dict[str, float] = {}
     last_regressed: dict[str, float] = {}
     history: list[dict[str, Any]] = []
@@ -404,6 +413,8 @@ def train(
                     step=step + 1,
                     tokens_seen=tokens_seen,
                     best_val_loss=best_val,
+                    component_best=dict(tracker.best),
+                    component_first=dict(tracker.first),
                     extra={
                         "spec": asdict(spec),
                         "config": config.to_dict(),
@@ -420,6 +431,8 @@ def train(
             step=config.steps,
             tokens_seen=tokens_seen,
             best_val_loss=best_val,
+            component_best=dict(tracker.best),
+            component_first=dict(tracker.first),
             extra={
                 "spec": asdict(spec),
                 "config": config.to_dict(),

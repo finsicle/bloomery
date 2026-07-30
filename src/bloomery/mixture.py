@@ -302,7 +302,17 @@ def load(name: str, version: int | None = None) -> Mixture:
         listed = ", ".join(f"v{v}" for v in available)
         raise MixtureError(f"{name!r} has no v{wanted}; available: {listed}")
     path = mixture_dir(name) / f"v{wanted}.json"
-    return Mixture.from_dict(json.loads(path.read_text()))
+    loaded = Mixture.from_dict(json.loads(path.read_text()))
+    if loaded.version != wanted:
+        # The filename is the identity everything else keys off — parent
+        # pointers, `versions()`, the immutability check in save(). A payload
+        # that disagrees with its own filename makes those disagree too, so it
+        # is corruption rather than something to paper over.
+        raise MixtureError(
+            f"{path.name} contains version {loaded.version}; the file name and "
+            "its contents must agree"
+        )
+    return loaded
 
 
 def list_all() -> list[Mixture]:
@@ -327,18 +337,21 @@ def lineage(mixture: Mixture) -> list[Mixture]:
     """
     chain = [mixture]
     current = mixture
-    # Version files are plain JSON on disk and can be hand-edited, so a parent
-    # pointer that loops back on itself is reachable. Without this guard that
-    # would hang the CLI rather than fail.
+    # Track the versions we have *asked for*, not the ones the payloads report.
+    # Those are the values the parent pointers are compared against, and keying
+    # on the payload instead lets a file whose contents disagree with its name
+    # cycle forever. load() now rejects that mismatch, so this is belt and
+    # braces — but lineage must not be the thing that hangs when it is wrong.
     seen = {mixture.version}
     while current.parent_version is not None:
-        if current.parent_version in seen:
+        wanted = current.parent_version
+        if wanted in seen:
             break
+        seen.add(wanted)
         try:
-            current = load(current.name, current.parent_version)
+            current = load(current.name, wanted)
         except (MixtureError, OSError, json.JSONDecodeError):
             break
-        seen.add(current.version)
         chain.append(current)
     return list(reversed(chain))
 

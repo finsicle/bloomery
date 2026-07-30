@@ -11,6 +11,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job here only reads the source tree. Without this the workflow inherits
+# whatever the repository or organisation default happens to be, which may
+# include write scopes it has no use for.
+permissions:
+  contents: read
+
 jobs:
   # The matrix is the point. This project's stated top risk is the install and
   # hardware-detection matrix, so the probe has to be exercised on all three
@@ -40,10 +46,10 @@ jobs:
             python: "3.13"
             experimental: true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
@@ -106,7 +112,12 @@ jobs:
       - name: doctor emits valid json
         shell: bash
         run: |
-          bloomery doctor --json > report.json || true
+          doctor_status=0
+          bloomery doctor --json > report.json || doctor_status=$?
+          if [ "$doctor_status" -gt 1 ]; then
+            echo "::error::doctor --json crashed with status $doctor_status"
+            exit 1
+          fi
           python - <<'PY'
           import json
           with open("report.json") as handle:
@@ -121,9 +132,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
@@ -149,9 +160,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v9.0.0
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: build wheel and sdist
         run: uv build

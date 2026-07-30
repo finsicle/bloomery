@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +32,11 @@ class ResumeState:
     step: int
     best_val_loss: float | None
     tokens_seen: int
+    # Per-component forgetting history. Without it a resumed run treats its first
+    # evaluation as a baseline, so a component that was already degrading before
+    # the checkpoint is reported as healthy.
+    component_best: dict[str, float] = field(default_factory=dict)
+    component_first: dict[str, float] = field(default_factory=dict)
 
 
 def checkpoint_dir(run_dir: Path, step: int | None = None) -> Path:
@@ -48,6 +53,8 @@ def save(
     step: int,
     tokens_seen: int,
     best_val_loss: float | None,
+    component_best: dict[str, float] | None = None,
+    component_first: dict[str, float] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> Path:
     """Write a complete, resumable checkpoint atomically."""
@@ -67,6 +74,8 @@ def save(
             "step": step,
             "tokens_seen": tokens_seen,
             "best_val_loss": best_val_loss,
+            "component_best": component_best or {},
+            "component_first": component_first or {},
         },
         staging / TRAINER_STATE,
     )
@@ -110,6 +119,10 @@ def load_resume_state(
         step=int(payload.get("step", 0)),
         best_val_loss=payload.get("best_val_loss"),
         tokens_seen=int(payload.get("tokens_seen", 0)),
+        # Absent in checkpoints written before forgetting was tracked; an empty
+        # history simply means the next evaluation establishes the baseline.
+        component_best=dict(payload.get("component_best") or {}),
+        component_first=dict(payload.get("component_first") or {}),
     )
 
 
