@@ -85,9 +85,17 @@ PyTorch build for your GPU automatically.
 
 ## License
 
-**Not yet decided.** No license file is present, which means default copyright
-applies and no usage rights are granted for now. This will be resolved before
-the first release.
+**GNU Affero General Public License v3.0 or later** — see [LICENSE](LICENSE).
+
+In plain terms: use it, modify it, run it, sell services around it. If you
+distribute a modified version — or offer one to users over a network — you have
+to make your source available under the same terms. You cannot build a
+proprietary product on top of bloomery and keep it closed.
+
+Contributions are accepted under a [Contributor License Agreement](CLA.md),
+which keeps open the possibility of offering commercial licenses to
+organisations that cannot use AGPL software. You keep the copyright in your
+work.
 
 ### A note on model licenses
 

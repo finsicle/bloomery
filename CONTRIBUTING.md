@@ -66,7 +66,20 @@ add rocm device enumeration to doctor
 
 ## Licensing of contributions
 
-The project license is not yet decided. Until it is, please do not submit
-substantial code contributions — the terms you would be contributing under
-aren't defined yet, which isn't fair to you. Issues and discussion are very
-welcome in the meantime.
+Bloomery is **AGPL-3.0-or-later**. Contributions are accepted under a
+[Contributor License Agreement](CLA.md) — you keep your copyright, and the
+project gains the right to also offer commercial licenses to organisations that
+cannot use AGPL software.
+
+Signing happens on your first pull request: a bot comments with a link and you
+confirm there. Nothing to print or email.
+
+If you'd rather not sign, issues, reviews, hardware reports and design
+discussion are all still very welcome and require no agreement.
+
+New source files should carry the two-line header:
+
+```python
+# SPDX-FileCopyrightText: 2026 Aswin Alexander Sam
+# SPDX-License-Identifier: AGPL-3.0-or-later
+```

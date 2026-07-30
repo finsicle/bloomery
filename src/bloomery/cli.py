@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Aswin Alexander Sam
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Command line entry point.
 
 Currently a placeholder. The first real command will be `bloomery doctor`,

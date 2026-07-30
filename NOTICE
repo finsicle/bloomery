@@ -1,0 +1,63 @@
+bloomery
+Copyright (C) 2026 Aswin Alexander Sam
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License along
+with this program. If not, see <https://www.gnu.org/licenses/>.
+
+The full license text is in the file LICENSE.
+
+
+===============================================================================
+THIRD-PARTY COMPONENTS
+===============================================================================
+
+Bloomery builds on the following works. Their licenses are compatible with the
+AGPL, and their terms continue to apply to their own code. Where bloomery
+includes or adapts their source directly, that is noted.
+
+-------------------------------------------------------------------------------
+nanochat — https://github.com/karpathy/nanochat
+MIT License, Copyright (c) 2025 Andrej Karpathy
+
+Bloomery's from-scratch pretraining path is modelled on nanochat, and adapts
+source from it. Adapted files carry their own attribution header alongside the
+bloomery notice.
+
+-------------------------------------------------------------------------------
+PyTorch — https://github.com/pytorch/pytorch
+BSD-3-Clause, Copyright (c) Meta Platforms, Inc. and affiliates
+
+Used as a dependency.
+
+-------------------------------------------------------------------------------
+transformers, accelerate, peft, trl, datasets, tokenizers, safetensors
+https://github.com/huggingface
+Apache License 2.0, Copyright The HuggingFace Team
+
+Used as dependencies.
+
+-------------------------------------------------------------------------------
+llama.cpp — https://github.com/ggml-org/llama.cpp
+MIT License, Copyright (c) 2023-2026 The ggml authors
+
+Used for GGUF conversion and quantization.
+
+-------------------------------------------------------------------------------
+bitsandbytes — https://github.com/bitsandbytes-foundation/bitsandbytes
+MIT License, Copyright (c) Facebook, Inc. and its affiliates; Tim Dettmers
+
+Used as an optional dependency for quantized training.
+
+-------------------------------------------------------------------------------
+
+Attribution is added here as components are introduced. If you contribute code
+derived from a third-party source, add it in the same form.

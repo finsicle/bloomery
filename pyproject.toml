@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,7 +8,9 @@ version = "0.0.0"
 description = "Train a language model from nothing, on your own machine."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "aswinsam", email = "aswinsam@gmail.com" }]
+authors = [{ name = "Aswin Alexander Sam", email = "aswinsam@gmail.com" }]
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
 keywords = [
     "llm",
     "pretraining",
@@ -19,6 +21,8 @@ keywords = [
     "rocm",
     "cuda",
 ]
+# No license classifier: PEP 639 deprecates them in favour of the SPDX
+# expression in `license` above.
 classifiers = [
     "Development Status :: 1 - Planning",
     "Intended Audience :: Developers",
@@ -27,9 +31,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-
-# NOTE: `license` and the corresponding classifier are intentionally omitted
-# until the license decision is made. Add both together when it is.
 
 # Kept deliberately light so the placeholder release installs fast.
 # Anything torch-shaped belongs in an extra, never here.
