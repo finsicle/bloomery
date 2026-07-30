@@ -87,9 +87,23 @@ class Supervisor:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
-        if cancel_running:
-            for job_id in list(self._running):
-                self.cancel(job_id)
+        if not cancel_running:
+            return
+
+        # Signal every tree at once. Cancelling serially would pay the full
+        # grace period per job, so shutting down four jobs would take a minute.
+        with self._lock:
+            entries = list(self._running.items())
+            self._running.clear()
+            pids = [entry.launched.pid for _, entry in entries]
+            for job_id, _ in entries:
+                job = self.store.get(job_id)
+                if job is not None and not job.status.terminal:
+                    self.store.mark_finished(job_id, JobStatus.CANCELLED)
+
+        runner.terminate_all(pids)
+        for job_id, _ in entries:
+            self._after_change(job_id)
 
     def reconcile(self) -> list[Job]:
         """Account for jobs the store still calls running.
@@ -132,7 +146,14 @@ class Supervisor:
         return job
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a queued or running job. Returns whether anything changed."""
+        """Cancel a queued or running job. Returns whether anything changed.
+
+        The bookkeeping happens under the lock; the kill does not. Terminating a
+        process tree waits out the full grace period, and holding the scheduler
+        lock for those seconds would stall every other job — no new work started,
+        no finished work collected — for the duration. That matters most once
+        cancels arrive from HTTP handlers rather than one at a time.
+        """
         with self._lock:
             job = self.store.get(job_id)
             if job is None or job.status.terminal:
@@ -145,11 +166,14 @@ class Supervisor:
 
             entry = self._running.pop(job_id, None)
             pid = entry.launched.pid if entry else job.pid
-            if pid is not None:
-                runner.terminate(pid)
+            # Recorded as cancelled before the process actually dies, so a
+            # concurrent tick() cannot reclassify it from its exit code.
             self.store.mark_finished(job_id, JobStatus.CANCELLED)
-            self._after_change(job_id)
-            return True
+
+        if pid is not None:
+            runner.terminate(pid)
+        self._after_change(job_id)
+        return True
 
     @property
     def running_ids(self) -> list[str]:

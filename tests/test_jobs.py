@@ -454,6 +454,79 @@ class TestSupervisor:
             time.sleep(0.2)
         assert not runner.is_alive(pid, store.get(job.id).pid_created_at)
 
+    def test_cancel_does_not_stall_the_scheduler(
+        self, store: JobStore, tmp_path: Path, stub_command, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killing a tree waits out the grace period; the lock must not be held.
+
+        Otherwise a single cancel freezes all scheduling for up to fifteen
+        seconds — nothing starts, nothing is collected — which matters as soon as
+        cancels arrive from HTTP handlers rather than one at a time.
+        """
+        stub_command(lambda job: sleeper(60))
+        sup = Supervisor(store=store, home=tmp_path, max_concurrent=4, poll_seconds=0.05)
+        victim = sup.submit(JobKind.PREPARE, {})
+        for _ in range(50):
+            sup.tick()
+            if store.get(victim.id).status is JobStatus.RUNNING:
+                break
+            time.sleep(0.05)
+
+        # A termination slow enough that holding the lock would be obvious.
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_terminate(pid, **kwargs):  # noqa: ANN001, ANN003
+            started.set()
+            release.wait(timeout=10)
+            return True
+
+        monkeypatch.setattr(runner, "terminate", slow_terminate)
+
+        canceller = threading.Thread(target=sup.cancel, args=(victim.id,))
+        canceller.start()
+        assert started.wait(timeout=5), "cancel never reached the kill"
+
+        try:
+            # The kill is in flight. Scheduling must still work.
+            other = sup.submit(JobKind.PREPARE, {})
+            acquired = threading.Event()
+
+            def try_tick() -> None:
+                sup.tick()
+                acquired.set()
+
+            ticker = threading.Thread(target=try_tick)
+            ticker.start()
+            assert acquired.wait(timeout=5), "tick() blocked while a cancel was killing"
+            ticker.join(timeout=5)
+            assert store.get(other.id).status is JobStatus.RUNNING
+        finally:
+            release.set()
+            canceller.join(timeout=10)
+            for job in store.find(status=JobStatus.RUNNING, limit=10):
+                if job.pid:
+                    runner.terminate_all([job.pid], grace=1)
+
+    def test_terminate_all_pays_the_grace_period_once(self) -> None:
+        """Shutting down several jobs must not cost one grace period each."""
+        import subprocess
+
+        processes = [subprocess.Popen(sleeper(60)) for _ in range(3)]
+        try:
+            started = time.monotonic()
+            signalled = runner.terminate_all([p.pid for p in processes], grace=5)
+            elapsed = time.monotonic() - started
+            assert signalled >= 3
+            # Serial termination of three trees would exceed one grace period.
+            assert elapsed < 5, f"took {elapsed:.1f}s, suggesting serial waits"
+            for process in processes:
+                process.wait(timeout=10)
+        finally:
+            for process in processes:
+                if process.poll() is None:  # pragma: no cover - cleanup
+                    process.kill()
+
     def test_cancelling_a_finished_job_changes_nothing(
         self, store: JobStore, tmp_path: Path
     ) -> None:

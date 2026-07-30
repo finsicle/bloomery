@@ -257,22 +257,30 @@ def launch(
     return Launched(process=process, command=command, limits_note=limits_note)
 
 
-def terminate(pid: int, *, grace: float = TERMINATE_GRACE_SECONDS) -> bool:
-    """Stop a job's process tree. Returns whether anything was killed.
+def _family(pid: int) -> list[psutil.Process]:
+    """A process and its descendants, children first.
 
-    Children first, then the parent, so a worker cannot outlive a dataloader it
-    spawned. Everything is asked politely before being killed, which gives the
-    trainer a chance to finish writing a checkpoint it is midway through.
+    Children first so a worker cannot outlive a dataloader it spawned.
     """
     try:
         parent = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return False
+        return [*parent.children(recursive=True), parent]
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return []
 
-    try:
-        family = [*parent.children(recursive=True), parent]
-    except psutil.NoSuchProcess:
-        return False
+
+def terminate_all(pids: list[int], *, grace: float = TERMINATE_GRACE_SECONDS) -> int:
+    """Stop several process trees, paying the grace period once rather than per tree.
+
+    Everything is signalled first and waited on together. Cancelling four jobs
+    one at a time would otherwise cost four full grace periods in sequence.
+    Returns how many processes were signalled.
+    """
+    family: list[psutil.Process] = []
+    for pid in pids:
+        family.extend(_family(pid))
+    if not family:
+        return 0
 
     for member in family:
         try:
@@ -287,7 +295,16 @@ def terminate(pid: int, *, grace: float = TERMINATE_GRACE_SECONDS) -> bool:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
     psutil.wait_procs(alive, timeout=5)
-    return True
+    return len(family)
+
+
+def terminate(pid: int, *, grace: float = TERMINATE_GRACE_SECONDS) -> bool:
+    """Stop one job's process tree. Returns whether anything was signalled.
+
+    Everything is asked politely before being killed, which gives the trainer a
+    chance to finish writing a checkpoint it is midway through.
+    """
+    return terminate_all([pid], grace=grace) > 0
 
 
 def is_alive(pid: int | None, created_at: float | None) -> bool:
