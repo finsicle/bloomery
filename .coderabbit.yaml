@@ -1,0 +1,176 @@
+# SPDX-FileCopyrightText: 2026 Aswin Alexander Sam
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# CodeRabbit review configuration.
+# Reference: https://docs.coderabbit.ai/reference/yaml-template
+#
+# Reviews trigger on pull requests only. Pushes straight to main are never
+# reviewed, which is why bloomery uses short-lived branches.
+
+language: en-US
+
+tone_instructions: >
+  Be direct and specific. Prefer naming a concrete failure case over general
+  advice. This project values honest uncertainty: if a concern is speculative,
+  say so rather than stating it as a defect.
+
+  Licensing matters here. bloomery is AGPL-3.0-or-later and the nearest
+  comparable projects (Transformer Lab, Unsloth Studio) are also AGPL, so
+  suggested code must be your own or from a permissively licensed source that
+  you name. Do not reproduce implementations from other AGPL projects: even
+  though the licence matches, doing so incurs attribution and compliance
+  obligations the project has not met. See CONTRIBUTING.md for the clean-room
+  rule.
+
+reviews:
+  # Start conservative. `chill` flags bugs, security issues and logic errors but
+  # stays quiet on style, which ruff and mypy already enforce in CI — there is no
+  # value in a second opinion on formatting.
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  path_filters:
+    # 34 KB of legal boilerplate. Reviewing it wastes context and cannot
+    # produce a useful comment.
+    - "!LICENSE"
+    - "!NOTICE"
+    # Generated knowledge-graph output.
+    - "!graphify-out/**"
+    # Binary and packed data.
+    - "!**/*.bin"
+    - "!**/*.safetensors"
+    - "!**/*.gguf"
+    - "!uv.lock"
+
+  path_instructions:
+    - path: "src/bloomery/probe/**"
+      instructions: >
+        This package is the diagnostic that runs when nothing else works, so it
+        has three hard constraints. It must never raise on a hostile
+        environment — a missing binary, a wedged driver, a permission error and
+        a timeout all have to degrade to "this source has nothing to tell us".
+        Every external command must go through probe/util.run(), which bounds
+        each call with a timeout. And it must import no ML dependency: torch is
+        an optional extra and the probe has to work before it is installed.
+        Flag any new subprocess call that bypasses run(), any bare import of
+        torch/transformers at module level, and any exception that can escape.
+        Parsers are deliberately split from the subprocess calls so they can be
+        tested against captured vendor output on machines with no GPU. Keep that
+        separation.
+
+    - path: "src/bloomery/capability.py"
+      instructions: >
+        The constants here are calibrated, not chosen. _STATE_BYTES_PER_PARAM,
+        _RECOMPUTE_BLOCK_FACTOR, _FRAGMENTATION and _CONTEXT_OVERHEAD were fitted
+        against published memory figures for Llama-2-era 7B configs under full,
+        LoRA and QLoRA training. Changing any one of them invalidates the
+        calibration tests in tests/test_capability.py. If a PR touches them,
+        insist the calibration tests were re-run rather than adjusted to match.
+        Separately, ModelSpec.params is a closed-form approximation that must
+        stay within 5% of arch.actual_param_count — the numbers `bloomery doctor`
+        prints stop describing reality if those drift apart.
+
+    - path: "src/bloomery/train/metrics.py"
+      instructions: >
+        The JSONL event shape is a published contract, not an implementation
+        detail: every engine writes it and the future web UI will read only it.
+        Adding a field is safe. Renaming or removing one is a breaking change and
+        should be called out as such. Events are flushed to disk on every write
+        on purpose — a killed run leaves this file as the only record of what
+        happened, so buffering would lose exactly the events that explain the
+        failure. Do not suggest buffering for performance.
+
+    - path: "src/bloomery/train/checkpoint.py"
+      instructions: >
+        Checkpoint writes stage to a temporary directory and then rename, so a
+        process killed mid-write leaves no half-written checkpoint. A partial
+        checkpoint is worse than none because it looks resumable. Flag any change
+        that writes into the destination directly.
+
+    - path: "src/bloomery/train/loop.py"
+      instructions: >
+        Two deliberate choices that look like bugs. First, the loss is computed
+        as model(input_ids=x, labels=x) — transformers shifts labels internally,
+        so passing a pre-shifted target would double-shift and silently train the
+        wrong objective. Do not suggest a manual shift. Second, the numpy memmap
+        is reopened on every batch draw; long-lived memmap handles accumulate
+        memory when sampled repeatedly, and reopening is far cheaper than the
+        leak. Do not suggest hoisting it out of the loop.
+
+    - path: "src/bloomery/data/shards.py"
+      instructions: >
+        The validation split uses (position + 1) % stride, not position % stride.
+        The offset is load-bearing: without it document 0 lands in validation on
+        every run, so the first document is never trained on and a
+        single-document corpus produces zero training tokens. The stride itself
+        is derived from the real corpus size when the corpus is a sized
+        collection, because deriving it from the fraction alone means a
+        60-document corpus at the default 1% never reaches a multiple of 100 and
+        the command hard-fails.
+
+    - path: "src/bloomery/cli.py"
+      instructions: >
+        Declaring CLI options as argument defaults (typer.Option(...)) is typer's
+        documented idiom, not the mutable-default-argument bug. ruff's B008 is
+        intentionally disabled for this file. Do not flag it.
+
+    - path: "tests/**"
+      instructions: >
+        Fixtures are verbatim captures of real vendor tool output (nvidia-smi CSV,
+        amd-smi and rocm-smi JSON) and synthetic sysfs trees. Do not suggest
+        rewrapping or reformatting them to satisfy a line-length limit — E501 is
+        deliberately ignored for this directory, because a reformatted fixture is
+        no longer a faithful sample. Tests that pin a specific invariant carry a
+        docstring explaining it; treat weakening such an assertion as a
+        regression, not a simplification.
+
+    - path: "scripts/**"
+      instructions: >
+        These run on a stranger's machine before anything else works, so they must
+        fail loudly with an actionable message rather than continuing in a broken
+        state. Flag any command whose failure is swallowed, and any assumption
+        that a tool is already on PATH without a check.
+
+    - path: "**/*.md"
+      instructions: >
+        This project's documentation deliberately distinguishes what is built from
+        what is planned. Flag any claim that a capability works when the code does
+        not yet support it, and any performance or memory figure that is not
+        reproducible from the repository.
+
+  tools:
+    # ruff and mypy already gate CI; inline PR annotations are still useful.
+    ruff:
+      enabled: true
+    # scripts/install.sh is user-facing and runs before anything else works.
+    shellcheck:
+      enabled: true
+    actionlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+    # Off deliberately: the prose in README and CONTRIBUTING is intentionally
+    # styled, and these two generate high-volume, low-value comments on it.
+    markdownlint:
+      enabled: false
+    languagetool:
+      enabled: false
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  learnings:
+    scope: local
+  web_search:
+    enabled: true
