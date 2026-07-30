@@ -40,17 +40,24 @@ jobs:
       #
       # Putting the venv on GITHUB_PATH means python, pytest, ruff, mypy and
       # bloomery all resolve to it in later steps without per-OS activation.
+      #
+      # GITHUB_WORKSPACE, not $PWD. On Windows this step runs under bash, where
+      # $PWD is a POSIX path (/d/a/...) that later PowerShell steps cannot
+      # resolve — which is exactly how `pytest` came back "not recognized" while
+      # every bash step on the same runner worked. GITHUB_WORKSPACE is always the
+      # platform-native path.
       - name: create venv on python ${{ matrix.python }}
         shell: bash
         run: |
           uv venv --python ${{ matrix.python }}
           if [ "$RUNNER_OS" = "Windows" ]; then
-            echo "$PWD/.venv/Scripts" >> "$GITHUB_PATH"
+            echo "$GITHUB_WORKSPACE/.venv/Scripts" >> "$GITHUB_PATH"
           else
-            echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+            echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
           fi
 
       - name: install
+        shell: bash
         run: uv pip install --torch-backend=auto -e ".[dev,train]"
 
       # Assert the interpreter and the training stack directly. This replaces an
@@ -64,6 +71,7 @@ jobs:
           python -c "import sys; assert sys.version_info[:2] == tuple(int(p) for p in '${{ matrix.python }}'.split('.')), sys.version_info"
 
       - name: test
+        shell: bash
         run: pytest -q
 
       # A real invocation on a real machine. Exit 1 is legitimate — it means an
