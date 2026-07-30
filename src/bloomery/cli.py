@@ -14,6 +14,7 @@ from rich.console import Console
 from bloomery import __version__, paths
 from bloomery.capability import LADDER_BY_KEY, Method, assess, format_params
 from bloomery.probe import probe_host_report
+from bloomery.probe.types import GIB
 from bloomery.render import render_report
 
 app = typer.Typer(
@@ -261,6 +262,9 @@ def train(
         False, "--grad-checkpoint", help="Trade compute for memory."
     ),
     resume: bool = typer.Option(False, "--resume", help="Continue from the latest checkpoint."),
+    force: bool = typer.Option(
+        False, "--force", help="Start even if the memory estimate says it will not fit."
+    ),
     seed: int = typer.Option(1337, "--seed"),
 ) -> None:
     """Train a model from random initialisation.
@@ -279,6 +283,8 @@ def train(
 
     from bloomery import mixture as mix_mod
     from bloomery.arch import actual_param_count, resolve_spec
+    from bloomery.capability import check_fit
+    from bloomery.probe import probe_host_report
     from bloomery.train import checkpoint as ckpt
     from bloomery.train.device import choose, thread_limit
     from bloomery.train.loop import TrainConfig
@@ -349,6 +355,42 @@ def train(
             )
         else:
             console.print(f"[dim]           replay share {replay * 100:.0f}%[/dim]")
+    # Pre-flight memory check. An out-of-memory error arrives whenever the
+    # allocator happens to hit the ceiling, which can be well into a run after
+    # the tokenizer, the packing and the model build have all succeeded. The
+    # estimate is cheap and deliberately conservative.
+    fit = check_fit(
+        probe_host_report(include_torch=False),
+        spec,
+        batch=batch,
+        seq=seq,
+        gradient_checkpointing=grad_checkpoint,
+        device_type=choice.type,
+    )
+    console.print(
+        f"memory     ~{fit.required / GIB:.1f} GiB needed of "
+        f"{fit.budget.total / GIB:.1f} GiB  [dim]{fit.budget.source}[/dim]"
+    )
+    if not fit.fits:
+        lines = [
+            f"this configuration needs about {fit.required / GIB:.1f} GiB but only "
+            f"{fit.budget.total / GIB:.1f} GiB is available ({fit.budget.source}).",
+        ]
+        if fit.suggestions():
+            lines.append("\ntry one of:")
+            lines.extend(f"  {option}" for option in fit.suggestions())
+        lines.append(
+            "\nThe estimate is conservative and assumes AdamW in bf16. "
+            "Pass --force to start anyway."
+        )
+        if not force:
+            _die("\n".join(lines))
+        console.print("[yellow]--force given; starting despite the estimate[/yellow]")
+    elif fit.headroom < 1.25:
+        console.print(
+            f"[yellow]           only {fit.headroom:.0%} of the estimate is spare — "
+            "an out-of-memory error is plausible[/yellow]"
+        )
     console.print()
 
     columns = (

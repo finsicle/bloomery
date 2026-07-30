@@ -73,7 +73,8 @@ a milestone are not built yet — see [Roadmap](#roadmap).
   corpus, pick a size with one dial, watch loss come down, then generate from the
   result. Checkpoints are standard Hugging Face directories.
 - **Honest pre-flight estimates** — VRAM and token budget computed from *your*
-  measured hardware, before you start rather than at hour six.
+  measured hardware, before you start rather than at hour six. `train` refuses a
+  configuration that will not fit and names what to change.
 - **Measured throughput** — `bench` runs real training steps instead of guessing
   from a peak-FLOPS table.
 - **CPU thread caps** — `--cores` works identically on every platform.
@@ -164,6 +165,25 @@ Checkpoints are ordinary Hugging Face directories. `AutoModelForCausalLM.from_pr
 loads them, which is the whole reason bloomery emits a Llama-architecture model
 rather than inventing one — GGUF conversion, vLLM and Ollama all work without a
 bespoke converter.
+
+`train` estimates memory before it starts and refuses a configuration that
+cannot fit, because an out-of-memory error arrives whenever the allocator
+happens to hit the ceiling — which can be well into a run, after the tokenizer,
+the packing and the model build have all succeeded:
+
+```text
+memory     ~14.4 GiB needed of 8.0 GiB  NVIDIA RTX 3070 — 8 GiB VRAM
+error this configuration needs about 14.4 GiB but only 8.0 GiB is available.
+
+try one of:
+  --grad-checkpoint  (saves ~4.2 GiB, costs ~30% speed)
+  --batch 8  (~7.9 GiB, fits)
+  --depth 10  (the largest depth that fits as configured)
+```
+
+The estimate is deliberately conservative; `--force` starts anyway. Note that
+gradient checkpointing is off by default, and the estimate accounts for that —
+turning it on is usually the largest single saving available.
 
 ```bash
 bloomery bench --size d12

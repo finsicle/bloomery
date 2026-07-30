@@ -44,10 +44,20 @@ _STATE_BYTES_PER_PARAM: dict[str, float] = {
     "qlora": 0.68,
 }
 
-# Gradient checkpointing stores each block's input and recomputes the interior.
-# The constant covers the peak inside the one block being recomputed. Assumes a
-# flash/SDPA attention kernel, so there is no batch x heads x seq^2 term.
+# Activation memory, expressed as a multiplier on batch * seq * hidden * 2 bytes.
+#
+# With gradient checkpointing each block stores only its input and recomputes the
+# interior, so the cost is one slot per layer plus the peak inside whichever block
+# is being recomputed.
+#
+# Without it every layer keeps its intermediates for the backward pass, which is
+# far more expensive and is the default in `bloomery train`. The multiplier comes
+# from the standard transformer activation estimate of 34 * s * b * h * L bytes;
+# dividing by the 2 bytes already in the formula gives 17 per layer.
+#
+# Both assume a flash/SDPA kernel, so there is no batch * heads * seq^2 term.
 _RECOMPUTE_BLOCK_FACTOR = 12
+_NO_CHECKPOINT_PER_LAYER = 17
 
 # Allocator fragmentation, plus a fixed allowance for the driver context.
 _FRAGMENTATION = 1.08
@@ -113,12 +123,28 @@ LADDER: tuple[ModelSpec, ...] = (
 LADDER_BY_KEY = {spec.key: spec for spec in LADDER}
 
 
-def activation_bytes(spec: ModelSpec, *, batch: int | None = None, seq: int | None = None) -> int:
-    """Activation memory under gradient checkpointing."""
+def activation_bytes(
+    spec: ModelSpec,
+    *,
+    batch: int | None = None,
+    seq: int | None = None,
+    gradient_checkpointing: bool = True,
+) -> int:
+    """Activation memory for one training step.
+
+    Checkpointing is the cheaper case by a wide margin, and it is *not* the
+    default in `bloomery train` — estimating as though it were on would
+    under-report the configuration people actually run.
+    """
     b = batch if batch is not None else spec.batch
     s = seq if seq is not None else spec.seq
     per_token = spec.hidden * 2  # bf16
-    return b * s * per_token * (spec.layers + _RECOMPUTE_BLOCK_FACTOR)
+    layers = (
+        spec.layers + _RECOMPUTE_BLOCK_FACTOR
+        if gradient_checkpointing
+        else spec.layers * _NO_CHECKPOINT_PER_LAYER
+    )
+    return b * s * per_token * layers
 
 
 def logit_bytes(spec: ModelSpec, *, batch: int | None = None, seq: int | None = None) -> int:
@@ -140,10 +166,13 @@ def estimate_memory(
     *,
     batch: int | None = None,
     seq: int | None = None,
+    gradient_checkpointing: bool = True,
 ) -> int:
     """Peak memory for one training step, in bytes."""
     state = int(spec.params * _STATE_BYTES_PER_PARAM[method.value])
-    working = activation_bytes(spec, batch=batch, seq=seq) + logit_bytes(spec, batch=batch, seq=seq)
+    working = activation_bytes(
+        spec, batch=batch, seq=seq, gradient_checkpointing=gradient_checkpointing
+    ) + logit_bytes(spec, batch=batch, seq=seq)
     return int((state + working) * _FRAGMENTATION) + _CONTEXT_OVERHEAD
 
 
@@ -198,15 +227,27 @@ class CapabilityReport:
         return max(fitting, key=lambda r: r.spec.params) if fitting else None
 
 
-def derive_budget(report: HostReport) -> Budget:
+def derive_budget(report: HostReport, *, device_type: str | None = None) -> Budget:
     """Work out the memory ceiling for one training process.
 
     Uses the *largest single* GPU rather than the sum. Plain data-parallel
     training replicates the whole model onto every device, so adding GPUs buys
     throughput, not capacity. Sharding across them is possible, and reported
     separately, but it is not the default and should not be assumed.
+
+    ``device_type`` pins the answer to the device a run will actually use. A
+    machine with a 24 GiB card still only has system RAM available to a run
+    launched with ``--device cpu``, and reporting the card's VRAM there would
+    approve a configuration that cannot possibly fit.
     """
     vendors = {gpu.vendor for gpu in report.gpus}
+
+    if device_type == "cpu":
+        available = report.memory.available or report.memory.total or 0
+        return Budget(
+            total=int(available * _CPU_RAM_FRACTION),
+            source=f"system RAM — {available / GIB:.0f} GiB available, CPU only",
+        )
 
     if report.gpus and report.largest_vram:
         largest = max(
@@ -268,6 +309,123 @@ def assess(report: HostReport) -> CapabilityReport:
             )
 
     return CapabilityReport(budget=budget, rows=tuple(rows))
+
+
+@dataclass(frozen=True, slots=True)
+class FitCheck:
+    """Whether a specific training configuration is expected to fit."""
+
+    spec: ModelSpec
+    method: Method
+    batch: int
+    seq: int
+    gradient_checkpointing: bool
+    required: int
+    budget: Budget
+
+    @property
+    def fits(self) -> bool:
+        return self.required <= self.budget.total
+
+    @property
+    def headroom(self) -> float:
+        """Budget as a multiple of the requirement. Below 1.0 means it will not fit."""
+        return self.budget.total / self.required if self.required else float("inf")
+
+    def suggestions(self) -> list[str]:
+        """Concrete ways to make this configuration fit, largest saving first."""
+        if self.fits:
+            return []
+
+        options: list[str] = []
+        if not self.gradient_checkpointing:
+            saved = self.required - estimate_memory(
+                self.spec,
+                self.method,
+                batch=self.batch,
+                seq=self.seq,
+                gradient_checkpointing=True,
+            )
+            if saved > 0:
+                options.append(
+                    f"--grad-checkpoint  (saves ~{saved / GIB:.1f} GiB, costs ~30% speed)"
+                )
+
+        # Halving either dimension halves the activation and logit terms, which
+        # is usually the fastest way back under the limit.
+        for label, kwargs in (
+            (f"--batch {max(1, self.batch // 2)}", {"batch": max(1, self.batch // 2)}),
+            (f"--seq {max(64, self.seq // 2)}", {"seq": max(64, self.seq // 2)}),
+        ):
+            reduced = estimate_memory(
+                self.spec,
+                self.method,
+                batch=kwargs.get("batch", self.batch),
+                seq=kwargs.get("seq", self.seq),
+                gradient_checkpointing=self.gradient_checkpointing,
+            )
+            if reduced < self.required:
+                verdict = "fits" if reduced <= self.budget.total else "still short"
+                options.append(f"{label}  (~{reduced / GIB:.1f} GiB, {verdict})")
+
+        smaller = _largest_depth_that_fits(self)
+        if smaller is not None:
+            options.append(f"--depth {smaller}  (the largest depth that fits as configured)")
+
+        return options
+
+
+def _largest_depth_that_fits(check: FitCheck) -> int | None:
+    """Biggest layer count that fits, holding batch, sequence and vocab fixed."""
+    from bloomery.arch import spec_from_depth
+
+    best: int | None = None
+    for depth in range(1, check.spec.layers):
+        candidate = spec_from_depth(depth, vocab=check.spec.vocab, seq=check.seq, batch=check.batch)
+        required = estimate_memory(
+            candidate,
+            check.method,
+            batch=check.batch,
+            seq=check.seq,
+            gradient_checkpointing=check.gradient_checkpointing,
+        )
+        if required <= check.budget.total:
+            best = depth
+    return best
+
+
+def check_fit(
+    report: HostReport,
+    spec: ModelSpec,
+    *,
+    method: Method = Method.FULL,
+    batch: int,
+    seq: int,
+    gradient_checkpointing: bool = False,
+    device_type: str | None = None,
+) -> FitCheck:
+    """Estimate whether a training configuration fits before it is started.
+
+    The point of running this ahead of a run rather than discovering it from an
+    out-of-memory error is that the error arrives whenever the allocator happens
+    to hit the ceiling — which can be twenty minutes in, after the tokenizer,
+    the packing and the model build have all succeeded.
+    """
+    return FitCheck(
+        spec=spec,
+        method=method,
+        batch=batch,
+        seq=seq,
+        gradient_checkpointing=gradient_checkpointing,
+        required=estimate_memory(
+            spec,
+            method,
+            batch=batch,
+            seq=seq,
+            gradient_checkpointing=gradient_checkpointing,
+        ),
+        budget=derive_budget(report, device_type=device_type),
+    )
 
 
 def format_tokens(count: int) -> str:

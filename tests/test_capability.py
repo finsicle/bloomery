@@ -18,6 +18,7 @@ from bloomery.capability import (
     Method,
     ModelSpec,
     assess,
+    check_fit,
     derive_budget,
     estimate_memory,
     format_params,
@@ -284,3 +285,137 @@ class TestFormatting:
     )
     def test_format_params(self, count: int, expected: str) -> None:
         assert format_params(count) == expected
+
+
+GIB_ = 1024**3
+
+
+class TestGradientCheckpointingIsModelled:
+    """Checkpointing is OFF by default in `train`, so the estimate must model it.
+
+    Assuming checkpointing when it is not enabled under-reports the very
+    configuration people actually run, which is the case the pre-flight guard
+    exists to catch.
+    """
+
+    def test_disabling_checkpointing_costs_more(self) -> None:
+        spec = LADDER_BY_KEY["d12"]
+        on = estimate_memory(spec, Method.FULL, gradient_checkpointing=True)
+        off = estimate_memory(spec, Method.FULL, gradient_checkpointing=False)
+        assert off > on
+
+    def test_the_gap_widens_with_depth(self) -> None:
+        """Non-checkpointed activations scale with layers; checkpointed do not."""
+        shallow = LADDER_BY_KEY["d12"]
+        deep = LADDER_BY_KEY["7b"]
+        shallow_gap = estimate_memory(
+            shallow, Method.FULL, batch=1, seq=1024, gradient_checkpointing=False
+        ) - estimate_memory(shallow, Method.FULL, batch=1, seq=1024, gradient_checkpointing=True)
+        deep_gap = estimate_memory(
+            deep, Method.FULL, batch=1, seq=1024, gradient_checkpointing=False
+        ) - estimate_memory(deep, Method.FULL, batch=1, seq=1024, gradient_checkpointing=True)
+        assert deep_gap > shallow_gap
+
+    def test_default_still_assumes_checkpointing(self) -> None:
+        """The doctor ladder is quoted with checkpointing, so the default must not move."""
+        spec = LADDER_BY_KEY["d12"]
+        assert estimate_memory(spec, Method.FULL) == estimate_memory(
+            spec, Method.FULL, gradient_checkpointing=True
+        )
+
+
+class TestDeviceAwareBudget:
+    def test_cpu_budget_ignores_the_gpu(self) -> None:
+        """`--device cpu` on a GPU box only has system RAM available.
+
+        Reporting the card's VRAM would approve a run that cannot possibly fit.
+        """
+        report = make_report([nvidia(80)], ram=8 * GIB)
+        gpu_budget = derive_budget(report)
+        cpu_budget = derive_budget(report, device_type="cpu")
+        assert gpu_budget.total == int(80 * GIB)
+        assert cpu_budget.total < 8 * GIB
+        assert "CPU only" in cpu_budget.source
+
+    def test_gpu_device_type_uses_the_card(self) -> None:
+        report = make_report([nvidia(24)], ram=8 * GIB)
+        assert derive_budget(report, device_type="cuda").total == int(24 * GIB)
+
+
+class TestCheckFit:
+    def test_a_reasonable_config_fits(self) -> None:
+        report = make_report([nvidia(24)])
+        check = check_fit(report, LADDER_BY_KEY["d12"], batch=8, seq=1024, device_type="cuda")
+        assert check.fits
+        assert check.headroom > 1
+
+    def test_an_oversized_config_does_not(self) -> None:
+        report = make_report([nvidia(8)])
+        check = check_fit(report, LADDER_BY_KEY["7b"], batch=8, seq=4096, device_type="cuda")
+        assert not check.fits
+        assert check.headroom < 1
+
+    def test_a_failing_check_offers_concrete_fixes(self) -> None:
+        report = make_report([nvidia(8)])
+        check = check_fit(
+            report,
+            LADDER_BY_KEY["d24"],
+            batch=32,
+            seq=2048,
+            gradient_checkpointing=False,
+            device_type="cuda",
+        )
+        assert not check.fits
+        options = check.suggestions()
+        assert options
+        # Checkpointing is the largest single saving when it is off.
+        assert any("--grad-checkpoint" in o for o in options)
+        assert any("--batch" in o for o in options)
+
+    def test_a_passing_check_offers_nothing(self) -> None:
+        report = make_report([nvidia(80)])
+        check = check_fit(report, LADDER_BY_KEY["d4"], batch=2, seq=128, device_type="cuda")
+        assert check.fits
+        assert check.suggestions() == []
+
+    def test_checkpointing_is_not_suggested_when_already_on(self) -> None:
+        report = make_report([nvidia(8)])
+        check = check_fit(
+            report,
+            LADDER_BY_KEY["7b"],
+            batch=8,
+            seq=4096,
+            gradient_checkpointing=True,
+            device_type="cuda",
+        )
+        assert not any("--grad-checkpoint" in o for o in check.suggestions())
+
+    def test_suggested_depth_actually_fits(self) -> None:
+        """A suggestion that does not fit would be worse than no suggestion."""
+        import re
+
+        report = make_report([nvidia(8)])
+        check = check_fit(
+            report,
+            LADDER_BY_KEY["1b"],
+            batch=8,
+            seq=1024,
+            gradient_checkpointing=False,
+            device_type="cuda",
+        )
+        depth_options = [o for o in check.suggestions() if o.startswith("--depth")]
+        if depth_options:
+            depth = int(re.search(r"--depth (\d+)", depth_options[0]).group(1))
+            from bloomery.arch import spec_from_depth
+
+            candidate = spec_from_depth(depth, vocab=check.spec.vocab, seq=1024, batch=8)
+            required = estimate_memory(
+                candidate, Method.FULL, batch=8, seq=1024, gradient_checkpointing=False
+            )
+            assert required <= check.budget.total
+
+    def test_cpu_run_on_a_gpu_box_is_judged_against_ram(self) -> None:
+        """The regression that motivated device_type: a GPU present but unused."""
+        report = make_report([nvidia(80)], ram=4 * GIB)
+        check = check_fit(report, LADDER_BY_KEY["1b"], batch=8, seq=2048, device_type="cpu")
+        assert not check.fits
