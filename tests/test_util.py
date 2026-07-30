@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from bloomery.probe.util import find_key, gfx_name, parse_int, run
@@ -85,6 +87,16 @@ class TestGfxName:
 
 
 class TestRun:
+    """Behaviour of the bounded subprocess helper.
+
+    Every case drives ``sys.executable`` rather than a shell utility. ``echo``,
+    ``false`` and ``sleep`` are cmd builtins on Windows, not executables, so
+    ``shutil.which`` returns None for all of them there — which made these tests
+    exercise the missing-binary path on Windows while claiming to test success,
+    timeout and non-zero exit. The Python interpreter is the one executable
+    guaranteed to exist on every platform the suite runs on.
+    """
+
     def test_missing_binary_is_not_an_error(self) -> None:
         result = run(["definitely-not-a-real-binary-xyz"])
         assert result.ok is False
@@ -94,16 +106,25 @@ class TestRun:
         assert run([]).ok is False
 
     def test_captures_success(self) -> None:
-        result = run(["echo", "hello"])
+        result = run([sys.executable, "-c", "print('hello')"])
         assert result.ok is True
         assert result.stdout.strip() == "hello"
 
+    def test_captures_stderr(self) -> None:
+        result = run([sys.executable, "-c", "import sys; sys.stderr.write('boom')"])
+        assert result.ok is True
+        assert "boom" in result.stderr
+
     def test_nonzero_exit_is_not_ok(self) -> None:
-        result = run(["false"])
+        result = run([sys.executable, "-c", "raise SystemExit(3)"])
         assert result.ok is False
-        assert result.returncode != 0
+        assert result.returncode == 3
 
     def test_timeout_does_not_raise(self) -> None:
-        result = run(["sleep", "5"], timeout=0.2)
+        result = run([sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.5)
         assert result.ok is False
         assert "timed out" in result.stderr
+
+    def test_lines_strips_and_drops_blanks(self) -> None:
+        result = run([sys.executable, "-c", "print('a\\n\\n  b  ')"])
+        assert result.lines() == ["a", "b"]

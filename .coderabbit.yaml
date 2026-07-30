@@ -10,17 +10,8 @@
 language: en-US
 
 tone_instructions: >
-  Be direct and specific. Prefer naming a concrete failure case over general
-  advice. This project values honest uncertainty: if a concern is speculative,
-  say so rather than stating it as a defect.
-
-  Licensing matters here. bloomery is AGPL-3.0-or-later and the nearest
-  comparable projects (Transformer Lab, Unsloth Studio) are also AGPL, so
-  suggested code must be your own or from a permissively licensed source that
-  you name. Do not reproduce implementations from other AGPL projects: even
-  though the licence matches, doing so incurs attribution and compliance
-  obligations the project has not met. See CONTRIBUTING.md for the clean-room
-  rule.
+  Be direct and specific. Name a concrete failure case rather than giving general
+  advice. If a concern is speculative, say so instead of stating it as a defect.
 
 reviews:
   # Start conservative. `chill` flags bugs, security issues and logic errors but
@@ -53,6 +44,15 @@ reviews:
     - "!uv.lock"
 
   path_instructions:
+    - path: "**"
+      instructions: >
+        bloomery is AGPL-3.0-or-later, and so are the nearest comparable projects
+        (Transformer Lab, Unsloth Studio). Any code you suggest must be your own
+        or from a permissively licensed source you name. Do not reproduce
+        implementations from other AGPL projects: a matching licence still
+        carries attribution and compliance obligations this project has not met.
+        See CONTRIBUTING.md for the clean-room rule.
+
     - path: "src/bloomery/probe/**"
       instructions: >
         This package is the diagnostic that runs when nothing else works, so it

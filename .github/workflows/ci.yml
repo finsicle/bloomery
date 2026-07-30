@@ -11,6 +11,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job here only reads the source tree. Without this the workflow inherits
+# whatever the repository or organisation default happens to be, which may
+# include write scopes it has no use for.
+permissions:
+  contents: read
+
 jobs:
   # The matrix is the point. This project's stated top risk is the install and
   # hardware-detection matrix, so the probe has to be exercised on all three
@@ -18,40 +24,77 @@ jobs:
   # exactly why the vendor parsers are fixture-driven.
   test:
     runs-on: ${{ matrix.os }}
+    # Windows on 3.13 is kept in the matrix but not allowed to block, because it
+    # is *intermittently* fatal. One run died with a native illegal-instruction
+    # fault (Windows exception 0xc000001d) partway into a training step; the next
+    # run of the same commit passed. It is a hard crash in the wheel rather than
+    # an assertion failure, and nothing in this codebase reaches it — Windows
+    # 3.11 and 3.12 have never shown it on the same runner image.
+    #
+    # Non-blocking rather than removed: deleting the entry would hide a real
+    # flake, while letting it block would stall merges on something we cannot fix
+    # here. If it starts failing consistently rather than occasionally, that is
+    # worth an upstream report — capture the faulthandler traceback first.
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.11", "3.12", "3.13"]
+        include:
+          - os: windows-latest
+            python: "3.13"
+            experimental: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
 
-      - name: set up python
-        run: uv python install ${{ matrix.python }}
-
-      # The train extra is not optional here. conftest.py skips the training
-      # suite when torch is missing, so installing only [dev] would quietly drop
-      # two thirds of the tests and report green.
-      - name: install
-        run: uv pip install --system --torch-backend=auto -e ".[dev,train]"
-
-      # A skip here is a failure, not a pass: it means torch is missing and the
-      # training suite silently did not run. Checked in the same invocation
-      # rather than a second one, so CI does not pay for the suite twice.
-      - name: test
+      # Install into a virtualenv, never with `uv pip install --system`. The
+      # system interpreter on the Linux and macOS runners is PEP 668
+      # externally-managed, so `--system` is refused outright — and because
+      # `--system` ignores whichever interpreter `uv python install` provided,
+      # every matrix entry was silently testing the same Python anyway.
+      #
+      # Putting the venv on GITHUB_PATH means python, pytest, ruff, mypy and
+      # bloomery all resolve to it in later steps without per-OS activation.
+      #
+      # GITHUB_WORKSPACE, not $PWD. On Windows this step runs under bash, where
+      # $PWD is a POSIX path (/d/a/...) that later PowerShell steps cannot
+      # resolve — which is exactly how `pytest` came back "not recognized" while
+      # every bash step on the same runner worked. GITHUB_WORKSPACE is always the
+      # platform-native path.
+      - name: create venv on python ${{ matrix.python }}
         shell: bash
         run: |
-          set -o pipefail
-          python -m pytest -q 2>&1 | tee pytest-out.txt
-          if grep -qE '[0-9]+ skipped' pytest-out.txt; then
-            echo "::error::tests were skipped — the train extra is probably missing"
-            exit 1
+          uv venv --python ${{ matrix.python }}
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            echo "$GITHUB_WORKSPACE/.venv/Scripts" >> "$GITHUB_PATH"
+          else
+            echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
           fi
+
+      - name: install
+        shell: bash
+        run: uv pip install --torch-backend=auto -e ".[dev,train]"
+
+      # Assert the interpreter and the training stack directly. This replaces an
+      # earlier trick of failing the build whenever pytest reported any skip,
+      # which conflated "torch is missing" with a legitimate platform skip.
+      - name: verify the environment
+        shell: bash
+        run: |
+          python -c "import sys; print('python', sys.version)"
+          python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__)"
+          python -c "import sys; assert sys.version_info[:2] == tuple(int(p) for p in '${{ matrix.python }}'.split('.')), sys.version_info"
+
+      - name: test
+        shell: bash
+        run: pytest -q
 
       # A real invocation on a real machine. Exit 1 is legitimate — it means an
       # error-level issue such as low disk was found — so only a crash fails
@@ -59,31 +102,51 @@ jobs:
       - name: doctor runs
         shell: bash
         run: |
-          bloomery doctor || status=$?
-          if [ "${status:-0}" -gt 1 ]; then
-            echo "doctor crashed with status ${status}"
+          doctor_status=0
+          bloomery doctor || doctor_status=$?
+          if [ "$doctor_status" -gt 1 ]; then
+            echo "::error::doctor crashed with status $doctor_status"
             exit 1
           fi
 
       - name: doctor emits valid json
         shell: bash
         run: |
-          bloomery doctor --json > report.json || true
-          python -c "import json,sys; d=json.load(open('report.json')); \
-            assert d['probe']['host']['platform'] in ('linux','wsl2','windows','macos','unknown'); \
-            assert len(d['capability']['models']) == 24; \
-            print('ok:', d['probe']['host']['platform'], d['probe']['backend'])"
+          doctor_status=0
+          bloomery doctor --json > report.json || doctor_status=$?
+          if [ "$doctor_status" -gt 1 ]; then
+            echo "::error::doctor --json crashed with status $doctor_status"
+            exit 1
+          fi
+          python - <<'PY'
+          import json
+          with open("report.json") as handle:
+              report = json.load(handle)
+          assert report["probe"]["host"]["platform"] in (
+              "linux", "wsl2", "windows", "macos", "unknown"
+          ), report["probe"]["host"]["platform"]
+          assert len(report["capability"]["models"]) == 24, len(report["capability"]["models"])
+          print("ok:", report["probe"]["host"]["platform"], report["probe"]["backend"])
+          PY
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
 
-      - run: uv pip install --system --torch-backend=auto -e ".[dev,train]"
+      - name: create venv
+        run: |
+          uv venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      # The train extra is needed here too: mypy resolves numpy's bundled stubs,
+      # and dropping it would turn a type error into an unanalysable import.
+      - run: uv pip install --torch-backend=auto -e ".[dev,train]"
 
       - name: ruff check
         run: ruff check .
@@ -97,24 +160,40 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: build wheel and sdist
         run: uv build
 
-      # Guards the licence metadata: PEP 639 support is recent enough in the
-      # build backend that a silent regression here is plausible, and shipping a
+      # Guards the licence metadata. Worth a check because PEP 639 support is
+      # recent enough in the build backend to regress quietly, and shipping a
       # wheel with no licence recorded would be a real problem.
+      #
+      # The licence file location is deliberately not pinned: hatchling moved it
+      # from `<dist-info>/LICENSE` to the PEP 639 standard
+      # `<dist-info>/licenses/LICENSE`, and a build backend is entitled to use
+      # either. What matters is that a licence file ships at all.
       - name: verify licence metadata
         run: |
-          python - <<'PY'
-          import zipfile, pathlib
+          uv run --no-project python - <<'PY'
+          import pathlib
+          import zipfile
+
           wheel = next(pathlib.Path("dist").glob("*.whl"))
-          z = zipfile.ZipFile(wheel)
-          meta = z.read(next(n for n in z.namelist() if n.endswith("METADATA"))).decode()
-          assert "License-Expression: AGPL-3.0-or-later" in meta, meta
-          assert any(n.endswith(".dist-info/LICENSE") for n in z.namelist()), z.namelist()
-          print("licence metadata ok:", wheel.name)
+          archive = zipfile.ZipFile(wheel)
+          names = archive.namelist()
+
+          metadata_name = next(n for n in names if n.endswith(".dist-info/METADATA"))
+          metadata = archive.read(metadata_name).decode()
+          assert "License-Expression: AGPL-3.0-or-later" in metadata, metadata
+
+          licences = [
+              n for n in names
+              if ".dist-info/" in n and pathlib.PurePosixPath(n).name == "LICENSE"
+          ]
+          assert licences, f"no LICENSE shipped in the wheel: {names}"
+
+          print(f"licence metadata ok: {wheel.name} -> {licences[0]}")
           PY

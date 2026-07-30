@@ -136,13 +136,18 @@ def run(
         one_step()
     _synchronize(choice.type)
 
-    began = time.monotonic()
+    began = time.perf_counter()
     for _ in range(steps):
         one_step()
     _synchronize(choice.type)
-    elapsed = time.monotonic() - began
+    elapsed = time.perf_counter() - began
 
     tokens = batch * seq * steps
+    if elapsed <= 0:
+        # Should be unreachable with perf_counter, but a zero here would be
+        # reported as "0 tok/s", which reads as a failure rather than as an
+        # unmeasurably fast run.
+        raise RuntimeError("benchmark completed in unmeasurable time; increase --steps or --batch")
     return BenchResult(
         spec=spec,
         device=str(choice.device),
@@ -152,7 +157,7 @@ def run(
         seq=seq,
         steps=steps,
         seconds=elapsed,
-        tokens_per_second=tokens / elapsed if elapsed > 0 else 0.0,
+        tokens_per_second=tokens / elapsed,
         peak_memory=_peak_memory(choice.type),
     )
 

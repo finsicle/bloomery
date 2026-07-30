@@ -4,10 +4,44 @@
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
+
+import pytest
 
 from bloomery.probe.pci import list_display_devices, vendors_present
 from bloomery.probe.types import Vendor
+
+
+def _can_build_sysfs_fixture() -> bool:
+    """Whether this platform can represent a sysfs PCI tree on disk.
+
+    Two requirements, both of which Windows fails. PCI slot directories are named
+    like ``0000:01:00.0`` and a colon is not a legal Windows filename character
+    (WinError 123). A bound driver is modelled as a symlink, and creating one
+    needs developer mode or elevation.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        try:
+            (root / "0000:01:00.0").mkdir()
+            target = root / "target"
+            target.mkdir()
+            (root / "link").symlink_to(target)
+        except (OSError, NotImplementedError, ValueError):
+            return False
+    return True
+
+
+# The code under test reads /sys/bus/pci/devices, which exists only on Linux; on
+# every other platform list_display_devices returns an empty list before touching
+# the filesystem. Skipping here is honest rather than a workaround: there is no
+# Windows behaviour to cover, and a fixture that cannot be built says nothing
+# about the Linux path.
+pytestmark = pytest.mark.skipif(
+    not _can_build_sysfs_fixture(),
+    reason="sysfs PCI fixtures need colons in filenames and symlinks",
+)
 
 
 def add_device(

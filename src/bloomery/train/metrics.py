@@ -34,7 +34,7 @@ class MetricsWriter:
     def __enter__(self) -> MetricsWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._handle = self.path.open("a", encoding="utf-8")
-        self._started = time.monotonic()
+        self._started = time.perf_counter()
         return self
 
     def __exit__(
@@ -53,7 +53,7 @@ class MetricsWriter:
         """Write one event. Returns it, so callers can also render it."""
         record = {
             "event": event,
-            "t": round(time.monotonic() - self._started, 3),
+            "t": round(time.perf_counter() - self._started, 3),
             **fields,
         }
         if self._handle is not None:

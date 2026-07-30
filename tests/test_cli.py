@@ -10,19 +10,22 @@ from __future__ import annotations
 
 import json
 
+from _helpers import plain
 from typer.testing import CliRunner
 
 from bloomery import __version__
 from bloomery.cli import app
 
-runner = CliRunner()
+# NO_COLOR keeps rendering deterministic; plain() makes the assertions immune
+# either way.
+runner = CliRunner(env={"NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "200"})
 
 
 class TestVersion:
     def test_prints_version(self) -> None:
         result = runner.invoke(app, ["version"])
         assert result.exit_code == 0
-        assert __version__ in result.stdout
+        assert __version__ in plain(result.stdout)
 
 
 class TestDoctor:
@@ -36,11 +39,11 @@ class TestDoctor:
     def test_renders_expected_sections(self) -> None:
         result = runner.invoke(app, ["doctor", "--no-torch"])
         for heading in ("host", "gpus", "pytorch backend", "what this machine can train"):
-            assert heading in result.stdout
+            assert heading in plain(result.stdout)
 
     def test_json_is_valid_and_shaped(self) -> None:
         result = runner.invoke(app, ["doctor", "--json", "--no-torch"])
-        payload = json.loads(result.stdout)
+        payload = json.loads(plain(result.stdout))
 
         assert payload["bloomery_version"] == __version__
         assert "home" in payload
@@ -78,18 +81,18 @@ class TestDoctor:
     def test_json_has_no_enum_repr_leakage(self) -> None:
         """Enums must serialise as their values, not as ``Vendor.NVIDIA``."""
         result = runner.invoke(app, ["doctor", "--json", "--no-torch"])
-        assert "Vendor." not in result.stdout
-        assert "Platform." not in result.stdout
-        assert "Backend." not in result.stdout
+        assert "Vendor." not in plain(result.stdout)
+        assert "Platform." not in plain(result.stdout)
+        assert "Backend." not in plain(result.stdout)
 
     def test_no_torch_flag_omits_torch_section(self) -> None:
         result = runner.invoke(app, ["doctor", "--json", "--no-torch"])
-        payload = json.loads(result.stdout)
+        payload = json.loads(plain(result.stdout))
         assert payload["probe"]["torch"] is None
 
     def test_exit_code_tracks_error_issues(self) -> None:
         result = runner.invoke(app, ["doctor", "--json", "--no-torch"])
-        payload = json.loads(result.stdout)
+        payload = json.loads(plain(result.stdout))
         has_error = any(i["level"] == "error" for i in payload["probe"]["issues"])
         assert result.exit_code == (1 if has_error else 0)
 
@@ -97,9 +100,9 @@ class TestDoctor:
 class TestHelp:
     def test_bare_invocation_shows_help(self) -> None:
         result = runner.invoke(app, [])
-        assert "doctor" in result.stdout
+        assert "doctor" in plain(result.stdout)
 
     def test_doctor_help(self) -> None:
         result = runner.invoke(app, ["doctor", "--help"])
         assert result.exit_code == 0
-        assert "--json" in result.stdout
+        assert "--json" in plain(result.stdout)

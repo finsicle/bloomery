@@ -77,11 +77,11 @@ a milestone are not built yet — see [Roadmap](#roadmap).
 - **Measured throughput** — `bench` runs real training steps instead of guessing
   from a peak-FLOPS table.
 - **CPU thread caps** — `--cores` works identically on every platform.
+- **Replay mixtures** — weighted, versioned dataset blends with per-component
+  forgetting detection.
 
 ### Not built yet
 
-- **Replay mixtures** (M2) — weighted, versioned dataset blends, so adding a
-  corpus doesn't silently degrade what the model already knew.
 - **Web UI and job queue** (M3), including per-job memory limits and GPU choice.
 - **Continued pretraining, SFT and preference optimization** (M4).
 - **Export to GGUF, Ollama, MLX** (M5).
@@ -108,15 +108,15 @@ hardware, `bloomery doctor --json` in an issue is genuinely useful.
 | --------- | ----------------------------------------------------------------- | ------ |
 | **M0**    | `bloomery doctor` — hardware probe, capability estimator, installers | done |
 | **M1**    | Pretrain from scratch end to end, then generate from it            | done |
-| **M2**    | Replay mixtures — weighted, versioned dataset blends               | next |
-| **M3**    | Web UI, job queue, cancel/resume, resource limits                  |        |
+| **M2**    | Replay mixtures — weighted, versioned dataset blends               | done |
+| **M3**    | Web UI, job queue, cancel/resume, resource limits                  | next |
 | **M4**    | Continued pretraining and SFT on existing models                   |        |
 | **M5**    | Export — GGUF, quantization, Ollama                                |        |
 | **M6**    | AMD hardening on real hardware, Windows, evaluation                |        |
 
-M2 is the mixture builder rather than the web UI, because weighted replay is what
-makes "keep adding datasets" work instead of quietly degrading the model — and
-it is the part no comparable tool has.
+M2 came before the web UI because weighted replay is what makes "keep adding
+datasets" work instead of quietly degrading the model — and it is the part no
+comparable tool has.
 
 ## Install
 
@@ -171,6 +171,58 @@ bloomery bench --size d12
 
 Measures real training throughput on your machine and tells you what a
 compute-optimal run would actually cost in hours.
+
+## Keep adding datasets, without forgetting
+
+Training on corpus A, then B, then C makes the model *worse* at A. That is
+catastrophic forgetting, and it is why "just keep adding data" does not work
+literally. The defence is replay: mix a share of the earlier data back into every
+later run.
+
+Replay only helps if the blend is a real object you can name, version and reuse.
+So it is one:
+
+```bash
+bloomery mix create --name blend --add new:0.8 --replay old:0.2
+bloomery train --mix blend --name run1 --depth 8 --steps 5000
+```
+
+Weights are raw numbers, normalised on use — `80/20` and `0.8/0.2` are the same
+blend. Components you mark `--replay` are the ones that exist to stop forgetting,
+and that share gets reported.
+
+**Every component is evaluated on its own held-out split.** This is the part that
+matters. A single aggregate validation loss is dominated by whichever component
+carries the most weight, so it can fall while the oldest corpus in the blend
+quietly degrades:
+
+```text
+  step 150  val loss 0.7004  ppl 2.01  new 0.696 old 0.742
+  step 200  val loss 0.6913  ppl 2.00  new 0.687 old 0.731
+  forgetting  old is 0.0180 above its best
+```
+
+That warning names the corpus that is getting worse while there is still time to
+raise its weight. Doing so creates the next version rather than editing the
+current one:
+
+```bash
+bloomery mix add blend --replay old:0.3 --note "raise replay after old regressed"
+bloomery mix show blend          # weights, replay share, and full lineage
+```
+
+Versions are immutable on disk. `mix show` prints the whole chain, so "what was
+run 7 actually trained on" has an answer.
+
+Two guards worth knowing about:
+
+- **Mismatched tokenizers are refused.** Each corpus is packed with its own
+  tokenizer, so blending two of them means token id 4,211 refers to different
+  symbols in each. That would not error — it would train, converge to nothing,
+  and give no clue why. Components must agree on vocabulary size and tokenizer
+  hash.
+- **A blend with no replay component gets a warning**, because that is the
+  configuration that forgets.
 
 ## `bloomery doctor`
 

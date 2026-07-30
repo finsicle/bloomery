@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from bloomery.arch import spec_from_depth
+from bloomery.mixture import single
 from bloomery.train import checkpoint as ckpt
 from bloomery.train.device import DeviceChoice, choose, select_precision
 from bloomery.train.loop import BatchSampler, TrainConfig, build_model, lr_at
@@ -191,7 +192,8 @@ def result(dataset: Any, tokenizer: Any, tmp_path_factory: Any) -> Any:
     )
     return train(
         spec=spec,
-        dataset=dataset,
+        datasets={"fixture": dataset},
+        mixture=single("fixture"),
         tokenizer=tokenizer,
         run_dir=tmp_path_factory.mktemp("integration"),
         config=TrainConfig(steps=40, batch=8, seq=32, eval_every=20, eval_batches=3, log_every=5),
@@ -336,6 +338,72 @@ class TestCheckpointAtomicity:
         assert not fresh.state_dict()["state"]
         ckpt.load_resume_state(target, fresh)
         assert fresh.state_dict()["state"]
+
+    def test_forgetting_history_survives_a_checkpoint(self, tmp_path: Path, tokenizer: Any) -> None:
+        """A resumed run must not mistake its first evaluation for a baseline.
+
+        Without this, a component already degrading before the interruption is
+        reported as healthy after resume — the run silently loses exactly the
+        signal the blend exists to provide.
+        """
+        import torch
+
+        spec = spec_from_depth(1, vocab=len(tokenizer), seq=16)
+        model = build_model(spec, eos_token_id=0, seed=0)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+        target = tmp_path / "latest"
+        ckpt.save(
+            target,
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            step=10,
+            tokens_seen=100,
+            best_val_loss=0.5,
+            component_best={"old": 0.9, "new": 0.4},
+            component_first={"old": 1.2, "new": 1.5},
+        )
+        state = ckpt.load_resume_state(target)
+        assert state.component_best == {"old": 0.9, "new": 0.4}
+        assert state.component_first == {"old": 1.2, "new": 1.5}
+
+    def test_restored_history_detects_a_regression_immediately(self) -> None:
+        """The restored best is what makes the very next reading actionable."""
+        from bloomery.train.mixing import ForgettingTracker
+
+        tracker = ForgettingTracker(tolerance=0.0)
+        tracker.best.update({"old": 0.9})
+        tracker.first.update({"old": 1.2})
+        # A fresh tracker would treat this as a baseline and report nothing.
+        assert tracker.update({"old": 1.1}) == pytest.approx({"old": pytest.approx(0.2)})
+
+    def test_checkpoint_without_component_history_still_loads(
+        self, tmp_path: Path, tokenizer: Any
+    ) -> None:
+        """Checkpoints written before forgetting was tracked must still resume."""
+        import torch
+
+        spec = spec_from_depth(1, vocab=len(tokenizer), seq=16)
+        model = build_model(spec, eos_token_id=0, seed=0)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        target = tmp_path / "latest"
+        ckpt.save(
+            target,
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            step=5,
+            tokens_seen=50,
+            best_val_loss=None,
+        )
+        payload = torch.load(target / ckpt.TRAINER_STATE, map_location="cpu", weights_only=False)
+        del payload["component_best"], payload["component_first"]
+        torch.save(payload, target / ckpt.TRAINER_STATE)
+
+        state = ckpt.load_resume_state(target)
+        assert state.component_best == {}
+        assert state.component_first == {}
 
     def test_missing_trainer_state(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
