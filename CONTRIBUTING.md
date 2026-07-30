@@ -34,7 +34,7 @@ exists) is genuinely valuable.
 Requires [uv](https://docs.astral.sh/uv/).
 
 ```bash
-git clone git@github.com:aswinsam/bloomery.git
+git clone git@github.com:finsicle/bloomery.git
 cd bloomery
 uv venv
 uv pip install -e ".[dev]"

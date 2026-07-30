@@ -123,7 +123,7 @@ it is the part no comparable tool has.
 Needs [uv](https://docs.astral.sh/uv/). The script installs it if it's missing.
 
 ```bash
-git clone https://github.com/aswinsam/bloomery.git
+git clone https://github.com/finsicle/bloomery.git
 cd bloomery
 ./scripts/install.sh
 ```

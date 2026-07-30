@@ -82,9 +82,9 @@ dev = [
 bloomery = "bloomery.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/aswinsam/bloomery"
-Repository = "https://github.com/aswinsam/bloomery"
-Issues = "https://github.com/aswinsam/bloomery/issues"
+Homepage = "https://github.com/finsicle/bloomery"
+Repository = "https://github.com/finsicle/bloomery"
+Issues = "https://github.com/finsicle/bloomery/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bloomery"]
