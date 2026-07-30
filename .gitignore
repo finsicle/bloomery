@@ -1,0 +1,128 @@
+# ---------------------------------------------------------------------------
+# AI assistant artifacts — never commit these
+# ---------------------------------------------------------------------------
+.claude/
+.claude*
+CLAUDE.md
+CLAUDE.local.md
+.claudeignore
+.mcp.json
+.cursor/
+.cursorrules
+.aider*
+.windsurfrules
+.github/copilot-instructions.md
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+.python-version
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# uv
+# NOTE: uv.lock IS committed once we have real backend lockfiles.
+
+# ---------------------------------------------------------------------------
+# Bloomery runtime data — models, checkpoints, corpora, logs
+# These get very large very fast. Never commit them.
+# ---------------------------------------------------------------------------
+workspace/
+runs/
+blooms/
+checkpoints/
+models/
+datasets/
+corpora/
+tokenizers/
+exports/
+*.gguf
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.npy
+*.npz
+*.arrow
+*.idx
+
+# Local app state
+bloomery.db
+bloomery.db-wal
+bloomery.db-shm
+*.sqlite
+*.sqlite3
+logs/
+*.log
+*.jsonl
+
+# Experiment tracking
+wandb/
+mlruns/
+tensorboard/
+events.out.tfevents.*
+
+# Hugging Face / Torch caches, if pointed inside the repo
+.cache/
+hf_cache/
+.torch/
+
+# ---------------------------------------------------------------------------
+# Frontend
+# ---------------------------------------------------------------------------
+node_modules/
+.vite/
+.next/
+web/dist/
+src/bloomery/static/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

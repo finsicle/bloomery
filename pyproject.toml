@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bloomery"
+version = "0.0.0"
+description = "Train a language model from nothing, on your own machine."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "aswinsam", email = "aswinsam@gmail.com" }]
+keywords = [
+    "llm",
+    "pretraining",
+    "fine-tuning",
+    "training",
+    "local",
+    "gguf",
+    "rocm",
+    "cuda",
+]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# NOTE: `license` and the corresponding classifier are intentionally omitted
+# until the license decision is made. Add both together when it is.
+
+# Kept deliberately light so the placeholder release installs fast.
+# Anything torch-shaped belongs in an extra, never here.
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+# Torch itself is resolved by `uv pip install --torch-backend=auto`, which
+# detects CUDA / ROCm / XPU / CPU and picks the matching wheel. These extras
+# carry the framework layer that sits on top of whichever build got selected.
+train = [
+    "torch>=2.6",
+    "transformers>=4.44",
+    "accelerate>=0.34",
+    "peft>=0.13",
+    "trl>=0.11",
+    "datasets>=3.0",
+    "tokenizers>=0.20",
+    "safetensors>=0.4",
+]
+serve = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.9",
+    "websockets>=13.0",
+]
+# Quantized training. CUDA and ROCm only — no macOS wheels exist.
+quant = [
+    "bitsandbytes>=0.44; sys_platform != 'darwin'",
+]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+bloomery = "bloomery.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aswinsam/bloomery"
+Repository = "https://github.com/aswinsam/bloomery"
+Issues = "https://github.com/aswinsam/bloomery/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bloomery"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

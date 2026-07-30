@@ -1,0 +1,113 @@
+name: Bug report
+description: Something is broken or behaves unexpectedly
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most bugs in a training tool are hardware or driver bugs in disguise.
+        The hardware section below is the part that actually gets things fixed —
+        please fill it in even if the problem seems unrelated.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `bloomery doctor`
+      description: Paste the full output. This covers most of the hardware questions at once.
+      render: shell
+    validations:
+      required: false
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - Windows (WSL2)
+        - Windows (native)
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: gpu-vendor
+    attributes:
+      label: GPU vendor
+      options:
+        - NVIDIA
+        - AMD
+        - Apple
+        - Intel
+        - None / CPU only
+    validations:
+      required: true
+
+  - type: input
+    id: gpu-model
+    attributes:
+      label: GPU model and count
+      placeholder: "2x RTX 4090 / 1x RX 7900 XTX / M3 Max"
+    validations:
+      required: true
+
+  - type: input
+    id: driver
+    attributes:
+      label: Driver / CUDA / ROCm version
+      placeholder: "CUDA 12.8, driver 570.x  —  or  —  ROCm 7.2.1"
+    validations:
+      required: true
+
+  - type: input
+    id: torch
+    attributes:
+      label: PyTorch version and build
+      placeholder: "2.9.0+cu128 / 2.9.0+rocm6.4"
+    validations:
+      required: false
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.4"
+    validations:
+      required: true
+
+  - type: input
+    id: memory
+    attributes:
+      label: System RAM and CPU cores
+      placeholder: "64 GB, 16 cores"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Include the traceback if there is one. Exit code 137 usually means the process was killed for exceeding a memory limit.
+      render: shell
+    validations:
+      required: false
