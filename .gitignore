@@ -96,6 +96,29 @@ logs/
 *.log
 *.jsonl
 
+# ---------------------------------------------------------------------------
+# graphify — knowledge graph tooling
+# ---------------------------------------------------------------------------
+# All derived output: graph.json, graph.html, GRAPH_REPORT.md, the extraction
+# cache, manifest and cost tracker. ~1.5 MB per run and fully regenerable from
+# the source tree, so there is no reason to version it.
+graphify-out/
+
+# Interpreter/scan-root markers, in case a run writes them before creating
+# graphify-out/.
+.graphify_*
+
+# Corpus fetched by `graphify add <url>` — third-party web pages, papers and
+# transcripts. Deliberately ignored: pulling someone else's content into an
+# AGPL repo by accident is a licensing problem, not just clutter. If you curate
+# a corpus you intend to ship, un-ignore it explicitly.
+raw/
+
+# Optional exports, when written outside graphify-out/.
+obsidian/
+*.graphml
+cypher.txt
+
 # Experiment tracking
 wandb/
 mlruns/
