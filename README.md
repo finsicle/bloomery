@@ -2,9 +2,8 @@
 
 **Train a language model from nothing, on your own machine.**
 
-> ⚠️ **Status: pre-alpha.** This repository is a skeleton. There is no working
-> code yet. Watch or star if you want to know when M1 lands — see
-> [Roadmap](#roadmap) for what's being built and in what order.
+> ⚠️ **Status: pre-alpha.** `bloomery doctor` works today. Nothing trains yet.
+> See [Roadmap](#roadmap) for what's being built and in what order.
 
 ---
 
@@ -80,8 +79,80 @@ fine-tuning as the natural next step rather than the headline.
 
 ## Install
 
-Not yet. When it exists it will be one command, and it will resolve the right
-PyTorch build for your GPU automatically.
+Needs [uv](https://docs.astral.sh/uv/). The script installs it if it's missing.
+
+```bash
+git clone https://github.com/aswinsam/bloomery.git
+cd bloomery
+./scripts/install.sh
+```
+
+On Windows, `.\scripts\install.ps1` — though WSL2 is the supported path.
+
+This installs the core package only, which is a few megabytes, then immediately
+reports what your machine can do. Adding PyTorch is a separate, much larger
+step, and there is no point spending that download before you know which backend
+you need:
+
+```bash
+uv pip install --torch-backend=auto -e ".[train,serve]"
+```
+
+`--torch-backend=auto` inspects your CUDA driver, AMD GPU version or Intel GPU
+and resolves the matching wheel index by itself. That one flag is most of what
+made dropping Docker viable.
+
+## `bloomery doctor`
+
+The first thing that works, and the thing to paste into a bug report.
+
+```
+╭─ gpus ───────────────────────────────────────────────────────────────────────╮
+│ #   vendor  device              memory   arch      source                    │
+│ 0   amd     Radeon RX 7900 XTX  24 GiB   gfx1100   amd-smi                   │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ what this machine can train ────────────────────────────────────────────────╮
+│ budget  Radeon RX 7900 XTX — 24 GiB VRAM                                     │
+│                                                                              │
+│ pretrain from scratch  up to 1B (1.07B)  ·  needs ~21.5B tokens              │
+│ fine-tune with QLoRA   up to 7B (6.98B)                                      │
+│                                                                              │
+│ model               params  tokens     step     Full     LoRA  QLoRA         │
+│ tiny                    5M    105M   32×512  1.6 GiB  1.5 GiB  1.5 GiB       │
+│ GPT-2 small class     124M    2.5B   8×1024  4.7 GiB  3.0 GiB  2.8 GiB       │
+│ nanochat d26          595M   11.9B   4×2048   13 GiB  5.1 GiB  4.2 GiB       │
+│ 1B                   1.07B   21.5B   2×2048   21 GiB  5.8 GiB  4.2 GiB       │
+│ 7B                   6.98B  139.6B   1×4096  117 GiB   20 GiB  9.2 GiB       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+It detects OS (including WSL2), CPU, RAM, free disk, and GPUs across NVIDIA,
+AMD, Apple and Intel — then estimates, from *your* measured VRAM, which model
+sizes are actually trainable. Memory estimates are conservative and assume
+AdamW, bf16 and gradient checkpointing.
+
+Two things it does that are easy to skip and expensive to omit:
+
+- **Reads the PCI bus directly.** So "you have no GPU" and "you have a GPU whose
+  driver isn't loaded" produce different messages. The second is the state most
+  new AMD users are actually in.
+- **Checks the installed PyTorch against the detected hardware.** A CPU-only
+  wheel on a machine with two H100s is a silent, expensive mistake.
+
+`--json` gives machine-readable output. Exit status is non-zero when something
+would stop a training run, so it works as a check in a script.
+
+## Development
+
+```bash
+uv pip install -e ".[dev]"
+pytest && ruff check . && ruff format --check . && mypy src
+```
+
+The GPU vendor parsers are fixture-driven, against captured `nvidia-smi`,
+`amd-smi` and `rocm-smi` output plus synthetic sysfs trees. That is deliberate:
+the AMD path has to be testable and CI-covered on machines with no AMD hardware,
+which is most of them.
 
 ## License
 

@@ -68,6 +68,7 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.6",
     "mypy>=1.11",
+    "types-psutil",
 ]
 
 [project.scripts]
@@ -88,5 +89,21 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# Test fixtures are verbatim captures of vendor tool output. Rewrapping them to
+# fit a line limit would stop them being faithful samples.
+"tests/*" = ["E501"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+# torch lives in an optional extra, so it is legitimately absent when the core
+# package is type-checked. The probe already guards the import at runtime.
+[[tool.mypy.overrides]]
+module = ["torch", "torch.*"]
+ignore_missing_imports = true

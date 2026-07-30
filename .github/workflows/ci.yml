@@ -1,0 +1,107 @@
+# SPDX-FileCopyrightText: 2026 Aswin Alexander Sam
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The matrix is the point. This project's stated top risk is the install and
+  # hardware-detection matrix, so the probe has to be exercised on all three
+  # operating systems on every push. None of these runners have a GPU, which is
+  # exactly why the vendor parsers are fixture-driven.
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: set up python
+        run: uv python install ${{ matrix.python }}
+
+      - name: install
+        run: uv pip install --system -e ".[dev]"
+
+      - name: test
+        run: python -m pytest -q
+
+      # A real invocation on a real machine. Exit 1 is legitimate — it means an
+      # error-level issue such as low disk was found — so only a crash fails
+      # this step.
+      - name: doctor runs
+        shell: bash
+        run: |
+          bloomery doctor || status=$?
+          if [ "${status:-0}" -gt 1 ]; then
+            echo "doctor crashed with status ${status}"
+            exit 1
+          fi
+
+      - name: doctor emits valid json
+        shell: bash
+        run: |
+          bloomery doctor --json > report.json || true
+          python -c "import json,sys; d=json.load(open('report.json')); \
+            assert d['probe']['host']['platform'] in ('linux','wsl2','windows','macos','unknown'); \
+            assert len(d['capability']['models']) == 24; \
+            print('ok:', d['probe']['host']['platform'], d['probe']['backend'])"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv pip install --system -e ".[dev]"
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: ruff format
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy src
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: build wheel and sdist
+        run: uv build
+
+      # Guards the licence metadata: PEP 639 support is recent enough in the
+      # build backend that a silent regression here is plausible, and shipping a
+      # wheel with no licence recorded would be a real problem.
+      - name: verify licence metadata
+        run: |
+          python - <<'PY'
+          import zipfile, pathlib
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          z = zipfile.ZipFile(wheel)
+          meta = z.read(next(n for n in z.namelist() if n.endswith("METADATA"))).decode()
+          assert "License-Expression: AGPL-3.0-or-later" in meta, meta
+          assert any(n.endswith(".dist-info/LICENSE") for n in z.namelist()), z.namelist()
+          print("licence metadata ok:", wheel.name)
+          PY
