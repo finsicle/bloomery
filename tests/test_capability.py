@@ -391,8 +391,16 @@ class TestCheckFit:
         assert not any("--grad-checkpoint" in o for o in check.suggestions())
 
     def test_suggested_depth_actually_fits(self) -> None:
-        """A suggestion that does not fit would be worse than no suggestion."""
+        """A suggestion that does not fit would be worse than no suggestion.
+
+        The configuration is fixed, so the option must be present. Guarding the
+        assertions behind `if depth_options:` would let the whole test pass
+        vacuously the day `_largest_depth_that_fits` stops emitting one — which
+        is exactly the regression this covers.
+        """
         import re
+
+        from bloomery.arch import spec_from_depth
 
         report = make_report([nvidia(8)])
         check = check_fit(
@@ -403,16 +411,35 @@ class TestCheckFit:
             gradient_checkpointing=False,
             device_type="cuda",
         )
+        assert not check.fits
         depth_options = [o for o in check.suggestions() if o.startswith("--depth")]
-        if depth_options:
-            depth = int(re.search(r"--depth (\d+)", depth_options[0]).group(1))
-            from bloomery.arch import spec_from_depth
+        assert depth_options, f"no --depth suggestion in {check.suggestions()}"
 
-            candidate = spec_from_depth(depth, vocab=check.spec.vocab, seq=1024, batch=8)
-            required = estimate_memory(
-                candidate, Method.FULL, batch=8, seq=1024, gradient_checkpointing=False
-            )
-            assert required <= check.budget.total
+        match = re.search(r"--depth (\d+)", depth_options[0])
+        assert match is not None, depth_options[0]
+        depth = int(match.group(1))
+
+        candidate = spec_from_depth(depth, vocab=check.spec.vocab, seq=1024, batch=8)
+        required = estimate_memory(
+            candidate, Method.FULL, batch=8, seq=1024, gradient_checkpointing=False
+        )
+        assert required <= check.budget.total
+
+    def test_spare_is_the_leftover_fraction_not_the_ratio(self) -> None:
+        """10 GiB needed on an 11 GiB card leaves 10% spare, not 110%."""
+        from bloomery.capability import Budget, FitCheck
+
+        check = FitCheck(
+            spec=LADDER_BY_KEY["d4"],
+            method=Method.FULL,
+            batch=1,
+            seq=64,
+            gradient_checkpointing=False,
+            required=10 * GIB,
+            budget=Budget(total=11 * GIB, source="test"),
+        )
+        assert check.headroom == pytest.approx(1.1)
+        assert check.spare == pytest.approx(0.1)
 
     def test_cpu_run_on_a_gpu_box_is_judged_against_ram(self) -> None:
         """The regression that motivated device_type: a GPU present but unused."""

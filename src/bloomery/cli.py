@@ -386,9 +386,9 @@ def train(
         if not force:
             _die("\n".join(lines))
         console.print("[yellow]--force given; starting despite the estimate[/yellow]")
-    elif fit.headroom < 1.25:
+    elif fit.spare < 0.25:
         console.print(
-            f"[yellow]           only {fit.headroom:.0%} of the estimate is spare — "
+            f"[yellow]           only {fit.spare:.0%} spare — "
             "an out-of-memory error is plausible[/yellow]"
         )
     console.print()

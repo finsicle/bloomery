@@ -332,6 +332,16 @@ class FitCheck:
         """Budget as a multiple of the requirement. Below 1.0 means it will not fit."""
         return self.budget.total / self.required if self.required else float("inf")
 
+    @property
+    def spare(self) -> float:
+        """Fraction of the budget left over once the estimate is met.
+
+        Distinct from :attr:`headroom`, which is a ratio: a run needing 10 GiB on
+        an 11 GiB card has headroom 1.1 and spare 0.1. Reporting the ratio as a
+        percentage "spare" overstates the margin by a factor of eleven.
+        """
+        return self.headroom - 1.0
+
     def suggestions(self) -> list[str]:
         """Concrete ways to make this configuration fit, largest saving first."""
         if self.fits:

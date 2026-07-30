@@ -169,20 +169,34 @@ bespoke converter.
 `train` estimates memory before it starts and refuses a configuration that
 cannot fit, because an out-of-memory error arrives whenever the allocator
 happens to hit the ceiling — which can be well into a run, after the tokenizer,
-the packing and the model build have all succeeded:
+the packing and the model build have all succeeded.
 
-```text
-memory     ~14.4 GiB needed of 8.0 GiB  NVIDIA RTX 3070 — 8 GiB VRAM
-error this configuration needs about 14.4 GiB but only 8.0 GiB is available.
+Reproduce the refusal below on any machine (the numbers on the right depend on
+your own memory, so yours will differ):
 
-try one of:
-  --grad-checkpoint  (saves ~4.2 GiB, costs ~30% speed)
-  --batch 8  (~7.9 GiB, fits)
-  --depth 10  (the largest depth that fits as configured)
+```bash
+bloomery prepare --name mine --synthetic 2000 --vocab 8192
+bloomery train --data mine --depth 12 --batch 8 --seq 512 --steps 1000 --device cpu
 ```
 
-The estimate is deliberately conservative; `--force` starts anyway. Note that
-gradient checkpointing is off by default, and the estimate accounts for that —
+```text
+memory     ~3.5 GiB needed of 1.2 GiB  system RAM — 2 GiB available, CPU only
+error this configuration needs about 3.5 GiB but only 1.2 GiB is available
+(system RAM — 2 GiB available, CPU only).
+
+try one of:
+  --grad-checkpoint  (saves ~1.1 GiB, costs ~30% speed)
+  --batch 4  (~2.8 GiB, still short)
+  --seq 256  (~2.8 GiB, still short)
+  --depth 5  (the largest depth that fits as configured)
+```
+
+Every suggestion is re-estimated against your actual budget before being
+offered, which is why some are labelled `still short` — a suggestion that does
+not help is worse than none. The estimate is deliberately conservative;
+`--force` starts anyway.
+
+Gradient checkpointing is off by default and the estimate accounts for that, so
 turning it on is usually the largest single saving available.
 
 ```bash
