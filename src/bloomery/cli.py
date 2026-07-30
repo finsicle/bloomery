@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import typer
 from rich.console import Console
@@ -47,7 +47,14 @@ def _quiet_transformers() -> None:
         pass
 
 
-def _die(message: str) -> None:
+def _die(message: str) -> NoReturn:
+    """Report a user-facing error and stop.
+
+    Annotated NoReturn so that everything after a call is provably unreachable.
+    Several handlers bind a name inside a `try` and read it afterwards; their
+    correctness depends on this raising, and `-> None` gave neither mypy nor a
+    reader that guarantee.
+    """
     console.print(f"[bold red]error[/bold red] {message}")
     raise typer.Exit(code=1)
 

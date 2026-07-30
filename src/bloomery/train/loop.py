@@ -437,7 +437,10 @@ def train(
                 tokens_per_second=round(throughput.value or 0.0, 1),
                 checkpoint=str(final_path),
                 per_component={k: round(v, 5) for k, v in tracker.best.items()} or None,
-                regressed=sorted(last_regressed) or None,
+                # Same shape as the `eval` event's field. run.jsonl is a
+                # published contract, so one key must not carry a dict in one
+                # event and a list in another.
+                regressed={k: round(last_regressed[k], 5) for k in sorted(last_regressed)} or None,
                 improvement={k: round(v, 5) for k, v in tracker.improvement().items()} or None,
             )
         )

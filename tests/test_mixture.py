@@ -209,6 +209,39 @@ class TestLineage:
         mix.save(m)
         assert len(mix.lineage(m)) == 1
 
+    def test_cyclic_parent_pointer_terminates(self) -> None:
+        """Version files are plain JSON and can be hand-edited into a loop.
+
+        Without a visited set this hangs the CLI instead of failing.
+        """
+        import json
+
+        v1 = blend()
+        mix.save(v1)
+        v2 = v1.with_component("x", 1.0)
+        mix.save(v2)
+
+        # Point v1's parent at v2, closing the loop.
+        path = mix.mixture_dir("b") / "v1.json"
+        payload = json.loads(path.read_text())
+        payload["parent_version"] = 2
+        path.write_text(json.dumps(payload))
+
+        chain = mix.lineage(mix.load("b", 2))
+        assert len(chain) <= 2
+
+    def test_self_referential_parent_terminates(self) -> None:
+        import json
+
+        v1 = blend()
+        mix.save(v1)
+        path = mix.mixture_dir("b") / "v1.json"
+        payload = json.loads(path.read_text())
+        payload["parent_version"] = 1
+        path.write_text(json.dumps(payload))
+
+        assert len(mix.lineage(mix.load("b", 1))) == 1
+
     def test_broken_chain_stops_instead_of_raising(self) -> None:
         """A partly deleted history should not block a training run."""
         v1 = blend()

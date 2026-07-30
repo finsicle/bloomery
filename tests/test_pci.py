@@ -4,10 +4,35 @@
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
+
+import pytest
 
 from bloomery.probe.pci import list_display_devices, vendors_present
 from bloomery.probe.types import Vendor
+
+
+def _symlinks_available() -> bool:
+    """Whether this platform lets an unprivileged process create a symlink."""
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "target"
+        target.mkdir()
+        try:
+            (Path(tmp) / "link").symlink_to(target)
+        except (OSError, NotImplementedError):
+            return False
+    return True
+
+
+# sysfs models a bound driver as a symlink, so the driver-name tests need real
+# symlinks. Creating one on Windows requires developer mode or elevation. The
+# code under test only ever reads /sys, which exists on Linux alone, so there is
+# genuinely nothing to cover on Windows — a fixture that failed there would say
+# nothing about the Linux behaviour.
+needs_symlinks = pytest.mark.skipif(
+    not _symlinks_available(), reason="symlink creation unavailable on this platform"
+)
 
 
 def add_device(
@@ -32,6 +57,7 @@ def add_device(
 
 
 class TestListDisplayDevices:
+    @needs_symlinks
     def test_finds_vga_class_nvidia(self, tmp_path: Path) -> None:
         devices = tmp_path / "devices"
         add_device(
@@ -48,6 +74,7 @@ class TestListDisplayDevices:
         assert found[0].driver == "nvidia"
         assert found[0].device_id == 0x2684
 
+    @needs_symlinks
     def test_finds_headless_compute_class(self, tmp_path: Path) -> None:
         # Datacentre cards report subclass 0x02, not the VGA-compatible 0x00.
         devices = tmp_path / "devices"

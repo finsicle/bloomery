@@ -260,8 +260,9 @@ class ForgettingTracker:
     def improvement(self) -> dict[str, float]:
         """How much each component improved from its first measurement to its best.
 
-        Negative means it never beat where it started — the clearest signal that a
-        component is being crowded out of the blend.
+        Never negative: `best` only ever moves downward, so a component that
+        never beat its opening measurement reports exactly zero. Zero is
+        therefore the signal that a component is being crowded out of the blend.
         """
         return {
             name: self.first[name] - self.best[name] for name in self.best if name in self.first

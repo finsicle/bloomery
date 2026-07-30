@@ -32,14 +32,33 @@ log = logging.getLogger(__name__)
 
 ENV_PRECISION = "BLOOMERY_PRECISION"
 
-# Keyed by device type, not device index: the answer depends on the hardware
-# family, and probing costs up to a second on Metal.
+# Memoised because the timing probe costs up to a second on Metal — negligible
+# once per training run, not once per call. See _cache_key for the identity used.
 _PRECISION_CACHE: dict[str, Any] = {}
 
 
 def clear_precision_cache() -> None:
     """Forget memoised precision decisions. For tests."""
     _PRECISION_CACHE.clear()
+
+
+def _cache_key(device: torch.device) -> str:
+    """Cache identity for a device.
+
+    CUDA is keyed by concrete index rather than by ``device.type``. A box can
+    hold cards of different generations — an A100 alongside a T4, say — where one
+    supports bf16 natively and the other does not. Caching both under "cuda"
+    would apply the first card's answer to every subsequent one.
+    """
+    if device.type != "cuda":
+        return device.type
+    try:
+        import torch
+
+        index = device.index if device.index is not None else torch.cuda.current_device()
+    except Exception:  # noqa: BLE001 - fall back to the family key
+        return device.type
+    return f"cuda:{index}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +176,7 @@ def _bf16_is_faster(device: torch.device, *, size: int = 384, reps: int = 5) -> 
 def select_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
     """Choose a compute dtype for this device.
 
-    Returns ``(dtype, use_autocast, reason)``. Memoised per device type: the
+    Returns ``(dtype, use_autocast, reason)``. Memoised per device identity: the
     timing probe costs up to a second on Metal, which is negligible once per
     training run but not once per call.
 
@@ -166,7 +185,8 @@ def select_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
     """
     import torch
 
-    cached = _PRECISION_CACHE.get(device.type)
+    key = _cache_key(device)
+    cached = _PRECISION_CACHE.get(key)
     if cached is not None:
         return cached
 
@@ -182,12 +202,12 @@ def select_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
         }.get(override)
         if forced is not None:
             result = (forced[0], forced[1], f"forced by {ENV_PRECISION}={override}")
-            _PRECISION_CACHE[device.type] = result
+            _PRECISION_CACHE[key] = result
             return result
         log.warning("ignoring unrecognised %s=%r", ENV_PRECISION, override)
 
     result = _probe_precision(device)
-    _PRECISION_CACHE[device.type] = result
+    _PRECISION_CACHE[key] = result
     return result
 
 
@@ -195,9 +215,20 @@ def _probe_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
     import torch
 
     if device.type == "cuda":
-        if torch.cuda.is_bf16_supported():
-            return torch.bfloat16, True, "cuda with bf16 support"
-        return torch.float16, True, "cuda without bf16; using fp16 autocast"
+        # including_emulation defaults to True, which would accept a card that
+        # merely emulates bf16 — the exact trap this module exists to avoid on
+        # CPU and Metal. Probed inside the device's own context so a multi-GPU
+        # box answers for the right card.
+        with torch.cuda.device(device if device.index is not None else torch.cuda.current_device()):
+            try:
+                native = torch.cuda.is_bf16_supported(including_emulation=False)
+            except TypeError:
+                # Older torch has no such parameter; its answer already excluded
+                # emulation.
+                native = torch.cuda.is_bf16_supported()
+        if native:
+            return torch.bfloat16, True, "cuda with native bf16"
+        return torch.float16, True, "cuda without native bf16; using fp16 autocast"
 
     if device.type == "mps":
         # Metal's bf16 coverage is uneven and moves between releases, so this is

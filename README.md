@@ -196,7 +196,7 @@ matters. A single aggregate validation loss is dominated by whichever component
 carries the most weight, so it can fall while the oldest corpus in the blend
 quietly degrades:
 
-```
+```text
   step 150  val loss 0.7004  ppl 2.01  new 0.696 old 0.742
   step 200  val loss 0.6913  ppl 2.00  new 0.687 old 0.731
   forgetting  old is 0.0180 above its best

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 from pathlib import Path
 from typing import Any
@@ -198,11 +199,11 @@ class TestForgettingTracker:
         tracker.update({"a": 1.0})
         assert tracker.improvement()["a"] == pytest.approx(2.0)
 
-    def test_improvement_is_negative_when_never_beaten(self) -> None:
+    def test_improvement_is_zero_when_never_beaten(self) -> None:
+        """Zero, not negative: `best` only ever moves downward."""
         tracker = ForgettingTracker(tolerance=0.0)
         tracker.update({"a": 1.0})
         tracker.update({"a": 5.0})
-        # Best stayed at the first value, so improvement is zero, not negative.
         assert tracker.improvement()["a"] == pytest.approx(0.0)
 
 
@@ -343,6 +344,47 @@ class TestPrecisionSelection:
         dev.select_precision(torch.device("cpu"))
         dev.select_precision(torch.device("cpu"))
         assert calls["n"] == 1
+
+    def test_cuda_rejects_emulated_bf16(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`is_bf16_supported()` defaults to including_emulation=True.
+
+        Accepting that default would reintroduce, on CUDA, exactly the
+        correct-but-slow trap this module exists to avoid on CPU and Metal.
+        """
+        import torch
+
+        from bloomery.train import device as dev
+
+        seen: dict[str, object] = {}
+
+        def fake_is_bf16_supported(including_emulation: bool = True) -> bool:
+            seen["including_emulation"] = including_emulation
+            # Native support absent; only emulation available.
+            return bool(including_emulation)
+
+        clear_precision_cache()
+        monkeypatch.delenv(dev.ENV_PRECISION, raising=False)
+        monkeypatch.setattr(torch.cuda, "is_bf16_supported", fake_is_bf16_supported)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "device", lambda _d: contextlib.nullcontext())
+
+        dtype, autocast, reason = dev._probe_precision(torch.device("cuda"))
+        assert seen["including_emulation"] is False
+        assert dtype is torch.float16
+        assert "without native bf16" in reason
+        assert autocast is True
+        clear_precision_cache()
+
+    def test_cuda_cache_key_is_per_device(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two cards of different generations must not share one answer."""
+        import torch
+
+        from bloomery.train.device import _cache_key
+
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        assert _cache_key(torch.device("cuda:0")) != _cache_key(torch.device("cuda:1"))
+        assert _cache_key(torch.device("cpu")) == "cpu"
+        assert _cache_key(torch.device("mps")) == "mps"
 
     def test_real_probe_returns_a_usable_answer(self) -> None:
         """Whatever this machine is, the probe must produce a workable dtype."""

@@ -327,11 +327,18 @@ def lineage(mixture: Mixture) -> list[Mixture]:
     """
     chain = [mixture]
     current = mixture
+    # Version files are plain JSON on disk and can be hand-edited, so a parent
+    # pointer that loops back on itself is reachable. Without this guard that
+    # would hang the CLI rather than fail.
+    seen = {mixture.version}
     while current.parent_version is not None:
+        if current.parent_version in seen:
+            break
         try:
             current = load(current.name, current.parent_version)
         except (MixtureError, OSError, json.JSONDecodeError):
             break
+        seen.add(current.version)
         chain.append(current)
     return list(reversed(chain))
 
