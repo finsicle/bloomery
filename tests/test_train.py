@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 
 from bloomery.arch import spec_from_depth
+from bloomery.mixture import single
 from bloomery.train import checkpoint as ckpt
 from bloomery.train.device import DeviceChoice, choose, select_precision
 from bloomery.train.loop import BatchSampler, TrainConfig, build_model, lr_at
@@ -191,7 +192,8 @@ def result(dataset: Any, tokenizer: Any, tmp_path_factory: Any) -> Any:
     )
     return train(
         spec=spec,
-        dataset=dataset,
+        datasets={"fixture": dataset},
+        mixture=single("fixture"),
         tokenizer=tokenizer,
         run_dir=tmp_path_factory.mktemp("integration"),
         config=TrainConfig(steps=40, batch=8, seq=32, eval_every=20, eval_batches=3, log_every=5),

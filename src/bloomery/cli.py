@@ -225,7 +225,15 @@ def prepare(
 
 @app.command()
 def train(
-    data: str = typer.Option(..., "--data", "-d", help="Dataset name from `prepare`."),
+    data: str | None = typer.Option(
+        None, "--data", "-d", help="Single dataset name from `prepare`."
+    ),
+    mix: str | None = typer.Option(
+        None, "--mix", "-m", help="Mixture name from `mix create`. Use instead of --data."
+    ),
+    mix_version: int | None = typer.Option(
+        None, "--mix-version", help="Pin a mixture version. Defaults to the newest."
+    ),
     name: str = typer.Option("run1", "--name", "-n", help="Name for this run."),
     depth: int | None = typer.Option(
         None, "--depth", help="Layer count. Everything else is derived from it."
@@ -262,27 +270,28 @@ def train(
         TimeElapsedColumn,
     )
 
+    from bloomery import mixture as mix_mod
     from bloomery.arch import actual_param_count, resolve_spec
-    from bloomery.data import load_dataset, load_tokenizer
     from bloomery.train import checkpoint as ckpt
     from bloomery.train.device import choose, thread_limit
     from bloomery.train.loop import TrainConfig
     from bloomery.train.loop import train as run_training
+    from bloomery.train.mixing import resolve as resolve_mixture
 
-    tokens_path = paths.tokens_dir(data)
-    tok_path = paths.tokenizer_dir(data)
-    if not tokens_path.is_dir() or not tok_path.is_dir():
-        _die(f"no dataset named {data!r}. Run `bloomery prepare --name {data} ...` first.")
+    if bool(data) == bool(mix):
+        _die("give exactly one of --data or --mix")
 
+    # A single dataset is a one-component blend, so the rest of the flow has a
+    # single path rather than a branch that can drift.
     try:
-        info = load_dataset(tokens_path)
+        blend = mix_mod.load(mix, mix_version) if mix else mix_mod.single(data or "")
+        resolved = resolve_mixture(blend)
+    except mix_mod.MixtureError as exc:
+        _die(str(exc))
     except FileNotFoundError as exc:
         _die(str(exc))
 
-    tokenizer = load_tokenizer(tok_path)
-    from bloomery.data import eot_id
-
-    eos = eot_id(tokenizer)
+    tokenizer = resolved.tokenizer
 
     try:
         spec = resolve_spec(size=size, depth=depth, vocab=len(tokenizer), seq=seq, batch=batch)
@@ -312,6 +321,7 @@ def train(
         gradient_checkpointing=grad_checkpoint,
     )
 
+    train_tokens = sum(i.split("train").tokens for i in resolved.datasets.values())
     console.print(
         f"model      [bold]{spec.label}[/bold]  "
         f"{spec.layers}L × {spec.hidden}d × {spec.heads}h  "
@@ -319,9 +329,19 @@ def train(
     )
     console.print(f"device     {choice.label()}  [dim]{choice.reason}[/dim]")
     console.print(
-        f"data       {info.split('train').tokens:,} train tokens  "
+        f"data       {train_tokens:,} train tokens  "
         f"[dim]{config.tokens_per_step:,} tokens/step[/dim]"
     )
+    if len(blend.components) > 1:
+        console.print(f"mixture    [bold]{blend.describe()}[/bold]")
+        replay = blend.replay_share()
+        if replay == 0:
+            console.print(
+                "[yellow]           no component is marked as replay — "
+                "an older corpus can degrade unnoticed[/yellow]"
+            )
+        else:
+            console.print(f"[dim]           replay share {replay * 100:.0f}%[/dim]")
     console.print()
 
     columns = (
@@ -344,21 +364,36 @@ def train(
                     ),
                 )
             elif event["event"] == "eval":
-                progress.console.print(
+                line = (
                     f"  [dim]step {event['step']}[/dim]  "
                     f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
                     f"ppl {event['perplexity']}"
                 )
+                per = event.get("per_component") or {}
+                if len(per) > 1:
+                    line += (
+                        "  [dim]"
+                        + " ".join(f"{k} {v:.3f}" for k, v in sorted(per.items()))
+                        + "[/dim]"
+                    )
+                progress.console.print(line)
+                # The point of per-component evaluation: name the corpus that is
+                # getting worse, while there is still time to raise its weight.
+                for component, delta in (event.get("regressed") or {}).items():
+                    progress.console.print(
+                        f"  [yellow]forgetting[/yellow]  {component} is {delta:.4f} above its best"
+                    )
 
         try:
             result = run_training(
                 spec=spec,
-                dataset=info,
+                datasets=resolved.datasets,
+                mixture=blend,
                 tokenizer=tokenizer,
                 run_dir=run_path,
                 config=config,
                 choice=choice,
-                eos_token_id=eos,
+                eos_token_id=resolved.eos_token_id,
                 resume_from=resume_from,
                 on_event=on_event,
             )
@@ -375,8 +410,186 @@ def train(
     if result.best_val_loss is not None:
         console.print(f"best val   [bold]{result.best_val_loss:.4f}[/bold]")
     console.print(f"throughput {result.tokens_per_second:,.0f} tok/s")
+    if len(result.per_component_loss) > 1:
+        console.print()
+        console.print("per component")
+        for component, loss in sorted(result.per_component_loss.items()):
+            flag = (
+                f"  [yellow]+{result.regressed[component]:.4f} over best[/yellow]"
+                if component in result.regressed
+                else ""
+            )
+            console.print(f"  {component:<24} {loss:.4f}{flag}")
+        if result.regressed:
+            console.print(
+                "\n[yellow]Some components ended worse than their best.[/yellow] "
+                "Raise their weight, or mark them as replay:\n"
+                f"  [bold]bloomery mix add {blend.name} "
+                f"--replay {next(iter(result.regressed))}:0.2[/bold]"
+            )
     console.print(f"checkpoint {result.checkpoint}")
     console.print(f"\nnext:  [bold]bloomery chat --run {name}[/bold]")
+
+
+# --------------------------------------------------------------------------- #
+# mix
+# --------------------------------------------------------------------------- #
+
+mix_app = typer.Typer(
+    name="mix",
+    help="Build and version weighted dataset blends.",
+    no_args_is_help=True,
+)
+app.add_typer(mix_app)
+
+
+def _parse_components(domain: list[str], replay: list[str]) -> list[Any]:
+    """Turn ``NAME:WEIGHT`` strings into components, tagged by role."""
+    from bloomery.mixture import ROLE_DOMAIN, ROLE_REPLAY, Component, parse_spec
+
+    components = []
+    for specs, role in ((domain, ROLE_DOMAIN), (replay, ROLE_REPLAY)):
+        for raw in specs:
+            dataset, weight = parse_spec(raw)
+            components.append(Component(dataset=dataset, weight=weight, role=role))
+    return components
+
+
+@mix_app.command("create")
+def mix_create(
+    name: str = typer.Option(..., "--name", "-n", help="Name for this mixture."),
+    add: list[str] = typer.Option(
+        [], "--add", help="Component as NAME:WEIGHT, e.g. domain:0.6. Repeatable."
+    ),
+    replay: list[str] = typer.Option(
+        [], "--replay", help="Same, but marked as replay data. Repeatable."
+    ),
+    note: str = typer.Option("", "--note", help="Why this blend exists."),
+) -> None:
+    """Create version 1 of a blend.
+
+    Weights are raw numbers, normalised on use — 60/15/25 and 0.6/0.15/0.25 are
+    the same blend. Mark the components that exist to prevent forgetting with
+    --replay; that share is what gets reported and warned about.
+    """
+    from bloomery import mixture as mix_mod
+
+    if not add and not replay:
+        _die("give at least one --add or --replay component")
+
+    try:
+        components = _parse_components(add, replay)
+        blend = mix_mod.create(name, components, note=note)
+        path = mix_mod.save(blend)
+    except mix_mod.MixtureError as exc:
+        _die(str(exc))
+
+    console.print(f"created    [bold]{blend.describe()}[/bold]")
+    console.print(f"replay     {blend.replay_share() * 100:.0f}%")
+    console.print(f"saved      {path}")
+    console.print(f"\nnext:  [bold]bloomery train --mix {name} --name run1[/bold]")
+
+
+@mix_app.command("list")
+def mix_list() -> None:
+    """List every blend, newest version of each."""
+    from bloomery import mixture as mix_mod
+
+    blends = mix_mod.list_all()
+    if not blends:
+        console.print("No mixtures yet. Create one with [bold]bloomery mix create[/bold].")
+        return
+    for blend in blends:
+        versions = mix_mod.versions(blend.name)
+        console.print(
+            f"[bold]{blend.name}[/bold]  v{blend.version}  "
+            f"[dim]({len(versions)} version(s), replay "
+            f"{blend.replay_share() * 100:.0f}%)[/dim]"
+        )
+        console.print(f"  {blend.describe()}")
+
+
+@mix_app.command("show")
+def mix_show(
+    name: str = typer.Argument(..., help="Mixture name."),
+    version: int | None = typer.Option(None, "--version", help="Defaults to newest."),
+) -> None:
+    """Show a blend, its weights and its full version history."""
+    from bloomery import mixture as mix_mod
+
+    try:
+        blend = mix_mod.load(name, version)
+    except mix_mod.MixtureError as exc:
+        _die(str(exc))
+
+    weights = blend.weights()
+    console.print(f"[bold]{blend.name}[/bold] v{blend.version}")
+    if blend.note:
+        console.print(f"[dim]{blend.note}[/dim]")
+    console.print()
+    for component in sorted(blend.components, key=lambda c: -c.weight):
+        role = "[cyan]replay[/cyan]" if component.role == "replay" else "domain"
+        console.print(
+            f"  {component.dataset:<24} {weights[component.dataset] * 100:>5.1f}%  "
+            f"[dim](raw {component.weight:g})[/dim]  {role}"
+        )
+    console.print(f"\n  replay share  {blend.replay_share() * 100:.0f}%")
+
+    chain = mix_mod.lineage(blend)
+    if len(chain) > 1:
+        console.print("\nlineage")
+        for entry in chain:
+            marker = "→" if entry.version == blend.version else " "
+            suffix = f"  [dim]{entry.note}[/dim]" if entry.note else ""
+            console.print(f"  {marker} v{entry.version}  {entry.describe()}{suffix}")
+
+
+@mix_app.command("add")
+def mix_add(
+    name: str = typer.Argument(..., help="Mixture name."),
+    add: list[str] = typer.Option([], "--add", help="NAME:WEIGHT to add or reweight."),
+    replay: list[str] = typer.Option([], "--replay", help="Same, marked as replay."),
+    remove: list[str] = typer.Option([], "--remove", help="Dataset name to drop."),
+    note: str = typer.Option("", "--note", help="Why this version exists."),
+) -> None:
+    """Create the next version of a blend.
+
+    Versions are immutable, so this never edits the current one — it writes a new
+    version that records the current one as its parent. That chain is what lets
+    you say exactly what a past run was trained on.
+    """
+    from bloomery import mixture as mix_mod
+
+    if not add and not replay and not remove:
+        _die("give at least one --add, --replay or --remove")
+
+    try:
+        blend = mix_mod.load(name)
+        for dataset in remove:
+            blend = blend.without_component(dataset, note=note)
+        for component in _parse_components(add, replay):
+            blend = blend.with_component(
+                component.dataset, component.weight, role=component.role, note=note
+            )
+        # Collapse the intermediate steps into one new version, so adding three
+        # components produces v2 rather than v2, v3 and v4.
+        current = mix_mod.load(name)
+        final = mix_mod.Mixture(
+            name=blend.name,
+            version=current.version + 1,
+            components=blend.components,
+            parent_version=current.version,
+            note=note,
+            created_at=blend.created_at,
+        )
+        path = mix_mod.save(final)
+    except mix_mod.MixtureError as exc:
+        _die(str(exc))
+
+    console.print(f"created    [bold]{final.describe()}[/bold]")
+    console.print(f"parent     v{final.parent_version}")
+    console.print(f"replay     {final.replay_share() * 100:.0f}%")
+    console.print(f"saved      {path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -546,6 +759,7 @@ def demo(
     _quiet_transformers()
     import shutil
 
+    from bloomery import mixture as mix_mod
     from bloomery.arch import actual_param_count, resolve_spec
     from bloomery.data import (
         build_dataset,
@@ -586,7 +800,8 @@ def demo(
 
     result = run_training(
         spec=spec,
-        dataset=info,
+        datasets={name: info},
+        mixture=mix_mod.single(name),
         tokenizer=tokenizer,
         run_dir=paths.run_dir(name),
         config=TrainConfig(

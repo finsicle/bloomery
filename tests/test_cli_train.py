@@ -371,3 +371,269 @@ class TestHelp:
         result = _invoke()
         for command in ("prepare", "train", "chat", "bench", "demo", "doctor"):
             assert command in result.stdout
+
+
+class TestMix:
+    def test_create_and_show(self, isolated_home: Path) -> None:
+        created = _invoke("mix", "create", "--name", "b", "--add", "new:0.9", "--replay", "old:0.1")
+        assert created.exit_code == 0, created.stdout
+        assert (isolated_home / "mixtures/b/v1.json").is_file()
+
+        shown = _invoke("mix", "show", "b")
+        assert shown.exit_code == 0
+        assert "90.0%" in shown.stdout
+        assert "replay" in shown.stdout
+
+    def test_weights_are_normalised_not_required_to_sum_to_one(self) -> None:
+        """60/15/25 must work as readily as 0.6/0.15/0.25."""
+        assert (
+            _invoke(
+                "mix",
+                "create",
+                "--name",
+                "raw",
+                "--add",
+                "a:60",
+                "--add",
+                "b:15",
+                "--replay",
+                "c:25",
+            ).exit_code
+            == 0
+        )
+        shown = _invoke("mix", "show", "raw")
+        assert "60.0%" in shown.stdout
+        assert "replay share  25%" in shown.stdout
+
+    def test_create_requires_a_component(self) -> None:
+        result = _invoke("mix", "create", "--name", "empty")
+        assert result.exit_code == 1
+        assert "at least one" in result.stdout
+
+    def test_malformed_spec_is_rejected(self) -> None:
+        result = _invoke("mix", "create", "--name", "b", "--add", "no-weight-here")
+        assert result.exit_code == 1
+        assert "cannot parse" in result.stdout
+
+    def test_add_creates_a_new_version_with_lineage(self, isolated_home: Path) -> None:
+        assert _invoke("mix", "create", "--name", "b", "--add", "new:0.9").exit_code == 0
+        added = _invoke("mix", "add", "b", "--replay", "old:0.3", "--note", "more replay")
+        assert added.exit_code == 0, added.stdout
+        assert "parent     v1" in added.stdout
+        assert (isolated_home / "mixtures/b/v2.json").is_file()
+        # v1 must survive unchanged; that is what makes a past run reproducible.
+        assert (isolated_home / "mixtures/b/v1.json").is_file()
+
+        shown = _invoke("mix", "show", "b")
+        assert "lineage" in shown.stdout
+        assert "more replay" in shown.stdout
+
+    def test_add_multiple_components_produces_one_version(self, isolated_home: Path) -> None:
+        """Three additions should give v2, not v2 through v4."""
+        assert _invoke("mix", "create", "--name", "b", "--add", "a:1").exit_code == 0
+        assert (
+            _invoke("mix", "add", "b", "--add", "c:1", "--add", "d:1", "--replay", "e:1").exit_code
+            == 0
+        )
+        versions = sorted(p.name for p in (isolated_home / "mixtures/b").iterdir())
+        assert versions == ["v1.json", "v2.json"]
+
+    def test_add_requires_an_operation(self) -> None:
+        assert _invoke("mix", "create", "--name", "b", "--add", "a:1").exit_code == 0
+        result = _invoke("mix", "add", "b")
+        assert result.exit_code == 1
+        assert "at least one" in result.stdout
+
+    def test_add_to_unknown_mixture(self) -> None:
+        result = _invoke("mix", "add", "ghost", "--add", "a:1")
+        assert result.exit_code == 1
+        assert "no mixture named" in result.stdout
+
+    def test_show_unknown_mixture(self) -> None:
+        result = _invoke("mix", "show", "ghost")
+        assert result.exit_code == 1
+
+    def test_list_empty_and_populated(self) -> None:
+        empty = _invoke("mix", "list")
+        assert empty.exit_code == 0
+        assert "No mixtures yet" in empty.stdout
+
+        _invoke("mix", "create", "--name", "one", "--add", "a:1")
+        _invoke("mix", "create", "--name", "two", "--add", "b:1")
+        listed = _invoke("mix", "list")
+        assert "one" in listed.stdout
+        assert "two" in listed.stdout
+
+
+class TestTrainOnMixture:
+    @pytest.fixture(autouse=True)
+    def prepared(self, isolated_home: Path) -> None:
+        # Two corpora sharing one tokenizer, which is what makes them blendable.
+        from bloomery import paths
+        from bloomery.data import (
+            build_dataset,
+            eot_id,
+            synthetic_documents,
+            train_tokenizer,
+        )
+
+        first = synthetic_documents(500, seed=1)
+        second = synthetic_documents(500, seed=2)
+        shared = train_tokenizer(
+            first + second, vocab_size=400, out_dir=paths.tokenizer_dir("alpha")
+        )
+        for name, docs in (("alpha", first), ("beta", second)):
+            shared.save_pretrained(str(paths.tokenizer_dir(name)))
+            build_dataset(
+                docs,
+                shared,
+                out_dir=paths.tokens_dir(name),
+                eot=eot_id(shared),
+                val_fraction=0.1,
+            )
+
+    def test_trains_on_a_blend_and_reports_each_component(self) -> None:
+        assert (
+            _invoke(
+                "mix", "create", "--name", "b", "--add", "alpha:0.8", "--replay", "beta:0.2"
+            ).exit_code
+            == 0
+        )
+
+        result = _invoke(
+            "train",
+            "--mix",
+            "b",
+            "--name",
+            "r",
+            "--depth",
+            "1",
+            "--steps",
+            "8",
+            "--batch",
+            "4",
+            "--seq",
+            "32",
+            "--eval-every",
+            "4",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, result.stdout
+        assert "mixture" in result.stdout
+        assert "replay share 20%" in result.stdout
+        assert "per component" in result.stdout
+
+    def test_records_the_mixture_in_the_run_log(self, isolated_home: Path) -> None:
+        from bloomery.train.metrics import read_events
+
+        _invoke("mix", "create", "--name", "b", "--add", "alpha:0.8", "--replay", "beta:0.2")
+        assert (
+            _invoke(
+                "train",
+                "--mix",
+                "b",
+                "--name",
+                "r",
+                "--depth",
+                "1",
+                "--steps",
+                "4",
+                "--batch",
+                "4",
+                "--seq",
+                "32",
+                "--device",
+                "cpu",
+            ).exit_code
+            == 0
+        )
+
+        start = next(
+            e for e in read_events(isolated_home / "runs/r/run.jsonl") if e["event"] == "start"
+        )
+        assert start["mixture"] == "b"
+        assert start["mixture_version"] == 1
+        assert start["replay_share"] == pytest.approx(0.2)
+        assert set(start["components"]) == {"alpha", "beta"}
+
+    def test_warns_when_a_blend_has_no_replay(self) -> None:
+        _invoke("mix", "create", "--name", "noreplay", "--add", "alpha:0.5", "--add", "beta:0.5")
+        result = _invoke(
+            "train",
+            "--mix",
+            "noreplay",
+            "--name",
+            "r",
+            "--depth",
+            "1",
+            "--steps",
+            "4",
+            "--batch",
+            "4",
+            "--seq",
+            "32",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, result.stdout
+        assert "no component is marked as replay" in result.stdout
+
+    def test_refuses_incompatible_tokenizers(self) -> None:
+        from bloomery import paths
+        from bloomery.data import (
+            build_dataset,
+            eot_id,
+            synthetic_documents,
+            train_tokenizer,
+        )
+
+        docs = synthetic_documents(300, seed=9)
+        foreign = train_tokenizer(docs, vocab_size=700, out_dir=paths.tokenizer_dir("foreign"))
+        build_dataset(
+            docs,
+            foreign,
+            out_dir=paths.tokens_dir("foreign"),
+            eot=eot_id(foreign),
+            val_fraction=0.1,
+        )
+        _invoke("mix", "create", "--name", "bad", "--add", "alpha:1", "--add", "foreign:1")
+
+        result = _invoke("train", "--mix", "bad", "--depth", "1", "--steps", "2", "--device", "cpu")
+        assert result.exit_code == 1
+        assert "different tokenizers" in result.stdout
+
+    def test_data_and_mix_are_mutually_exclusive(self) -> None:
+        result = _invoke("train", "--data", "alpha", "--mix", "b", "--steps", "2")
+        assert result.exit_code == 1
+        assert "exactly one" in result.stdout
+
+    def test_neither_data_nor_mix(self) -> None:
+        result = _invoke("train", "--steps", "2")
+        assert result.exit_code == 1
+
+    def test_pinning_a_mixture_version(self) -> None:
+        _invoke("mix", "create", "--name", "b", "--add", "alpha:1")
+        _invoke("mix", "add", "b", "--replay", "beta:1")
+        result = _invoke(
+            "train",
+            "--mix",
+            "b",
+            "--mix-version",
+            "1",
+            "--name",
+            "r",
+            "--depth",
+            "1",
+            "--steps",
+            "4",
+            "--batch",
+            "4",
+            "--seq",
+            "32",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, result.stdout
+        # v1 is a single component, so no mixture line is printed.
+        assert "replay share" not in result.stdout

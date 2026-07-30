@@ -20,9 +20,19 @@ from typing import TYPE_CHECKING, Any
 from bloomery.arch import suggested_lr, to_llama_config
 from bloomery.capability import ModelSpec
 from bloomery.data.shards import DatasetInfo, open_split
+from bloomery.mixture import Mixture
 from bloomery.train import checkpoint
 from bloomery.train.device import DeviceChoice
 from bloomery.train.metrics import MetricsWriter, Throughput
+
+# mixing imports BatchSampler and evaluate from this module, but does so inside
+# its functions, so importing it here at module level does not cycle.
+from bloomery.train.mixing import (  # noqa: E402 - ordering explained above
+    ForgettingTracker,
+    MixtureSampler,
+    evaluate_components,
+    weighted_mean,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
@@ -66,6 +76,11 @@ class TrainResult:
     tokens_seen: int
     tokens_per_second: float
     history: list[dict[str, Any]] = field(default_factory=list)
+    # Last measured validation loss per blend component, and any component that
+    # ended worse than its own best. Empty for a single-dataset run with no
+    # validation split.
+    per_component_loss: dict[str, float] = field(default_factory=dict)
+    regressed: dict[str, float] = field(default_factory=dict)
 
 
 def build_model(spec: ModelSpec, *, eos_token_id: int, seed: int) -> Any:
@@ -177,7 +192,8 @@ def evaluate(
 def train(
     *,
     spec: ModelSpec,
-    dataset: DatasetInfo,
+    datasets: dict[str, DatasetInfo],
+    mixture: Mixture,
     tokenizer: Any,
     run_dir: Path,
     config: TrainConfig,
@@ -187,6 +203,11 @@ def train(
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> TrainResult:
     """Train a model from random initialisation, or resume one.
+
+    Always trains against a :class:`~bloomery.mixture.Mixture`. A plain single
+    dataset is a one-component blend — see :func:`bloomery.mixture.single` — so
+    there is one sampling path, one evaluation path and one metrics shape rather
+    than two that drift apart.
 
     Emits every event to ``run.jsonl`` and, if given, to ``on_event`` for live
     display.
@@ -241,13 +262,19 @@ def train(
     # bf16 has the exponent range to avoid this, so the scaler stays disabled.
     scaler = torch.amp.GradScaler(choice.type, enabled=choice.dtype == torch.float16)
 
-    train_sampler = BatchSampler(dataset, "train", seq=config.seq, seed=config.seed)
-    val_sampler: BatchSampler | None
+    train_sampler = MixtureSampler(mixture, datasets, "train", seq=config.seq, seed=config.seed)
+
+    # A missing or too-small validation split is not fatal: training still works,
+    # you just lose the forgetting signal. Say so rather than aborting.
+    val_sampler: MixtureSampler | None
     try:
-        val_sampler = BatchSampler(dataset, "val", seq=config.seq, seed=config.seed + 1)
-    except (ValueError, FileNotFoundError):
+        val_sampler = MixtureSampler(mixture, datasets, "val", seq=config.seq, seed=config.seed + 1)
+    except (ValueError, FileNotFoundError, KeyError):
         val_sampler = None
 
+    tracker = ForgettingTracker()
+    last_per_component: dict[str, float] = {}
+    last_regressed: dict[str, float] = {}
     history: list[dict[str, Any]] = []
     throughput = Throughput()
     final_loss = float("nan")
@@ -272,6 +299,15 @@ def train(
                 val_tokens=val_sampler.tokens if val_sampler else 0,
                 peak_lr=peak_lr,
                 resumed_from=str(resume_from) if resume_from else None,
+                mixture=mixture.name,
+                mixture_version=mixture.version,
+                mixture_summary=mixture.describe(),
+                replay_share=round(mixture.replay_share(), 4),
+                components=train_sampler.effective_weights,
+                component_tokens=train_sampler.tokens_by_component(),
+                # Named so a component silently dropped from the blend cannot be
+                # mistaken for one that was never in it.
+                components_skipped=train_sampler.skipped or None,
                 config=config.to_dict(),
             )
         )
@@ -326,15 +362,25 @@ def train(
                 and (step + 1) % config.eval_every == 0
             )
             if should_eval and val_sampler is not None:
-                val_loss = evaluate(
+                # Each component is measured on its own held-out split. The
+                # aggregate is reported too, but it is dominated by whichever
+                # component carries the most weight, so on its own it can fall
+                # while an older corpus is being forgotten.
+                per_component = evaluate_components(
                     model,
-                    val_sampler,
+                    val_sampler.component_samplers(),
                     choice,
                     batch=config.batch,
                     batches=config.eval_batches,
                 )
+                regressed = tracker.update(per_component)
+                last_per_component = per_component
+                last_regressed = regressed
+                val_loss = weighted_mean(per_component, val_sampler.effective_weights)
+
                 if math.isfinite(val_loss) and (best_val is None or val_loss < best_val):
                     best_val = val_loss
+
                 record(
                     metrics.emit(
                         "eval",
@@ -344,6 +390,8 @@ def train(
                         perplexity=round(math.exp(min(val_loss, 20)), 2)
                         if math.isfinite(val_loss)
                         else None,
+                        per_component={k: round(v, 5) for k, v in per_component.items()},
+                        regressed={k: round(v, 5) for k, v in regressed.items()} or None,
                     )
                 )
 
@@ -356,7 +404,11 @@ def train(
                     step=step + 1,
                     tokens_seen=tokens_seen,
                     best_val_loss=best_val,
-                    extra={"spec": asdict(spec), "config": config.to_dict()},
+                    extra={
+                        "spec": asdict(spec),
+                        "config": config.to_dict(),
+                        "mixture": mixture.to_dict(),
+                    },
                 )
                 record(metrics.emit("checkpoint", step=step + 1, path=str(path)))
 
@@ -368,7 +420,11 @@ def train(
             step=config.steps,
             tokens_seen=tokens_seen,
             best_val_loss=best_val,
-            extra={"spec": asdict(spec), "config": config.to_dict()},
+            extra={
+                "spec": asdict(spec),
+                "config": config.to_dict(),
+                "mixture": mixture.to_dict(),
+            },
         )
 
         record(
@@ -380,6 +436,9 @@ def train(
                 tokens=tokens_seen,
                 tokens_per_second=round(throughput.value or 0.0, 1),
                 checkpoint=str(final_path),
+                per_component={k: round(v, 5) for k, v in tracker.best.items()} or None,
+                regressed=sorted(last_regressed) or None,
+                improvement={k: round(v, 5) for k, v in tracker.improvement().items()} or None,
             )
         )
 
@@ -392,4 +451,6 @@ def train(
         tokens_seen=tokens_seen,
         tokens_per_second=throughput.value or 0.0,
         history=history,
+        per_component_loss=last_per_component,
+        regressed=last_regressed,
     )

@@ -36,6 +36,11 @@ def runs_dir() -> Path:
     return home() / "runs"
 
 
+def mixtures_dir() -> Path:
+    """Weighted dataset blends, one directory per name, one file per version."""
+    return home() / "mixtures"
+
+
 def exports_dir() -> Path:
     return home() / "exports"
 
@@ -46,7 +51,7 @@ def cache_dir() -> Path:
 
 def dataset_dir(name: str) -> Path:
     """Everything produced by `prepare` for one named corpus."""
-    return datasets_dir() / _slug(name)
+    return datasets_dir() / slug(name)
 
 
 def tokenizer_dir(name: str) -> Path:
@@ -58,10 +63,10 @@ def tokens_dir(name: str) -> Path:
 
 
 def run_dir(name: str) -> Path:
-    return runs_dir() / _slug(name)
+    return runs_dir() / slug(name)
 
 
-def _slug(name: str) -> str:
+def slug(name: str) -> str:
     """Make a user-supplied name safe to use as a directory.
 
     Names come from the CLI and will later come from a web form, so this must
@@ -84,6 +89,7 @@ def ensure_home() -> Path:
         datasets_dir(),
         blooms_dir(),
         runs_dir(),
+        mixtures_dir(),
         exports_dir(),
         cache_dir(),
     ):
