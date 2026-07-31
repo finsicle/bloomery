@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -907,7 +908,32 @@ def demo(
     )
 
 
+def _force_utf8_output() -> None:
+    """Make stdout and stderr UTF-8 regardless of the platform's locale.
+
+    Windows defaults to the locale codec — cp1252 for most installs — whenever
+    output is not a console, which is exactly what happens when a command is
+    redirected to a file or captured by the job runner. The report uses "→" and
+    "×", none of which cp1252 can encode, so the command died with
+    UnicodeEncodeError partway through printing rather than doing its work.
+
+    errors="replace" as well as the encoding: losing a character from a progress
+    line is a far better outcome than killing a twelve-hour training run over it.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            # A stream that cannot be reconfigured, such as one already replaced
+            # by a test harness. Nothing to do, and not worth failing over.
+            continue
+
+
 def main() -> None:
+    _force_utf8_output()
     app()
 
 
