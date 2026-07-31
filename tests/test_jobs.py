@@ -472,6 +472,12 @@ class TestSupervisor:
                 break
             time.sleep(0.05)
 
+        # Captured now, because the point of the fix under test is that cancel()
+        # records the job as cancelled *before* killing it — by the time the
+        # cleanup below runs it is no longer visible as a running job, and the
+        # kill that would normally reap it is stubbed out.
+        strays = [store.get(victim.id).pid]
+
         # A termination slow enough that holding the lock would be obvious.
         started = threading.Event()
         release = threading.Event()
@@ -504,9 +510,8 @@ class TestSupervisor:
         finally:
             release.set()
             canceller.join(timeout=10)
-            for job in store.find(status=JobStatus.RUNNING, limit=10):
-                if job.pid:
-                    runner.terminate_all([job.pid], grace=1)
+            strays.extend(j.pid for j in store.find(status=JobStatus.RUNNING, limit=10) if j.pid)
+            runner.terminate_all([pid for pid in strays if pid], grace=1)
 
     def test_terminate_all_pays_the_grace_period_once(self) -> None:
         """Shutting down several jobs must not cost one grace period each."""
