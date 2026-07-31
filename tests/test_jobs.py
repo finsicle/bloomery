@@ -695,6 +695,96 @@ class TestReconcile:
             if process.poll() is None:  # pragma: no cover - cleanup
                 process.kill()
 
+    def test_shutdown_keeps_a_real_outcome(
+        self, store: JobStore, tmp_path: Path, stub_command
+    ) -> None:
+        """A job that finished just before shutdown must not be recorded cancelled.
+
+        The loop exits the moment the stop event is set, with no final pass, so a
+        process that completed during the last poll interval is still in
+        _running with its real outcome unrecorded.
+        """
+        stub_command(lambda job: quick(0))
+        sup = Supervisor(store=store, home=tmp_path, poll_seconds=30)
+        job = sup.submit(JobKind.PREPARE, {})
+        sup.tick()  # launches it
+        assert store.get(job.id).status is JobStatus.RUNNING
+
+        # Let it finish, without giving the supervisor a chance to notice.
+        entry = sup._running[job.id]
+        entry.launched.process.wait(timeout=30)
+
+        sup.stop(cancel_running=True)
+
+        assert store.get(job.id).status is JobStatus.SUCCEEDED
+        assert store.get(job.id).exit_code == 0
+
+    def test_shutdown_still_cancels_what_is_really_running(
+        self, store: JobStore, tmp_path: Path, stub_command
+    ) -> None:
+        stub_command(lambda job: sleeper(60))
+        sup = Supervisor(store=store, home=tmp_path, poll_seconds=30)
+        job = sup.submit(JobKind.PREPARE, {})
+        sup.tick()
+        pid = store.get(job.id).pid
+
+        sup.stop(cancel_running=True)
+
+        assert store.get(job.id).status is JobStatus.CANCELLED
+        assert not runner.is_alive(pid, store.get(job.id).pid_created_at)
+
+    def test_a_job_with_no_recorded_identity_is_not_signalled(
+        self, store: JobStore, tmp_path: Path
+    ) -> None:
+        """An unreadable creation time must not become a licence to kill by pid.
+
+        Storing 0.0 for an unavailable identity was worse than storing nothing:
+        it looked like data, matched no real process, and left the job both
+        unkillable and permanently misreported.
+        """
+        import subprocess
+
+        bystander = subprocess.Popen(sleeper(45))
+        try:
+            job = store.create(JobKind.TRAIN, {})
+            store.mark_started(job.id, pid=bystander.pid, pid_created_at=None)
+
+            sup = Supervisor(store=store, home=tmp_path)
+            assert sup.cancel(job.id) is True
+            assert store.get(job.id).status is JobStatus.CANCELLED
+
+            time.sleep(1.0)
+            assert bystander.poll() is None, "signalled a pid it could not verify"
+        finally:
+            bystander.kill()
+            bystander.wait(timeout=10)
+
+    def test_exclusivity_is_read_from_the_entry_not_the_store(
+        self, store: JobStore, tmp_path: Path, stub_command, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Scheduling must not hit the database once per running job per tick."""
+        stub_command(lambda job: sleeper(30))
+        sup = Supervisor(store=store, home=tmp_path, max_concurrent=4, poll_seconds=0.05)
+        first = sup.submit(JobKind.TRAIN, {})
+        sup.tick()
+
+        reads = 0
+        original = store.get
+
+        def counting_get(job_id: str):  # noqa: ANN202
+            nonlocal reads
+            reads += 1
+            return original(job_id)
+
+        monkeypatch.setattr(store, "get", counting_get)
+        try:
+            before = reads
+            sup._exclusive_running()
+            assert reads == before, "exclusivity check still queried the store"
+        finally:
+            monkeypatch.undo()
+            sup.cancel(first.id)
+
     def test_queued_jobs_are_untouched(self, store: JobStore, tmp_path: Path) -> None:
         job = store.create(JobKind.TRAIN, {})
         Supervisor(store=store, home=tmp_path).reconcile()

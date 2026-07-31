@@ -52,17 +52,23 @@ class Launched:
     def pid(self) -> int:
         return self.process.pid
 
-    def created_at(self) -> float:
+    def created_at(self) -> float | None:
         """Process creation time, used with the PID to prove identity later.
 
         A PID on its own is not evidence: they are reused, and a supervisor that
         restarts an hour later must not mistake an unrelated process for the
         worker it lost.
+
+        None when the identity could not be read — AccessDenied can happen while
+        the process is perfectly alive. Returning 0.0 for that case was worse
+        than useless: it stored a plausible-looking number that no real creation
+        time can match, so the job became both unkillable and permanently
+        misreported as interrupted.
         """
         try:
             return psutil.Process(self.process.pid).create_time()
         except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return 0.0
+            return None
 
 
 # Parameter name -> command-line flag, per job kind. Declarative so that a
@@ -266,9 +272,9 @@ def launch(
 def _same_process(process: psutil.Process, created_at: float | None) -> bool:
     """Whether this is really the process that was recorded, not a reused pid.
 
-    ``created_at`` of None means the caller has no recorded identity and accepts
-    whatever holds the number. Nothing in the supervisor does that: a pid is
-    always stored alongside its creation time.
+    ``created_at`` of None means the caller is not asking for a check, which is
+    only safe when it holds the process handle itself. The supervisor never
+    passes None for a pid recovered from the store — see Supervisor.cancel.
     """
     if created_at is None:
         return True

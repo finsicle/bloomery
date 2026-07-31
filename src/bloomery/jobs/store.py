@@ -148,7 +148,7 @@ class JobStore:
             conn.execute(f"UPDATE jobs SET {assignments} WHERE id = :id", row)
         return job
 
-    def mark_started(self, job_id: str, *, pid: int, pid_created_at: float) -> None:
+    def mark_started(self, job_id: str, *, pid: int, pid_created_at: float | None) -> None:
         with self.connect() as conn:
             conn.execute(
                 "UPDATE jobs SET status = ?, started_at = ?, pid = ?, pid_created_at = ? "

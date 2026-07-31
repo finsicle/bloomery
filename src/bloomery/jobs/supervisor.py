@@ -41,7 +41,10 @@ class _Running:
     job_id: str
     launched: runner.Launched
     # Kept beside the pid so shutdown can prove identity before signalling.
-    pid_created_at: float
+    pid_created_at: float | None
+    # Fixed once the job starts, so it is recorded here rather than re-read from
+    # the store on every scheduling pass while the lock is held.
+    exclusive: bool
 
 
 class Supervisor:
@@ -91,6 +94,12 @@ class Supervisor:
             self._thread = None
         if not cancel_running:
             return
+
+        # Reap first. The loop exits the moment the stop event is set, without a
+        # final pass, so a process that finished during the last poll interval is
+        # still sitting in _running with its real outcome unrecorded. Marking it
+        # cancelled here would overwrite a job that had actually succeeded.
+        self._collect_finished()
 
         # Signal every tree at once. Cancelling serially would pay the full
         # grace period per job, so shutting down four jobs would take a minute.
@@ -170,7 +179,21 @@ class Supervisor:
             pid: int | None
             pid_created_at: float | None
             if entry is not None:
+                # This supervisor holds the handle, so the pid is its own by
+                # construction and needs no further proof.
                 pid, pid_created_at = entry.launched.pid, entry.pid_created_at
+            elif job.pid_created_at is None:
+                # A record with no identity, from a launch where the creation
+                # time could not be read. There is no way to tell the original
+                # process from whatever now holds the number, so it is left
+                # alone. Recording the cancellation without killing anything is
+                # the safe half of the job; killing the wrong process is not
+                # recoverable.
+                log.warning(
+                    "job %s has no recorded process identity; cancelling without signalling",
+                    job_id,
+                )
+                pid, pid_created_at = None, None
             else:
                 # No handle, so this record may be stale — reconcile() leaves a
                 # live-but-unadopted job running, and once it exits nothing
@@ -238,11 +261,7 @@ class Supervisor:
                     return
 
     def _exclusive_running(self) -> bool:
-        for entry in self._running.values():
-            job = self.store.get(entry.job_id)
-            if job is not None and job.exclusive:
-                return True
-        return False
+        return any(entry.exclusive for entry in self._running.values())
 
     def _launch(self, job: Job) -> bool:
         request = ResourceRequest.from_dict(job.params.get("resources"))
@@ -260,7 +279,10 @@ class Supervisor:
         pid_created_at = launched.created_at()
         self.store.mark_started(job.id, pid=launched.pid, pid_created_at=pid_created_at)
         self._running[job.id] = _Running(
-            job_id=job.id, launched=launched, pid_created_at=pid_created_at
+            job_id=job.id,
+            launched=launched,
+            pid_created_at=pid_created_at,
+            exclusive=job.exclusive,
         )
         self._after_change(job.id)
         return True
