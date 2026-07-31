@@ -482,7 +482,7 @@ class TestSupervisor:
         started = threading.Event()
         release = threading.Event()
 
-        def slow_terminate(pid, **kwargs):  # noqa: ANN001, ANN003
+        def slow_terminate(pid, created_at=None, **kwargs):  # noqa: ANN001, ANN003
             started.set()
             release.wait(timeout=10)
             return True
@@ -511,7 +511,7 @@ class TestSupervisor:
             release.set()
             canceller.join(timeout=10)
             strays.extend(j.pid for j in store.find(status=JobStatus.RUNNING, limit=10) if j.pid)
-            runner.terminate_all([pid for pid in strays if pid], grace=1)
+            runner.terminate_all([(pid, None) for pid in strays if pid], grace=1)
 
     def test_terminate_all_pays_the_grace_period_once(self) -> None:
         """Shutting down several jobs must not cost one grace period each."""
@@ -520,7 +520,7 @@ class TestSupervisor:
         processes = [subprocess.Popen(sleeper(60)) for _ in range(3)]
         try:
             started = time.monotonic()
-            signalled = runner.terminate_all([p.pid for p in processes], grace=5)
+            signalled = runner.terminate_all([(p.pid, None) for p in processes], grace=5)
             elapsed = time.monotonic() - started
             assert signalled >= 3
             # Serial termination of three trees would exceed one grace period.
@@ -645,6 +645,55 @@ class TestReconcile:
         Supervisor(store=store, home=tmp_path).reconcile()
 
         assert store.get(job.id).status is JobStatus.INTERRUPTED
+
+    def test_cancelling_a_stale_record_cannot_kill_a_bystander(
+        self, store: JobStore, tmp_path: Path
+    ) -> None:
+        """The reachable version of pid reuse, and the reason kills are verified.
+
+        reconcile() deliberately leaves a live-but-unadopted job as RUNNING, and
+        nothing then collects it when the process finally exits — so the store
+        can hold a pid long after it stopped belonging to that job. Cancelling
+        such a record used to send SIGTERM then SIGKILL to whatever the machine
+        had since given that number to.
+        """
+        import subprocess
+
+        bystander = subprocess.Popen(sleeper(45))
+        try:
+            recorded_at = psutil.Process(bystander.pid).create_time()
+            job = store.create(JobKind.TRAIN, {})
+            # Same pid, but recorded as having started long before this process.
+            store.mark_started(job.id, pid=bystander.pid, pid_created_at=recorded_at - 10_000)
+
+            sup = Supervisor(store=store, home=tmp_path)
+            assert sup.cancel(job.id) is True
+            assert store.get(job.id).status is JobStatus.CANCELLED
+
+            time.sleep(1.0)
+            assert bystander.poll() is None, "cancel killed an unrelated process"
+        finally:
+            bystander.kill()
+            bystander.wait(timeout=10)
+
+    def test_terminate_skips_a_recycled_pid(self) -> None:
+        """The guard at the level it is enforced."""
+        import subprocess
+
+        process = subprocess.Popen(sleeper(45))
+        try:
+            wrong_time = psutil.Process(process.pid).create_time() - 10_000
+            assert runner.terminate(process.pid, wrong_time, grace=1) is False
+            time.sleep(0.5)
+            assert process.poll() is None
+
+            # With the right identity it is stopped as usual.
+            correct_time = psutil.Process(process.pid).create_time()
+            assert runner.terminate(process.pid, correct_time, grace=5) is True
+            process.wait(timeout=10)
+        finally:
+            if process.poll() is None:  # pragma: no cover - cleanup
+                process.kill()
 
     def test_queued_jobs_are_untouched(self, store: JobStore, tmp_path: Path) -> None:
         job = store.create(JobKind.TRAIN, {})

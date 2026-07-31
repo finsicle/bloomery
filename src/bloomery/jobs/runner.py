@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,11 @@ from typing import Any
 import psutil
 
 from bloomery.jobs.types import Job, JobKind, ResourceRequest
+
+# How far a process's reported creation time may drift from the recorded one and
+# still be considered the same process. Filesystem and clock granularity vary by
+# platform, so an exact match is not reliable.
+PID_IDENTITY_TOLERANCE = 1.0
 
 # How long a cancelled process is given to exit on its own before being killed.
 # Long enough for the trainer to finish writing the checkpoint it is midway
@@ -257,28 +263,58 @@ def launch(
     return Launched(process=process, command=command, limits_note=limits_note)
 
 
-def _family(pid: int) -> list[psutil.Process]:
-    """A process and its descendants, children first.
+def _same_process(process: psutil.Process, created_at: float | None) -> bool:
+    """Whether this is really the process that was recorded, not a reused pid.
 
-    Children first so a worker cannot outlive a dataloader it spawned.
+    ``created_at`` of None means the caller has no recorded identity and accepts
+    whatever holds the number. Nothing in the supervisor does that: a pid is
+    always stored alongside its creation time.
+    """
+    if created_at is None:
+        return True
+    try:
+        return abs(process.create_time() - created_at) <= PID_IDENTITY_TOLERANCE
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def _family(pid: int, created_at: float | None) -> list[psutil.Process]:
+    """A process and its descendants, children first, or nothing if the pid was reused.
+
+    Children first so a worker cannot outlive a dataloader it spawned. The
+    identity check is the important part: pids are recycled, and a stale record
+    pointed at a recycled number would otherwise send SIGKILL to whatever the
+    machine has since put there.
     """
     try:
         parent = psutil.Process(pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return []
+    if not _same_process(parent, created_at):
+        return []
+    try:
         return [*parent.children(recursive=True), parent]
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return []
 
 
-def terminate_all(pids: list[int], *, grace: float = TERMINATE_GRACE_SECONDS) -> int:
+def terminate_all(
+    targets: Sequence[tuple[int, float | None]],
+    *,
+    grace: float = TERMINATE_GRACE_SECONDS,
+) -> int:
     """Stop several process trees, paying the grace period once rather than per tree.
 
-    Everything is signalled first and waited on together. Cancelling four jobs
-    one at a time would otherwise cost four full grace periods in sequence.
+    Each target is the pid together with the creation time recorded when it was
+    started, so a recycled pid is skipped rather than killed. Everything is
+    signalled first and waited on together: cancelling four jobs one at a time
+    would otherwise cost four full grace periods in sequence.
+
     Returns how many processes were signalled.
     """
     family: list[psutil.Process] = []
-    for pid in pids:
-        family.extend(_family(pid))
+    for pid, created_at in targets:
+        family.extend(_family(pid, created_at))
     if not family:
         return 0
 
@@ -298,13 +334,18 @@ def terminate_all(pids: list[int], *, grace: float = TERMINATE_GRACE_SECONDS) ->
     return len(family)
 
 
-def terminate(pid: int, *, grace: float = TERMINATE_GRACE_SECONDS) -> bool:
+def terminate(
+    pid: int,
+    created_at: float | None = None,
+    *,
+    grace: float = TERMINATE_GRACE_SECONDS,
+) -> bool:
     """Stop one job's process tree. Returns whether anything was signalled.
 
     Everything is asked politely before being killed, which gives the trainer a
     chance to finish writing a checkpoint it is midway through.
     """
-    return terminate_all([pid], grace=grace) > 0
+    return terminate_all([(pid, created_at)], grace=grace) > 0
 
 
 def is_alive(pid: int | None, created_at: float | None) -> bool:
@@ -317,7 +358,7 @@ def is_alive(pid: int | None, created_at: float | None) -> bool:
         return False
     try:
         process = psutil.Process(pid)
-        if created_at is not None and abs(process.create_time() - created_at) > 1.0:
+        if not _same_process(process, created_at):
             return False
         return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
     except (psutil.NoSuchProcess, psutil.AccessDenied):

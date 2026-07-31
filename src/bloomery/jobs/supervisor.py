@@ -40,6 +40,8 @@ DEFAULT_MAX_CONCURRENT = 2
 class _Running:
     job_id: str
     launched: runner.Launched
+    # Kept beside the pid so shutdown can prove identity before signalling.
+    pid_created_at: float
 
 
 class Supervisor:
@@ -95,13 +97,13 @@ class Supervisor:
         with self._lock:
             entries = list(self._running.items())
             self._running.clear()
-            pids = [entry.launched.pid for _, entry in entries]
+            targets = [(entry.launched.pid, entry.pid_created_at) for _, entry in entries]
             for job_id, _ in entries:
                 job = self.store.get(job_id)
                 if job is not None and not job.status.terminal:
                     self.store.mark_finished(job_id, JobStatus.CANCELLED)
 
-        runner.terminate_all(pids)
+        runner.terminate_all(targets)
         for job_id, _ in entries:
             self._after_change(job_id)
 
@@ -165,13 +167,22 @@ class Supervisor:
                 return True
 
             entry = self._running.pop(job_id, None)
-            pid = entry.launched.pid if entry else job.pid
+            pid: int | None
+            pid_created_at: float | None
+            if entry is not None:
+                pid, pid_created_at = entry.launched.pid, entry.pid_created_at
+            else:
+                # No handle, so this record may be stale — reconcile() leaves a
+                # live-but-unadopted job running, and once it exits nothing
+                # collects it. The creation time is what stops the kill landing
+                # on whatever the machine has since given that number to.
+                pid, pid_created_at = job.pid, job.pid_created_at
             # Recorded as cancelled before the process actually dies, so a
             # concurrent tick() cannot reclassify it from its exit code.
             self.store.mark_finished(job_id, JobStatus.CANCELLED)
 
         if pid is not None:
-            runner.terminate(pid)
+            runner.terminate(pid, pid_created_at)
         self._after_change(job_id)
         return True
 
@@ -246,8 +257,11 @@ class Supervisor:
         job.log_path = str(log_path)
         job.limits_note = launched.limits_note
         self.store.update(job)
-        self.store.mark_started(job.id, pid=launched.pid, pid_created_at=launched.created_at())
-        self._running[job.id] = _Running(job_id=job.id, launched=launched)
+        pid_created_at = launched.created_at()
+        self.store.mark_started(job.id, pid=launched.pid, pid_created_at=pid_created_at)
+        self._running[job.id] = _Running(
+            job_id=job.id, launched=launched, pid_created_at=pid_created_at
+        )
         self._after_change(job.id)
         return True
 
