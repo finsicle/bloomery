@@ -288,7 +288,12 @@ def _register_routes(app: FastAPI, state: Any) -> None:
                     }
                 )
                 while True:
-                    event = await queue.get()
+                    event = await st.hub.next_event(queue)
+                    if event is None:
+                        # The hub is closing. Leaving the loop lets the handler
+                        # finish, which is what allows uvicorn's shutdown to
+                        # proceed instead of waiting out its grace period.
+                        break
                     await websocket.send_json(event)
         except WebSocketDisconnect:
             return

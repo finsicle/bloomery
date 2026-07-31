@@ -14,6 +14,7 @@ is one less dependency for a handful of tests.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
@@ -302,6 +303,82 @@ class TestEventHub:
         assert size == 4, "queue grew past its limit"
         assert newest["n"] == 9, "kept the stale events instead of the fresh ones"
 
+    def test_a_parked_reader_wakes_on_close(self) -> None:
+        """Otherwise every restart waits out uvicorn's graceful-shutdown timeout.
+
+        Uvicorn waits for active tasks before running lifespan teardown, so a
+        websocket handler blocked on an empty queue would sit through the whole
+        grace period and then be force-cancelled — the client dropped rather
+        than closed.
+        """
+
+        async def scenario() -> Any:
+            hub = EventHub()
+            hub.bind()
+            async with hub.subscribe() as queue:
+                reader = asyncio.create_task(hub.next_event(queue))
+                await asyncio.sleep(0.05)
+                assert not reader.done(), "reader should be parked"
+                await hub.close()
+                return await asyncio.wait_for(reader, timeout=5)
+
+        assert asyncio.run(scenario()) is None
+
+    def test_a_full_queue_still_learns_about_shutdown(self) -> None:
+        """The reason the wake-up is a flag and not a sentinel event.
+
+        A sentinel would be pushed with put_nowait, which a full queue rejects —
+        so it would go missing exactly when the server is busiest, which is the
+        worst moment for shutdown to hang.
+        """
+
+        async def scenario() -> Any:
+            hub = EventHub(queue_limit=2)
+            hub.bind()
+            async with hub.subscribe() as queue:
+                for n in range(6):
+                    hub.publish_threadsafe({"n": n})
+                await asyncio.sleep(0.05)
+                assert queue.full()
+                await hub.close()
+
+                last: Any = object()
+                while last is not None:
+                    last = await asyncio.wait_for(hub.next_event(queue), timeout=5)
+                return last
+
+        assert asyncio.run(scenario()) is None
+
+    def test_subscribing_after_close_does_not_park_forever(self) -> None:
+        async def scenario() -> Any:
+            hub = EventHub()
+            hub.bind()
+            await hub.close()
+            async with hub.subscribe() as queue:
+                return await asyncio.wait_for(hub.next_event(queue), timeout=5)
+
+        assert asyncio.run(scenario()) is None
+
+    def test_close_drops_whatever_was_still_buffered(self) -> None:
+        """Shutdown wins over delivery, deliberately.
+
+        These are status updates for a live view and the connection is ending
+        anyway. Draining them into a socket that may not be reading is the exact
+        stall the wake-up exists to prevent.
+        """
+
+        async def scenario() -> Any:
+            hub = EventHub()
+            hub.bind()
+            async with hub.subscribe() as queue:
+                hub.publish_threadsafe({"n": 1})
+                await asyncio.sleep(0.05)
+                assert queue.qsize() == 1
+                await hub.close()
+                return await asyncio.wait_for(hub.next_event(queue), timeout=5)
+
+        assert asyncio.run(scenario()) is None
+
     def test_unsubscribing_stops_delivery(self) -> None:
         async def scenario() -> int:
             hub = EventHub()
@@ -348,6 +425,17 @@ class TestWiring:
             socket.receive_json()  # snapshot
             supervisor.submit(JobKind.PREPARE, {})
             assert socket.receive_json()["job"]["kind"] == "prepare"
+
+    def test_shutdown_is_not_delayed_by_an_open_socket(
+        self, store: JobStore, tmp_path: Path
+    ) -> None:
+        """The behaviour the wake-up exists for, at the level a user would feel."""
+        app = create_app(store=store, home=tmp_path, start_supervisor=False)
+        started = time.monotonic()
+        with TestClient(app) as test_client, test_client.websocket_connect("/api/stream") as socket:
+            socket.receive_json()  # snapshot; the handler is now parked
+        elapsed = time.monotonic() - started
+        assert elapsed < 5, f"shutdown took {elapsed:.1f}s with a socket open"
 
     def test_the_openapi_schema_builds(self, client: Any) -> None:
         schema = client.get("/openapi.json").json()

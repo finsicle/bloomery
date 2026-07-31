@@ -41,6 +41,9 @@ class EventHub:
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._lock = asyncio.Lock()
+        # Set on close. Readers wait on this *alongside* their queue, so a
+        # handler parked on an empty queue still learns that shutdown started.
+        self._closing = asyncio.Event()
 
     def bind(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """Record the loop that publishes must be marshalled onto.
@@ -95,6 +98,48 @@ class EventHub:
             async with self._lock:
                 self._subscribers.discard(queue)
 
+    async def next_event(self, queue: asyncio.Queue[dict[str, Any]]) -> dict[str, Any] | None:
+        """The next event for this subscriber, or None once the hub is closing.
+
+        A reader parked on ``queue.get()`` has no way to notice shutdown on its
+        own. Uvicorn waits for active tasks *before* running lifespan teardown,
+        so a websocket handler blocked here would sit through the whole graceful
+        shutdown period and then be force-cancelled — every restart paying that
+        timeout, and a client dropped rather than closed.
+
+        The wake-up is a separate flag rather than a sentinel pushed onto the
+        queue, because a full queue rejects ``put_nowait``: a sentinel would go
+        missing exactly when the server is busiest, which is the worst time for
+        shutdown to hang.
+        """
+        if self._closing.is_set():
+            # Anything still buffered is dropped. These are status updates for a
+            # live view and the connection is ending either way; draining them
+            # into a socket that may not be reading is the stall this method
+            # exists to prevent.
+            return None
+
+        getter: asyncio.Task[dict[str, Any]] = asyncio.ensure_future(queue.get())
+        closing: asyncio.Task[bool] = asyncio.ensure_future(self._closing.wait())
+        try:
+            await asyncio.wait({getter, closing}, return_when=asyncio.FIRST_COMPLETED)
+            if getter.done() and not getter.cancelled():
+                return getter.result()
+            return None
+        finally:
+            for task in (getter, closing):
+                if not task.done():
+                    task.cancel()
+            # Awaiting the cancellations keeps "Task was destroyed but it is
+            # pending" out of the log on shutdown.
+            await asyncio.gather(getter, closing, return_exceptions=True)
+
     async def close(self) -> None:
+        """Wake every reader and drop them.
+
+        Setting the flag before clearing the subscribers, so a reader that wakes
+        immediately finds the hub already closing rather than racing the set.
+        """
+        self._closing.set()
         async with self._lock:
             self._subscribers.clear()
