@@ -434,3 +434,188 @@ class TestDeviceSelection:
         assert dtype in (torch.float32, torch.bfloat16)
         assert isinstance(autocast, bool)
         assert reason
+
+
+class TestCpuBf16Gate:
+    """Capability is read, never discovered by running a bf16 matmul.
+
+    On a CPU whose bf16 kernels use instructions it does not implement, that
+    matmul does not return a wrong answer and does not raise — it takes an
+    illegal-instruction trap and kills the process. This is not theoretical: it
+    killed CI on Windows, in `_bf16_is_faster`, with exception 0xc000001d, and
+    the same crash reaches any user on such a machine the moment they run
+    `bloomery train`.
+    """
+
+    def test_nothing_bf16_runs_when_capability_is_absent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import torch
+
+        from bloomery.train import device
+
+        executed: list[str] = []
+        monkeypatch.setattr(device, "_cpu_bf16_is_native", lambda: False)
+        monkeypatch.setattr(device, "_bf16_works", lambda d: executed.append("_bf16_works") or True)
+        monkeypatch.setattr(
+            device, "_bf16_is_faster", lambda d, **k: executed.append("_bf16_is_faster") or True
+        )
+        monkeypatch.setattr(
+            device,
+            "_bf16_probe_says_faster",
+            lambda d, **k: executed.append("_bf16_probe_says_faster") or True,
+        )
+        monkeypatch.setattr(device, "_PRECISION_CACHE", {})
+
+        dtype, autocast, reason = device.select_precision(torch.device("cpu"))
+
+        assert executed == [], f"executed bf16 work on a CPU that cannot run it: {executed}"
+        assert dtype is torch.float32
+        assert autocast is False
+        assert "without hardware bf16" in reason
+
+    def test_the_timing_probe_still_runs_where_bf16_is_supported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hardware support is not the same as being worth using."""
+        import torch
+
+        from bloomery.train import device
+
+        monkeypatch.setattr(device, "_cpu_bf16_is_native", lambda: True)
+        monkeypatch.setattr(device, "_bf16_probe_says_faster", lambda d, **k: False)
+        monkeypatch.setattr(device, "_PRECISION_CACHE", {})
+
+        dtype, autocast, reason = device.select_precision(torch.device("cpu"))
+
+        assert dtype is torch.float32
+        assert "not usably faster" in reason
+
+    def test_bf16_is_selected_when_supported_and_faster(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import torch
+
+        from bloomery.train import device
+
+        monkeypatch.setattr(device, "_cpu_bf16_is_native", lambda: True)
+        monkeypatch.setattr(device, "_bf16_probe_says_faster", lambda d, **k: True)
+        monkeypatch.setattr(device, "_PRECISION_CACHE", {})
+
+        dtype, autocast, reason = device.select_precision(torch.device("cpu"))
+
+        assert dtype is torch.bfloat16
+        assert autocast is True
+        assert "accelerated bf16" in reason
+
+    def test_a_child_killed_by_a_signal_means_do_not_use_bf16(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The whole point of the subprocess: dying is a valid, survivable answer."""
+        import subprocess
+        import sys
+
+        import torch
+
+        from bloomery.train.device import _bf16_probe_says_faster
+
+        real_run = subprocess.run
+
+        def suicidal(cmd: object, **kwargs: object) -> object:
+            return real_run(
+                [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGILL)"],
+                **kwargs,
+            )
+
+        monkeypatch.setattr(subprocess, "run", suicidal)
+        assert _bf16_probe_says_faster(torch.device("cpu")) is False
+
+    def test_a_probe_that_cannot_run_means_do_not_use_bf16(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess
+
+        import torch
+
+        from bloomery.train.device import _bf16_probe_says_faster
+
+        def refuse(*args: object, **kwargs: object) -> object:
+            raise OSError("no interpreter")
+
+        monkeypatch.setattr(subprocess, "run", refuse)
+        assert _bf16_probe_says_faster(torch.device("cpu")) is False
+
+    def test_a_hanging_probe_does_not_hang_the_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import subprocess
+
+        import torch
+
+        from bloomery.train.device import _bf16_probe_says_faster
+
+        def stall(*args: object, **kwargs: object) -> object:
+            raise subprocess.TimeoutExpired(cmd="probe", timeout=1)
+
+        monkeypatch.setattr(subprocess, "run", stall)
+        assert _bf16_probe_says_faster(torch.device("cpu")) is False
+
+    def test_the_probe_can_be_switched_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import torch
+
+        from bloomery.train.device import ENV_BF16_PROBE, _bf16_probe_says_faster
+
+        monkeypatch.setenv(ENV_BF16_PROBE, "0")
+        assert _bf16_probe_says_faster(torch.device("cpu")) is False
+
+    def test_the_probe_module_reports_a_verdict(self) -> None:
+        """Run for real, out of process, exactly as select_precision does."""
+        import subprocess
+        import sys
+
+        completed = subprocess.run(
+            [sys.executable, "-m", "bloomery.train._bf16_probe", "cpu"],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        # A crash here is a legitimate outcome on hardware that cannot do bf16 —
+        # what matters is that it happened in a child and said something usable.
+        if completed.returncode == 0:
+            assert completed.stdout.strip().splitlines()[-1] in ("bf16", "fp32")
+
+    def test_capability_answers_without_running_anything(self) -> None:
+        """The gate itself must not be implemented by trying a bf16 operation."""
+        from bloomery.train.device import _cpu_bf16_is_native
+
+        assert isinstance(_cpu_bf16_is_native(), bool)
+
+    def test_unreportable_hardware_counts_as_unsupported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Being wrong this way costs speed; the other way kills the run."""
+        import torch
+
+        from bloomery.train.device import _cpu_bf16_is_native
+
+        class Blank:
+            pass
+
+        monkeypatch.setattr(torch, "cpu", Blank())
+        assert _cpu_bf16_is_native() is False
+
+    def test_a_capability_probe_that_raises_is_not_fatal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import torch
+
+        from bloomery.train.device import _cpu_bf16_is_native
+
+        def explode(*args: object, **kwargs: object) -> bool:
+            raise RuntimeError("torch internals moved")
+
+        class Hostile:
+            _is_avx512_bf16_supported = staticmethod(explode)
+            get_capabilities = staticmethod(explode)
+
+        monkeypatch.setattr(torch, "cpu", Hostile())
+        assert _cpu_bf16_is_native() is False

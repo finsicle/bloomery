@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +33,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger(__name__)
 
 ENV_PRECISION = "BLOOMERY_PRECISION"
+# Set to "0" to skip the out-of-process bf16 timing probe entirely.
+ENV_BF16_PROBE = "BLOOMERY_BF16_PROBE"
 
 # Memoised because the timing probe costs up to a second on Metal — negligible
 # once per training run, not once per call. See _cache_key for the identity used.
@@ -103,8 +107,59 @@ def select_device(prefer: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
+def _cpu_bf16_is_native() -> bool:
+    """Whether this CPU implements bf16 in hardware — asked, never executed.
+
+    Everything else in this module decides by running the operation and looking
+    at the result. That approach cannot be used here, because the failure mode
+    is not a wrong answer or an exception.
+
+    A CPU whose bf16 kernels use instructions it does not implement does not
+    return a bad number and does not raise: it takes an illegal-instruction trap
+    and the process dies where it stands. On Windows that surfaces as exception
+    ``0xc000001d`` and exit code 132. ``except Exception`` is no defence — a
+    hardware trap is not a Python exception, and there is nothing left running
+    to catch it.
+
+    So capability is read from torch rather than discovered by executing a
+    matmul, and anything that cannot be positively confirmed counts as absent.
+    Being wrong in this direction costs some speed on an unrecognised CPU;
+    being wrong in the other direction kills a training run at startup.
+    """
+    import torch
+
+    cpu = getattr(torch, "cpu", None)
+    if cpu is None:  # pragma: no cover - very old torch
+        return False
+
+    # x86: the bf16 matmul path needs AVX512-BF16 (or AMX, which implies it).
+    probe = getattr(cpu, "_is_avx512_bf16_supported", None)
+    if probe is not None:
+        try:
+            if bool(probe()):
+                return True
+        except Exception:  # noqa: BLE001 - absence of an answer is a "no"
+            pass
+
+    # aarch64 and anything else torch can describe. Apple silicon reports
+    # bf16=False here, which is why the probe must never have run there.
+    capabilities = getattr(cpu, "get_capabilities", None)
+    if capabilities is not None:
+        try:
+            reported = capabilities()
+            return bool(reported.get("bf16") or reported.get("sve_bf16"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    return False
+
+
 def _bf16_works(device: torch.device) -> bool:
-    """Run a real bf16 matmul and see whether it produces finite numbers."""
+    """Run a real bf16 matmul and see whether it produces finite numbers.
+
+    Only safe once the device is known to support bf16: on a CPU that does not,
+    this matmul is fatal rather than wrong. See :func:`_cpu_bf16_is_native`.
+    """
     import torch
 
     try:
@@ -173,6 +228,40 @@ def _bf16_is_faster(device: torch.device, *, size: int = 384, reps: int = 5) -> 
     return bf16_seconds <= fp32_seconds * 1.1
 
 
+def _bf16_probe_says_faster(device: torch.device, *, timeout: float = 180.0) -> bool:
+    """Run the timing probe in a child process and read its verdict.
+
+    The child may die from a hardware trap; that is expected, and is exactly why
+    it is a child. Any outcome other than a clean "bf16" is treated as "do not
+    use bf16", which is the answer a crash was implying anyway.
+
+    ``BLOOMERY_BF16_PROBE=0`` skips it and answers no, for anyone who would
+    rather not spend the subprocess at all.
+    """
+    if os.environ.get(ENV_BF16_PROBE, "").strip() == "0":
+        return False
+
+    command = [sys.executable, "-m", "bloomery.train._bf16_probe", str(device)]
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        log.debug("bf16 probe could not run; assuming bf16 is not usable")
+        return False
+
+    if completed.returncode != 0:
+        # Includes the illegal-instruction case. Negative on Unix (killed by a
+        # signal), 132 and friends on Windows.
+        log.info("bf16 probe exited with %s on %s; using fp32", completed.returncode, device)
+        return False
+    return completed.stdout.strip().splitlines()[-1:] == ["bf16"]
+
+
 def select_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
     """Choose a compute dtype for this device.
 
@@ -237,10 +326,23 @@ def _probe_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
             return torch.bfloat16, True, "metal with working bf16"
         return torch.float32, False, "metal without usable bf16; using fp32"
 
-    # CPU bf16 is where the correct-but-slow trap lives. See _bf16_is_faster.
-    if _bf16_works(device) and _bf16_is_faster(device):
+    # Two gates, and both are needed.
+    #
+    # The cheap one first: a CPU that does not claim bf16 gets fp32 without
+    # spawning anything. That covers Apple silicon and most consumer x86, so the
+    # common case pays nothing.
+    if not _cpu_bf16_is_native():
+        return torch.float32, False, "cpu without hardware bf16; using fp32"
+
+    # Then the timing probe, in a process we can afford to lose. A CPU that
+    # claims bf16 can still trap on the matmul — a Windows runner reporting
+    # AVX512-BF16 survived an 8x8 bf16 matmul and died on a 384x384 one, because
+    # the larger shape dispatches to a kernel needing instructions the chip did
+    # not have. There is no way to ask about that in advance, and no way to
+    # catch it in process, so it is asked somewhere dying is survivable.
+    if _bf16_probe_says_faster(device):
         return torch.bfloat16, True, "cpu with accelerated bf16"
-    return torch.float32, False, "cpu without accelerated bf16; using fp32"
+    return torch.float32, False, "cpu bf16 not usably faster; using fp32"
 
 
 def choose(prefer: str | None = None) -> DeviceChoice:
