@@ -271,6 +271,11 @@ class TestPrecisionSelection:
     hardware without native bf16 it is emulated: correct and far slower. A short
     test run cannot see the difference, so these tests pin the decision rule
     rather than the timing.
+
+    These cover the decision made *after* the hardware gate passes, so they stub
+    it open. The gate itself — which stops a bf16 matmul ever running on a CPU
+    that would take an illegal-instruction trap on it — is covered by
+    TestCpuBf16Gate in test_train.py.
     """
 
     def test_requires_speed_not_just_correctness(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -280,13 +285,14 @@ class TestPrecisionSelection:
 
         clear_precision_cache()
         monkeypatch.delenv(dev.ENV_PRECISION, raising=False)
+        monkeypatch.setattr(dev, "_cpu_bf16_is_native", lambda: True)
         monkeypatch.setattr(dev, "_bf16_works", lambda _d: True)
         monkeypatch.setattr(dev, "_bf16_is_faster", lambda _d, **_k: False)
 
         dtype, autocast, reason = dev.select_precision(torch.device("cpu"))
         assert dtype is torch.float32
         assert autocast is False
-        assert "without accelerated bf16" in reason
+        assert "measured no faster" in reason
 
     def test_uses_bf16_when_it_is_genuinely_faster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import torch
@@ -295,6 +301,7 @@ class TestPrecisionSelection:
 
         clear_precision_cache()
         monkeypatch.delenv(dev.ENV_PRECISION, raising=False)
+        monkeypatch.setattr(dev, "_cpu_bf16_is_native", lambda: True)
         monkeypatch.setattr(dev, "_bf16_works", lambda _d: True)
         monkeypatch.setattr(dev, "_bf16_is_faster", lambda _d, **_k: True)
 
@@ -338,6 +345,7 @@ class TestPrecisionSelection:
             calls["n"] += 1
             return False
 
+        monkeypatch.setattr(dev, "_cpu_bf16_is_native", lambda: True)
         monkeypatch.setattr(dev, "_bf16_works", lambda _d: True)
         monkeypatch.setattr(dev, "_bf16_is_faster", counted)
 

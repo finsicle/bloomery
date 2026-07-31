@@ -76,33 +76,19 @@ jobs:
           python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__)"
           python -c "import sys; assert sys.version_info[:2] == tuple(int(p) for p in '${{ matrix.python }}'.split('.')), sys.version_info"
 
-      # PyTorch on Windows intermittently dies with a native illegal-instruction
-      # fault (Windows exception 0xc000001d) partway into a training step. It has
-      # been seen on 3.11 and 3.13, passes on a re-run of the same commit, and is
-      # a crash inside the wheel rather than anything this codebase reaches.
+      # No retry. One was added here on the theory that the illegal-instruction
+      # crashes on Windows were an intermittent fault in the PyTorch wheel that
+      # nothing in this codebase reached. That was wrong on both counts: the
+      # crash came from our own bf16 timing probe running a matmul on CPUs whose
+      # kernels use instructions they do not implement, and it appeared random
+      # only because the runners have assorted CPU models. The retry did not
+      # tolerate a flake, it hid a bug that reached users.
       #
-      # Retried only for the fault signals, listed explicitly rather than as
-      # "128 and above". Cancellation surfaces as 130 (SIGINT) or 143 (SIGTERM),
-      # and this workflow sets cancel-in-progress, so a blanket threshold would
-      # rerun the whole suite on a run that is already being cancelled. An
-      # ordinary test failure exits 1 and is never retried, so a real regression
-      # fails on the first attempt and two consecutive crashes fail the job.
+      # A native crash now fails the job on the first attempt, which is what
+      # made this one findable.
       - name: test
         shell: bash
-        run: |
-          set +e
-          pytest -q
-          status=$?
-          set -e
-          case "$status" in
-            0) exit 0 ;;
-            # 132 SIGILL, 134 SIGABRT, 136 SIGFPE, 138 SIGBUS, 139 SIGSEGV
-            132|134|136|138|139)
-              echo "::warning::pytest crashed with status $status (native fault); retrying once"
-              pytest -q
-              ;;
-            *) exit "$status" ;;
-          esac
+        run: pytest -q
 
       # A real invocation on a real machine. Exit 1 is legitimate — it means an
       # error-level issue such as low disk was found — so only a crash fails

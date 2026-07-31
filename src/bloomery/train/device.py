@@ -103,8 +103,59 @@ def select_device(prefer: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
+def _cpu_bf16_is_native() -> bool:
+    """Whether this CPU implements bf16 in hardware — asked, never executed.
+
+    Everything else in this module decides by running the operation and looking
+    at the result. That approach cannot be used here, because the failure mode
+    is not a wrong answer or an exception.
+
+    A CPU whose bf16 kernels use instructions it does not implement does not
+    return a bad number and does not raise: it takes an illegal-instruction trap
+    and the process dies where it stands. On Windows that surfaces as exception
+    ``0xc000001d`` and exit code 132. ``except Exception`` is no defence — a
+    hardware trap is not a Python exception, and there is nothing left running
+    to catch it.
+
+    So capability is read from torch rather than discovered by executing a
+    matmul, and anything that cannot be positively confirmed counts as absent.
+    Being wrong in this direction costs some speed on an unrecognised CPU;
+    being wrong in the other direction kills a training run at startup.
+    """
+    import torch
+
+    cpu = getattr(torch, "cpu", None)
+    if cpu is None:  # pragma: no cover - very old torch
+        return False
+
+    # x86: the bf16 matmul path needs AVX512-BF16 (or AMX, which implies it).
+    probe = getattr(cpu, "_is_avx512_bf16_supported", None)
+    if probe is not None:
+        try:
+            if bool(probe()):
+                return True
+        except Exception:  # noqa: BLE001 - absence of an answer is a "no"
+            pass
+
+    # aarch64 and anything else torch can describe. Apple silicon reports
+    # bf16=False here, which is why the probe must never have run there.
+    capabilities = getattr(cpu, "get_capabilities", None)
+    if capabilities is not None:
+        try:
+            reported = capabilities()
+            return bool(reported.get("bf16") or reported.get("sve_bf16"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    return False
+
+
 def _bf16_works(device: torch.device) -> bool:
-    """Run a real bf16 matmul and see whether it produces finite numbers."""
+    """Run a real bf16 matmul and see whether it produces finite numbers.
+
+    Only safe once the device is known to support bf16: on a CPU that does not,
+    this matmul is fatal rather than wrong. See :func:`_cpu_bf16_is_native`.
+    """
     import torch
 
     try:
@@ -237,10 +288,18 @@ def _probe_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
             return torch.bfloat16, True, "metal with working bf16"
         return torch.float32, False, "metal without usable bf16; using fp32"
 
-    # CPU bf16 is where the correct-but-slow trap lives. See _bf16_is_faster.
+    # Capability is checked before anything bf16-shaped runs. On a CPU without
+    # hardware bf16 the matmul below is not slow, it is fatal — see
+    # _cpu_bf16_is_native. This also skips the timing probe on every machine
+    # that would have failed it anyway, which is most of them.
+    if not _cpu_bf16_is_native():
+        return torch.float32, False, "cpu without hardware bf16; using fp32"
+
+    # Hardware support is not the same as being worth using: some CPUs advertise
+    # bf16 and still run it slower than fp32. See _bf16_is_faster.
     if _bf16_works(device) and _bf16_is_faster(device):
         return torch.bfloat16, True, "cpu with accelerated bf16"
-    return torch.float32, False, "cpu without accelerated bf16; using fp32"
+    return torch.float32, False, "cpu with hardware bf16 that measured no faster; using fp32"
 
 
 def choose(prefer: str | None = None) -> DeviceChoice:
