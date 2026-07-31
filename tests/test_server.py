@@ -233,6 +233,58 @@ class TestJobLog:
         assert "before" in payload["lines"]
         assert "after" in payload["lines"]
 
+    def test_a_windows_log_does_not_come_back_with_stray_carriage_returns(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        """Runners write logs on every OS in the matrix, including CRLF ones."""
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_bytes(b"first\r\nsecond\r\n")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        assert client.get(f"/api/jobs/{created['id']}/log").json()["lines"] == [
+            "first",
+            "second",
+        ]
+
+    def test_a_form_feed_inside_a_line_does_not_invent_a_new_line(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        """The one deliberate difference from the old splitlines() reader.
+
+        splitlines() breaks on form feeds and U+2028 as well as newlines, so a
+        progress bar emitting either was reported as extra log lines that were
+        never written. Only real newlines end a line now.
+        """
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_text("step 1\x0c50%\nstep 2 done\n", encoding="utf-8")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        assert client.get(f"/api/jobs/{created['id']}/log").json()["lines"] == [
+            "step 1\x0c50%",
+            "step 2 done",
+        ]
+
+    def test_the_tail_is_bounded_for_a_log_far_larger_than_it(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        """Why the reader streams: this endpoint backs the live view and is polled."""
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_text("".join(f"line {i}\n" for i in range(20_000)), encoding="utf-8")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        payload = client.get(f"/api/jobs/{created['id']}/log", params={"tail": 3}).json()
+        assert payload["lines"] == ["line 19997", "line 19998", "line 19999"]
+        assert payload["truncated"] is True
+
 
 class TestHost:
     def test_reports_this_machine(self, client: Any) -> None:

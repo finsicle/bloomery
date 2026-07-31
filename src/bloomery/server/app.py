@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -252,11 +253,25 @@ def _register_routes(app: FastAPI, state: Any) -> None:
         path = Path(job.log_path)
         if not path.is_file():
             return {"id": job_id, "lines": []}
+        # Streamed into a bounded window rather than read whole: this endpoint
+        # backs the live log view, so it is polled repeatedly during exactly the
+        # long runs whose logs grow large, and a 200-line tail should not cost a
+        # few hundred megabytes of resident text each time.
+        #
         # errors="replace" because a log is diagnostic output, and refusing to
         # show it because one byte is malformed helps nobody.
-        text = path.read_text(encoding="utf-8", errors="replace")
-        lines = text.splitlines()
-        return {"id": job_id, "lines": lines[-tail:], "truncated": len(lines) > tail}
+        #
+        # Iterating in text mode splits on \n and normalises \r\n, where the
+        # previous splitlines() also broke on form feeds and U+2028. Progress-bar
+        # output can carry those, and treating one as a line break invented log
+        # lines that were never written.
+        window: deque[str] = deque(maxlen=tail)
+        total = 0
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                total += 1
+                window.append(line.rstrip("\n"))
+        return {"id": job_id, "lines": list(window), "truncated": total > tail}
 
     # -------------------------------------------------------------------- host
 
