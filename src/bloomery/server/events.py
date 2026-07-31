@@ -123,6 +123,14 @@ class EventHub:
         closing: asyncio.Task[bool] = asyncio.ensure_future(self._closing.wait())
         try:
             await asyncio.wait({getter, closing}, return_when=asyncio.FIRST_COMPLETED)
+            # Shutdown wins a tie. Both can finish together when close() lands
+            # while an event is queued, and handing that event back would put a
+            # send on a socket we already know is going away — a smaller version
+            # of the stall this method exists to prevent. It would also
+            # contradict the drop-what-is-buffered rule above, for no reason
+            # beyond which task the loop happened to schedule first.
+            if self._closing.is_set():
+                return None
             if getter.done() and not getter.cancelled():
                 return getter.result()
             return None

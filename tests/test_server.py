@@ -249,41 +249,131 @@ class TestJobLog:
             "second",
         ]
 
-    def test_a_form_feed_inside_a_line_does_not_invent_a_new_line(
+    def test_a_progress_bar_redraw_is_not_a_new_log_line(
         self, client: Any, store: JobStore, tmp_path: Path
     ) -> None:
-        """The one deliberate difference from the old splitlines() reader.
+        """The deliberate difference from the old splitlines() reader.
 
-        splitlines() breaks on form feeds and U+2028 as well as newlines, so a
-        progress bar emitting either was reported as extra log lines that were
-        never written. Only real newlines end a line now.
+        A bare CR is how every progress bar redraws its line. splitlines() broke
+        on it, so one tqdm bar arrived as thousands of log entries that were
+        never written. Only a newline ends a line now.
         """
         created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
         log = tmp_path / "job.log"
-        log.write_text("step 1\x0c50%\nstep 2 done\n", encoding="utf-8")
+        log.write_bytes(b"epoch 1: 10%\repoch 1: 90%\repoch 1: done\nsaved\n")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        assert client.get(f"/api/jobs/{created['id']}/log").json()["lines"] == [
+            "epoch 1: 10%\repoch 1: 90%\repoch 1: done",
+            "saved",
+        ]
+
+    def test_form_feeds_and_unicode_separators_do_not_invent_lines(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        """splitlines() also broke on these; the byte-level split does not."""
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_text("step 1\x0c50%\nstep 2\u2028done\n", encoding="utf-8")
         job = store.get(created["id"])
         job.log_path = str(log)
         store.update(job)
 
         assert client.get(f"/api/jobs/{created['id']}/log").json()["lines"] == [
             "step 1\x0c50%",
-            "step 2 done",
+            "step 2\u2028done",
         ]
 
-    def test_the_tail_is_bounded_for_a_log_far_larger_than_it(
+    def test_a_tail_of_a_large_log_reads_only_the_end(
         self, client: Any, store: JobStore, tmp_path: Path
     ) -> None:
-        """Why the reader streams: this endpoint backs the live view and is polled."""
+        """Job logs are never rotated, so one only grows. Rereading it per poll is the bug."""
         created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
         log = tmp_path / "job.log"
-        log.write_text("".join(f"line {i}\n" for i in range(20_000)), encoding="utf-8")
+        log.write_text("".join(f"line {i}\n" for i in range(200_000)), encoding="utf-8")
         job = store.get(created["id"])
         job.log_path = str(log)
         store.update(job)
 
         payload = client.get(f"/api/jobs/{created['id']}/log", params={"tail": 3}).json()
-        assert payload["lines"] == ["line 19997", "line 19998", "line 19999"]
+        assert payload["lines"] == ["line 199997", "line 199998", "line 199999"]
         assert payload["truncated"] is True
+
+    def test_a_line_longer_than_the_first_read_still_comes_back_whole(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        """The read budget grows until it has the lines; it must not return a fragment."""
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_text("head\n" + ("x" * 300_000) + "\ntail line\n", encoding="utf-8")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        payload = client.get(f"/api/jobs/{created['id']}/log", params={"tail": 2}).json()
+        assert payload["lines"] == ["x" * 300_000, "tail line"]
+        assert payload["truncated"] is True
+
+    def test_a_whole_short_log_is_not_reported_as_truncated(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_text("only line\n", encoding="utf-8")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        payload = client.get(f"/api/jobs/{created['id']}/log", params={"tail": 10}).json()
+        assert payload["lines"] == ["only line"]
+        assert payload["truncated"] is False
+
+    def test_an_empty_log_is_not_truncated(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_bytes(b"")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        payload = client.get(f"/api/jobs/{created['id']}/log").json()
+        assert payload["lines"] == []
+        assert payload["truncated"] is False
+
+    def test_a_log_without_a_final_newline_keeps_its_last_line(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        """A log being appended to right now has no trailing newline yet."""
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_text("first\nstill writing", encoding="utf-8")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        assert client.get(f"/api/jobs/{created['id']}/log").json()["lines"] == [
+            "first",
+            "still writing",
+        ]
+
+    def test_multibyte_characters_survive_a_seek_into_the_middle(
+        self, client: Any, store: JobStore, tmp_path: Path
+    ) -> None:
+        """The backward read seeks to an arbitrary byte; it must not cut a character in half."""
+        created = client.post("/api/jobs", json={"kind": "prepare", "params": {}}).json()
+        log = tmp_path / "job.log"
+        log.write_text("".join(f"日本語のログ行 {i}\n" for i in range(5_000)), encoding="utf-8")
+        job = store.get(created["id"])
+        job.log_path = str(log)
+        store.update(job)
+
+        payload = client.get(f"/api/jobs/{created['id']}/log", params={"tail": 4}).json()
+        assert payload["lines"] == [f"日本語のログ行 {i}" for i in range(4996, 5000)]
+        assert "�" not in "".join(payload["lines"])
 
 
 class TestHost:

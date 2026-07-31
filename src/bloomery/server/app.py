@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,6 +41,59 @@ ENV_SOURCE_URL = "BLOOMERY_SOURCE_URL"
 DEFAULT_SOURCE_URL = "https://github.com/finsicle/bloomery"
 
 API_PREFIX = "/api"
+
+# How much of a log to pull back on the first attempt when reading its tail.
+# Quadrupled until enough lines are found, so an ordinary tail costs one read
+# and a log of very long lines still terminates rather than thrashing.
+_TAIL_FIRST_READ = 8192
+
+
+def _decode_log_line(raw: bytes) -> str:
+    # Only the \r that formed a CRLF terminator goes; any others are content.
+    if raw.endswith(b"\r"):
+        raw = raw[:-1]
+    # errors="replace" because a log is diagnostic output, and refusing to show
+    # it because one byte is malformed helps nobody.
+    return raw.decode("utf-8", errors="replace")
+
+
+def _tail_lines(path: Path, tail: int) -> tuple[list[str], bool]:
+    """The last ``tail`` lines of a log, plus whether earlier lines exist.
+
+    Read backward from the end. Job logs are append-only and never rotated, so a
+    long training run's log grows without bound — and this backs the live log
+    view, which polls it. Reading forward would cost a full scan per poll no
+    matter how few lines were asked for.
+
+    Lines are split on ``\\n`` at the byte level, which cannot cut a character in
+    half: no byte of a UTF-8 multi-byte sequence can be ``0x0A``. A bare ``\\r``
+    is left alone, because that is how a progress bar redraws its line and each
+    redraw is not a new log entry.
+    """
+    size = path.stat().st_size
+    if size == 0:
+        return [], False
+
+    budget = _TAIL_FIRST_READ
+    while True:
+        start = max(0, size - budget)
+        with path.open("rb") as handle:
+            handle.seek(start)
+            chunks = handle.read(size - start).split(b"\n")
+
+        # A window that does not begin at byte 0 opens partway through a line.
+        # Dropping that fragment cannot change the answer: it sits at the front,
+        # and the tail is taken from the back.
+        if start > 0:
+            chunks.pop(0)
+        # A trailing newline leaves an empty final chunk, which is not a line.
+        if chunks and chunks[-1] == b"":
+            chunks.pop()
+
+        if len(chunks) >= tail or start == 0:
+            # start > 0 means the dropped fragment was itself preceded by more.
+            return [_decode_log_line(c) for c in chunks[-tail:]], start > 0 or len(chunks) > tail
+        budget *= 4
 
 
 # --------------------------------------------------------------------------- #
@@ -253,25 +305,8 @@ def _register_routes(app: FastAPI, state: Any) -> None:
         path = Path(job.log_path)
         if not path.is_file():
             return {"id": job_id, "lines": []}
-        # Streamed into a bounded window rather than read whole: this endpoint
-        # backs the live log view, so it is polled repeatedly during exactly the
-        # long runs whose logs grow large, and a 200-line tail should not cost a
-        # few hundred megabytes of resident text each time.
-        #
-        # errors="replace" because a log is diagnostic output, and refusing to
-        # show it because one byte is malformed helps nobody.
-        #
-        # Iterating in text mode splits on \n and normalises \r\n, where the
-        # previous splitlines() also broke on form feeds and U+2028. Progress-bar
-        # output can carry those, and treating one as a line break invented log
-        # lines that were never written.
-        window: deque[str] = deque(maxlen=tail)
-        total = 0
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                total += 1
-                window.append(line.rstrip("\n"))
-        return {"id": job_id, "lines": list(window), "truncated": total > tail}
+        lines, truncated = _tail_lines(path, tail)
+        return {"id": job_id, "lines": lines, "truncated": truncated}
 
     # -------------------------------------------------------------------- host
 
