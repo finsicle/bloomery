@@ -64,7 +64,7 @@ jobs:
 
       - name: install
         shell: bash
-        run: uv pip install --torch-backend=auto -e ".[dev,train]"
+        run: uv pip install --torch-backend=auto -e ".[dev,train,serve]"
 
       # Assert the interpreter and the training stack directly. This replaces an
       # earlier trick of failing the build whenever pytest reported any skip,
@@ -75,6 +75,10 @@ jobs:
           python -c "import sys; print('python', sys.version)"
           python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__)"
           python -c "import sys; assert sys.version_info[:2] == tuple(int(p) for p in '${{ matrix.python }}'.split('.')), sys.version_info"
+          # The server tests importorskip on fastapi, which is right for users
+          # who did not install the extra — and wrong here, where a broken serve
+          # install would make the whole file skip and the job pass anyway.
+          python -c "import fastapi, httpx, uvicorn; print('serve extra ok')"
 
       # No retry. One was added here on the theory that the illegal-instruction
       # crashes on Windows were an intermittent fault in the PyTorch wheel that
@@ -140,7 +144,7 @@ jobs:
 
       # The train extra is needed here too: mypy resolves numpy's bundled stubs,
       # and dropping it would turn a type error into an unanalysable import.
-      - run: uv pip install --torch-backend=auto -e ".[dev,train]"
+      - run: uv pip install --torch-backend=auto -e ".[dev,train,serve]"
 
       - name: ruff check
         run: ruff check .

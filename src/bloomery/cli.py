@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, NoReturn
@@ -36,8 +37,6 @@ def _quiet_transformers() -> None:
     chattiness buries our own output, and a shard-writing progress bar for a
     3 MB model is noise.
     """
-    import os
-
     os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     try:
@@ -906,6 +905,67 @@ def demo(
         "  [bold]bloomery prepare --name mine --source ./my-text --vocab 8192[/bold]\n"
         "  [bold]bloomery train --data mine --depth 8 --steps 5000[/bold]"
     )
+
+
+@app.command()
+def serve(
+    host: str = typer.Option(
+        "127.0.0.1",
+        "--host",
+        help="Address to bind. The default is local-only on purpose.",
+    ),
+    port: int = typer.Option(8080, "--port", help="Port to listen on."),
+    source_url: str = typer.Option(
+        "",
+        "--source-url",
+        help="Where this build's source can be obtained. Required if you have modified it.",
+    ),
+) -> None:
+    """Run the web interface and job queue.
+
+    Binds to localhost by default. bloomery runs training jobs, which means it
+    runs processes, so exposing it on a network is a decision the operator should
+    have to make deliberately rather than one they discover later.
+    """
+    try:
+        import uvicorn
+
+        from bloomery.server import create_app
+    except ImportError as exc:  # pragma: no cover - depends on install extras
+        console.print(f"[bold red]error[/bold red]  the serve extra is not installed: {exc}")
+        console.print('  install it with:  [bold]uv pip install -e ".[serve]"[/bold]')
+        raise typer.Exit(1) from exc
+
+    from bloomery.server.app import ENV_SOURCE_URL
+
+    if source_url:
+        os.environ[ENV_SOURCE_URL] = source_url
+
+    exposed = host not in ("127.0.0.1", "localhost", "::1")
+    console.print()
+    console.print(f"  bloomery  [bold]http://{host}:{port}[/bold]")
+    console.print(f"  source    {os.environ.get(ENV_SOURCE_URL) or _default_source_url()}")
+    if exposed:
+        # Section 13 of the AGPL is triggered by letting other people interact
+        # with this over a network, which is exactly what binding beyond
+        # localhost does. Saying so at the moment of the decision is more use
+        # than a paragraph in a file nobody opens.
+        console.print()
+        console.print(
+            "  [yellow]this is reachable from other machines[/yellow]. Anyone who can reach it"
+        )
+        console.print("  can start jobs, which run processes on this host. If you are running a")
+        console.print("  modified build, the AGPL requires you to offer them its source — set")
+        console.print("  --source-url so they can find it.")
+    console.print()
+
+    uvicorn.run(create_app(), host=host, port=port, log_level="info")
+
+
+def _default_source_url() -> str:
+    from bloomery.server.app import DEFAULT_SOURCE_URL
+
+    return DEFAULT_SOURCE_URL
 
 
 def _force_utf8_output() -> None:
