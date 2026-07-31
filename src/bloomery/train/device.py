@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +33,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 log = logging.getLogger(__name__)
 
 ENV_PRECISION = "BLOOMERY_PRECISION"
+# Set to "0" to skip the out-of-process bf16 timing probe entirely.
+ENV_BF16_PROBE = "BLOOMERY_BF16_PROBE"
 
 # Memoised because the timing probe costs up to a second on Metal — negligible
 # once per training run, not once per call. See _cache_key for the identity used.
@@ -224,6 +228,40 @@ def _bf16_is_faster(device: torch.device, *, size: int = 384, reps: int = 5) -> 
     return bf16_seconds <= fp32_seconds * 1.1
 
 
+def _bf16_probe_says_faster(device: torch.device, *, timeout: float = 180.0) -> bool:
+    """Run the timing probe in a child process and read its verdict.
+
+    The child may die from a hardware trap; that is expected, and is exactly why
+    it is a child. Any outcome other than a clean "bf16" is treated as "do not
+    use bf16", which is the answer a crash was implying anyway.
+
+    ``BLOOMERY_BF16_PROBE=0`` skips it and answers no, for anyone who would
+    rather not spend the subprocess at all.
+    """
+    if os.environ.get(ENV_BF16_PROBE, "").strip() == "0":
+        return False
+
+    command = [sys.executable, "-m", "bloomery.train._bf16_probe", str(device)]
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            command,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        log.debug("bf16 probe could not run; assuming bf16 is not usable")
+        return False
+
+    if completed.returncode != 0:
+        # Includes the illegal-instruction case. Negative on Unix (killed by a
+        # signal), 132 and friends on Windows.
+        log.info("bf16 probe exited with %s on %s; using fp32", completed.returncode, device)
+        return False
+    return completed.stdout.strip().splitlines()[-1:] == ["bf16"]
+
+
 def select_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
     """Choose a compute dtype for this device.
 
@@ -288,18 +326,23 @@ def _probe_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
             return torch.bfloat16, True, "metal with working bf16"
         return torch.float32, False, "metal without usable bf16; using fp32"
 
-    # Capability is checked before anything bf16-shaped runs. On a CPU without
-    # hardware bf16 the matmul below is not slow, it is fatal — see
-    # _cpu_bf16_is_native. This also skips the timing probe on every machine
-    # that would have failed it anyway, which is most of them.
+    # Two gates, and both are needed.
+    #
+    # The cheap one first: a CPU that does not claim bf16 gets fp32 without
+    # spawning anything. That covers Apple silicon and most consumer x86, so the
+    # common case pays nothing.
     if not _cpu_bf16_is_native():
         return torch.float32, False, "cpu without hardware bf16; using fp32"
 
-    # Hardware support is not the same as being worth using: some CPUs advertise
-    # bf16 and still run it slower than fp32. See _bf16_is_faster.
-    if _bf16_works(device) and _bf16_is_faster(device):
+    # Then the timing probe, in a process we can afford to lose. A CPU that
+    # claims bf16 can still trap on the matmul — a Windows runner reporting
+    # AVX512-BF16 survived an 8x8 bf16 matmul and died on a 384x384 one, because
+    # the larger shape dispatches to a kernel needing instructions the chip did
+    # not have. There is no way to ask about that in advance, and no way to
+    # catch it in process, so it is asked somewhere dying is survivable.
+    if _bf16_probe_says_faster(device):
         return torch.bfloat16, True, "cpu with accelerated bf16"
-    return torch.float32, False, "cpu with hardware bf16 that measured no faster; using fp32"
+    return torch.float32, False, "cpu bf16 not usably faster; using fp32"
 
 
 def choose(prefer: str | None = None) -> DeviceChoice:

@@ -286,13 +286,12 @@ class TestPrecisionSelection:
         clear_precision_cache()
         monkeypatch.delenv(dev.ENV_PRECISION, raising=False)
         monkeypatch.setattr(dev, "_cpu_bf16_is_native", lambda: True)
-        monkeypatch.setattr(dev, "_bf16_works", lambda _d: True)
-        monkeypatch.setattr(dev, "_bf16_is_faster", lambda _d, **_k: False)
+        monkeypatch.setattr(dev, "_bf16_probe_says_faster", lambda _d, **_k: False)
 
         dtype, autocast, reason = dev.select_precision(torch.device("cpu"))
         assert dtype is torch.float32
         assert autocast is False
-        assert "measured no faster" in reason
+        assert "not usably faster" in reason
 
     def test_uses_bf16_when_it_is_genuinely_faster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import torch
@@ -302,8 +301,7 @@ class TestPrecisionSelection:
         clear_precision_cache()
         monkeypatch.delenv(dev.ENV_PRECISION, raising=False)
         monkeypatch.setattr(dev, "_cpu_bf16_is_native", lambda: True)
-        monkeypatch.setattr(dev, "_bf16_works", lambda _d: True)
-        monkeypatch.setattr(dev, "_bf16_is_faster", lambda _d, **_k: True)
+        monkeypatch.setattr(dev, "_bf16_probe_says_faster", lambda _d, **_k: True)
 
         dtype, autocast, _ = dev.select_precision(torch.device("cpu"))
         assert dtype is torch.bfloat16
@@ -346,8 +344,7 @@ class TestPrecisionSelection:
             return False
 
         monkeypatch.setattr(dev, "_cpu_bf16_is_native", lambda: True)
-        monkeypatch.setattr(dev, "_bf16_works", lambda _d: True)
-        monkeypatch.setattr(dev, "_bf16_is_faster", counted)
+        monkeypatch.setattr(dev, "_bf16_probe_says_faster", counted)
 
         dev.select_precision(torch.device("cpu"))
         dev.select_precision(torch.device("cpu"))
