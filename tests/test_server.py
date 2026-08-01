@@ -28,6 +28,7 @@ from bloomery.jobs import JobKind, JobStatus, JobStore, Supervisor  # noqa: E402
 from bloomery.server.app import (  # noqa: E402
     DEFAULT_SOURCE_URL,
     ENV_SOURCE_URL,
+    SNAPSHOT_LIMIT,
     create_app,
 )
 from bloomery.server.events import EventHub  # noqa: E402
@@ -447,22 +448,19 @@ class TestWebUi:
         assert (STATIC_DIR / "app.css").is_file()
         assert (STATIC_DIR / "format.js").is_file()
 
-    def test_the_page_knows_how_much_history_the_snapshot_carries(self) -> None:
-        """The page tells the user when it is showing a truncated list.
+    def test_the_page_does_not_invent_a_history_limit(self) -> None:
+        """Truncation is the server's to report, so the page must not guess it.
 
-        It can only say that if its number matches the server's. If the server
-        raised SNAPSHOT_LIMIT and the page did not, the notice would appear
-        while jobs were still arriving; lower it and the notice never appears
-        at all, so the missing jobs go unmentioned.
+        Counting the received jobs cannot distinguish a complete list that
+        happens to sit on the limit from a truncated one, and the first live
+        transition after a snapshot pushes the client's count past the limit
+        either way.
         """
-        import re
-
-        from bloomery.server.app import SNAPSHOT_LIMIT, STATIC_DIR
+        from bloomery.server.app import STATIC_DIR
 
         source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
-        declared = re.search(r"const HISTORY_LIMIT = (\d+);", source)
-        assert declared, "app.js does not declare HISTORY_LIMIT"
-        assert int(declared.group(1)) == SNAPSHOT_LIMIT
+        assert "HISTORY_LIMIT" not in source, "the page is guessing at the limit again"
+        assert "frame.truncated" in source
 
     def test_the_form_and_the_runner_offer_the_same_parameters(self) -> None:
         """Neither table may hold a key the other does not.
@@ -535,6 +533,40 @@ class TestStream:
         assert event["type"] == "job"
         assert event["job"]["id"] == created["id"]
         assert event["job"]["status"] == "queued"
+
+    def test_a_complete_snapshot_says_so(self, client: Any) -> None:
+        client.post("/api/jobs", json={"kind": "prepare", "params": {}})
+        with client.websocket_connect("/api/stream") as socket:
+            first = socket.receive_json()
+        assert first["truncated"] is False
+        assert first["total"] == 1
+
+    def test_a_snapshot_exactly_at_the_limit_is_not_truncated(
+        self, client: Any, store: JobStore
+    ) -> None:
+        """The case a client cannot work out for itself.
+
+        A list holding exactly SNAPSHOT_LIMIT jobs looks identical whether or
+        not anything was left out, which is why the flag has to come from here.
+        """
+        for _ in range(SNAPSHOT_LIMIT):
+            store.create(JobKind.PREPARE, {})
+        with client.websocket_connect("/api/stream") as socket:
+            first = socket.receive_json()
+        assert len(first["jobs"]) == SNAPSHOT_LIMIT
+        assert first["total"] == SNAPSHOT_LIMIT
+        assert first["truncated"] is False
+
+    def test_a_snapshot_past_the_limit_reports_the_truncation(
+        self, client: Any, store: JobStore
+    ) -> None:
+        for _ in range(SNAPSHOT_LIMIT + 5):
+            store.create(JobKind.PREPARE, {})
+        with client.websocket_connect("/api/stream") as socket:
+            first = socket.receive_json()
+        assert len(first["jobs"]) == SNAPSHOT_LIMIT
+        assert first["total"] == SNAPSHOT_LIMIT + 5
+        assert first["truncated"] is True
 
 
 class TestEventHub:

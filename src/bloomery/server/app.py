@@ -349,10 +349,19 @@ def _register_routes(app: FastAPI, state: Any) -> None:
         await websocket.accept()
         try:
             async with st.hub.subscribe() as queue:
+                jobs = st.store.find(limit=SNAPSHOT_LIMIT)
+                # Whether anything was left out is the server's to say. A client
+                # cannot work it out from the list it received: exactly
+                # SNAPSHOT_LIMIT jobs is a complete answer as often as it is a
+                # truncated one, and the first live transition afterwards pushes
+                # the client's count past the limit either way.
+                total = sum(st.store.counts().values())
                 await websocket.send_json(
                     {
                         "type": "snapshot",
-                        "jobs": [job.to_dict() for job in st.store.find(limit=SNAPSHOT_LIMIT)],
+                        "jobs": [job.to_dict() for job in jobs],
+                        "total": total,
+                        "truncated": total > len(jobs),
                         "source_url": st.source_url(),
                     }
                 )

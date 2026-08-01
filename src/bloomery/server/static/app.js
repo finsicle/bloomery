@@ -15,11 +15,6 @@ import {
 
 const SIZES = ["d4", "d8", "d12", "d24", "d26", "1b", "3b", "7b"];
 
-// How many jobs the page can show. Matches the `limit=100` the server passes to
-// store.find() when it builds the /api/stream snapshot — change one and this
-// number is wrong. Asserted against the server in tests/test_server.py.
-const HISTORY_LIMIT = 100;
-
 // Exactly the parameters the runner accepts, per kind. It filters anything else
 // out silently, so offering an extra field would produce a job that ignores what
 // was typed with no error anywhere. Keep in step with _FLAGS in jobs/runner.py.
@@ -77,6 +72,11 @@ const state = {
   open: null, // id of the expanded job, if any
   logTimer: null,
   gpus: [],
+  // Both come from the snapshot frame. Once the server has said the history was
+  // truncated it stays true for this connection: later frames only ever add
+  // newer jobs, so they cannot restore the older ones that were left out.
+  truncated: false,
+  total: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -227,12 +227,15 @@ function renderJobs() {
   const host = $("jobs");
   const jobs = sorted();
   $("jobs-empty").hidden = jobs.length > 0;
-  // The snapshot is capped server-side, and it replaces client state wholesale,
-  // so beyond the cap the oldest jobs are simply not here and a reload will not
-  // bring them back. Say so rather than letting the list look complete.
+  // Whether the snapshot left anything out comes from the server, not from the
+  // length of this list. A list exactly at the cap is complete as often as it
+  // is truncated, and the first live transition after a snapshot pushes the
+  // count past the cap regardless.
   const note = $("jobs-note");
-  note.hidden = jobs.length < HISTORY_LIMIT;
-  note.textContent = `Showing the newest ${HISTORY_LIMIT}. Older jobs are in the store but not on this page.`;
+  note.hidden = !state.truncated;
+  note.textContent = state.total
+    ? `Showing the newest ${jobs.length} of ${state.total}. The rest are in the store but not on this page.`
+    : "";
   host.replaceChildren();
   for (const job of jobs) host.append(renderJob(job));
   renderCounts();
@@ -460,6 +463,8 @@ function connect(attempt = 0) {
       // subscriber without marking the gap, so after a reconnect the snapshot
       // is the only trustworthy account of what exists.
       state.jobs = new Map(frame.jobs.map((job) => [job.id, job]));
+      state.truncated = Boolean(frame.truncated);
+      state.total = frame.total ?? frame.jobs.length;
       if (frame.source_url) showSource(frame.source_url);
       renderJobs();
       if (state.open) pollLog(state.open);
