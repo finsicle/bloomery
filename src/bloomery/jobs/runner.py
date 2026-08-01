@@ -373,15 +373,25 @@ def compact_log(
             # The window opens mid-line; that fragment belongs to a line whose
             # beginning is being dropped, so it would read as corruption.
             newline = tail.find(b"\n")
-            tail = tail[newline + 1 :] if newline != -1 else tail
+            if newline != -1:
+                tail = tail[newline + 1 :]
 
-            # It can end mid-line too. A job's `print` is not one write syscall —
-            # the text and its newline can go separately — so the size measured
-            # above may fall between them. Leaving the rewrite ending mid-line
+            # It has to end on a line boundary too. A job's `print` is not one
+            # write syscall — the text and its newline can go separately — so
+            # the size measured above may fall between them. Ending mid-line
             # glues the next line the job writes onto this one, which is how
             # "line 0085line 0086" appears in a log that never contained it.
-            end = tail.rfind(b"\n")
-            tail = tail[: end + 1] if end != -1 else b""
+            if tail and not tail.endswith(b"\n"):
+                end = tail.rfind(b"\n")
+                if end != -1:
+                    tail = tail[: end + 1]
+                else:
+                    # No boundary anywhere in the window: one line longer than
+                    # it. A progress display that only ever redrew with bare
+                    # carriage returns looks exactly like this. Terminate the
+                    # fragment rather than discard the only output there is —
+                    # the marker above it already says the beginning went.
+                    tail += b"\n"
 
             marker = (
                 f"[bloomery] {_readable(size - len(tail))} of earlier output was dropped "

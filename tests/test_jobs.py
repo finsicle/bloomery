@@ -922,6 +922,28 @@ class TestLogCompaction:
         assert lines[-1] == "line 9999"
         assert all(re.fullmatch(r"line \d{4}", line) for line in lines[1:]), lines[-3:]
 
+    def test_a_window_with_no_line_break_keeps_what_it_can(self, tmp_path: Path) -> None:
+        """A progress display that only ever redrew with bare carriage returns.
+
+        There is no newline anywhere in the window, so there is no boundary to
+        trim back to. Discarding on that basis would throw away the only output
+        the job produced; the fragment is terminated instead, and the marker
+        above it already says the beginning went.
+        """
+        path = tmp_path / "job.log"
+        path.write_bytes(b"\r".join(f"progress {i}%".encode() for i in range(5_000)))
+
+        runner.compact_log(path, cap=4096, keep=2048)
+
+        # Bytes, not read_text: universal newlines would translate every bare
+        # carriage return into a newline and hide what is actually on disk.
+        raw = path.read_bytes()
+        body = raw.split(b"\n")[1]
+        assert body, "the whole log was discarded"
+        assert b"progress 4999%" in body, "the most recent redraw went missing"
+        assert raw.endswith(b"\n"), "a fragment must still be terminated"
+        assert raw.count(b"\n") == 2, "no newline should have been invented mid-fragment"
+
     def test_the_rewrite_never_makes_the_file_longer(self, tmp_path: Path) -> None:
         """The invariant that keeps a concurrent append from being spliced.
 
@@ -1046,6 +1068,53 @@ class TestLogCompaction:
         assert store.get(job.id).status is JobStatus.INTERRUPTED
         assert path.stat().st_size < oversized
         assert path.read_text(encoding="utf-8").startswith("[bloomery]")
+
+    @pytest.mark.skipif(
+        not runner.CAN_TRIM_WHILE_WRITING,
+        reason="an unadopted job is still writing, so its log waits for the next restart",
+    )
+    def test_a_job_that_outlived_a_restart_still_has_its_log_bounded(
+        self, store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gap that matters most, because it is the longest-running jobs.
+
+        A run survives a supervisor restart. reconcile() finds it alive and
+        deliberately leaves it be rather than killing it, so it is in the
+        store's running set but in no supervisor's _running. Scanning only
+        _running would mean nothing ever bounded its log again.
+
+        Where a live writer cannot be trimmed this necessarily waits: the job
+        holds no handle this supervisor can wait on, so its log is bounded by a
+        reconcile() after it has finally exited, at the next start.
+        """
+        monkeypatch.setattr(runner, "LOG_CAP_BYTES", 4096)
+        monkeypatch.setattr(runner, "LOG_KEEP_BYTES", 1024)
+
+        # A real live process this supervisor knows nothing about.
+        child = subprocess.Popen(sleeper(30))
+        try:
+            job = store.create(JobKind.PREPARE, {})
+            path = log_path_for(tmp_path, job.id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"".join(f"line {i}\n".encode() for i in range(20_000)))
+            job.log_path = str(path)
+            store.update(job)
+            store.mark_started(
+                job.id, pid=child.pid, pid_created_at=psutil.Process(child.pid).create_time()
+            )
+
+            sup = Supervisor(store=store, home=tmp_path, poll_seconds=0.05)
+            assert sup.reconcile() == [], "a live job must not be marked interrupted"
+            assert job.id not in sup.running_ids, "it must not have been adopted"
+
+            oversized = path.stat().st_size
+            sup.tick()
+
+            assert path.stat().st_size < oversized, "an unadopted job's log was never bounded"
+            assert path.read_text(encoding="utf-8").startswith("[bloomery]")
+        finally:
+            child.kill()
+            child.wait(timeout=10)
 
     def test_the_supervisor_bounds_a_log_when_the_job_exits(
         self, store: JobStore, tmp_path: Path, stub_command, monkeypatch: pytest.MonkeyPatch

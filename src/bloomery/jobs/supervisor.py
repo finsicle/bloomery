@@ -253,6 +253,17 @@ class Supervisor:
         """
         with self._lock:
             entries = [(entry.job_id, entry.log_path) for entry in self._running.values()]
+        adopted = {job_id for job_id, _ in entries}
+
+        # Jobs the store calls running that this supervisor did not start. A run
+        # survives a restart, reconcile() deliberately leaves it alone rather
+        # than killing it, and it is then in no supervisor's _running — so
+        # nothing here would ever look at its log again. Those are precisely the
+        # longest-lived runs, which is to say the ones whose logs get large.
+        for job in self.store.running():
+            if job.id not in adopted and job.log_path:
+                entries.append((job.id, Path(job.log_path)))
+
         # Deliberately outside the lock: this touches the filesystem, and
         # scheduling should not wait behind a multi-megabyte rewrite.
         for job_id, path in entries:
