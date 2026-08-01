@@ -347,9 +347,11 @@ def compact_log(
     nowhere. Truncating the file the job already has is what keeps its output
     arriving.
 
-    A line written in the instant between measuring and truncating is lost. The
-    window is microseconds against a cap measured in tens of megabytes, and the
-    alternative is stopping the job to take a lock on its own diagnostic output.
+    A line the job writes in the instant between measuring and truncating is
+    lost — discarded whole, never spliced, because the rewrite only ever shrinks
+    the file. The window is microseconds against a cap measured in tens of
+    megabytes, and the alternative is stopping the job to take a lock on its own
+    diagnostic output.
     """
     if still_writing and not CAN_TRIM_WHILE_WRITING:
         return 0
@@ -373,13 +375,33 @@ def compact_log(
             newline = tail.find(b"\n")
             tail = tail[newline + 1 :] if newline != -1 else tail
 
-            dropped = size - len(tail)
+            # It can end mid-line too. A job's `print` is not one write syscall —
+            # the text and its newline can go separately — so the size measured
+            # above may fall between them. Leaving the rewrite ending mid-line
+            # glues the next line the job writes onto this one, which is how
+            # "line 0085line 0086" appears in a log that never contained it.
+            end = tail.rfind(b"\n")
+            tail = tail[: end + 1] if end != -1 else b""
+
             marker = (
-                f"[bloomery] {_readable(dropped)} of earlier output was dropped to keep "
-                f"this log under {_readable(cap)}. What follows is the most recent "
-                f"output; anything the job writes from here on is appended below.\n"
+                f"[bloomery] {_readable(size - len(tail))} of earlier output was dropped "
+                f"to keep this log under {_readable(cap)}. What follows is the most "
+                f"recent output; anything the job writes from here on is appended "
+                f"below.\n"
             ).encode()
 
+            # The rewrite must only ever shrink the file. If marker + tail were
+            # longer than what is on disk — which a small cap makes easy — the
+            # write would extend it, and a line the job appends meanwhile would
+            # land inside the region still being written and come back spliced.
+            # Shrinking means a concurrent append always lands past the end of
+            # the new content, where truncate discards it whole.
+            overflow = len(marker) + len(tail) - size
+            if overflow > 0:
+                cut = tail.find(b"\n", overflow)
+                tail = tail[cut + 1 :] if cut != -1 else b""
+
+            dropped = size - len(tail)
             handle.seek(0)
             handle.write(marker + tail)
             handle.truncate()

@@ -899,6 +899,47 @@ class TestLogCompaction:
         assert "0.0 MiB" not in first
         assert "KiB" in first, first
 
+    def test_a_tail_that_ends_mid_line_does_not_glue_onto_the_next(self, tmp_path: Path) -> None:
+        """A job's `print` is not one write syscall.
+
+        The text and its newline can arrive separately, so the size this
+        measures can fall between them. Ending the rewrite mid-line glues the
+        job's next line onto the truncated one — "line 0085line 0086" in a log
+        that never contained such a line. Caught on the macOS matrix, and
+        reproducible directly by cutting the file at a byte offset.
+        """
+        path = tmp_path / "job.log"
+        body = b"".join(f"line {i:04d}\n".encode() for i in range(500))
+        # Chop off the final newline, exactly as a half-written line looks.
+        path.write_bytes(body[:-1])
+
+        runner.compact_log(path, cap=512, keep=256)
+        # Whatever the job writes next must start its own line.
+        with path.open("ab", buffering=0) as handle:
+            handle.write(b"line 9999\n")
+
+        lines = path.read_text(encoding="utf-8").splitlines()
+        assert lines[-1] == "line 9999"
+        assert all(re.fullmatch(r"line \d{4}", line) for line in lines[1:]), lines[-3:]
+
+    def test_the_rewrite_never_makes_the_file_longer(self, tmp_path: Path) -> None:
+        """The invariant that keeps a concurrent append from being spliced.
+
+        If marker + tail were longer than what is on disk — which a small cap
+        makes easy, since the marker is a couple of hundred bytes on its own —
+        the write would extend the file, and a line the job appended meanwhile
+        would land inside the region still being written. Shrinking means such a
+        line always lands past the new end, where truncate discards it whole.
+        """
+        for cap, keep in ((150, 120), (200, 100), (512, 400), (4096, 2048)):
+            path = tmp_path / f"job-{cap}.log"
+            path.write_bytes(b"".join(f"line {i:04d}\n".encode() for i in range(500)))
+            size = path.stat().st_size
+
+            runner.compact_log(path, cap=cap, keep=keep)
+
+            assert path.stat().st_size <= size, f"cap={cap} grew the file"
+
     def test_a_live_writer_is_left_alone_where_that_is_unsafe(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
