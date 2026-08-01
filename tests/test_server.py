@@ -414,7 +414,12 @@ class TestWebUi:
         assert client.get("/no-such-page").status_code == 404
 
     def test_the_assets_are_served(self, client: Any) -> None:
-        for path, kind in (("/app.js", "javascript"), ("/app.css", "css")):
+        for path, kind in (
+            ("/app.js", "javascript"),
+            ("/app.css", "css"),
+            # app.js imports this one as a module, so a 404 here is a blank page.
+            ("/format.js", "javascript"),
+        ):
             response = client.get(path)
             assert response.status_code == 200, path
             assert kind in response.headers["content-type"], response.headers["content-type"]
@@ -432,6 +437,7 @@ class TestWebUi:
         assert (STATIC_DIR / "index.html").is_file()
         assert (STATIC_DIR / "app.js").is_file()
         assert (STATIC_DIR / "app.css").is_file()
+        assert (STATIC_DIR / "format.js").is_file()
 
     def test_the_form_offers_only_parameters_the_runner_accepts(self) -> None:
         """A field the runner filters out would be silently ignored, with no error.

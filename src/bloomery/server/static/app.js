@@ -4,9 +4,14 @@
 // The whole client. No build step, no dependencies — what you are reading is
 // what runs, which is the honest answer to the AGPL's offer of source.
 
-// A job is finished when it reaches one of these. `interrupted` is not `failed`:
-// it means the server died mid-run and never learned how the job ended.
-const TERMINAL = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
+import {
+  TERMINAL,
+  describe,
+  elapsed,
+  formatBytes,
+  formatDuration,
+  terminalise,
+} from "./format.js";
 
 const SIZES = ["d4", "d8", "d12", "d24", "d26", "1b", "3b", "7b"];
 
@@ -62,23 +67,6 @@ const SWITCHES = {
   bench: [{ key: "grad_checkpoint", label: "Gradient checkpointing" }],
 };
 
-// Escape sequences a terminal would act on rather than print: CSI (colour,
-// cursor moves, erase) and OSC (window titles and the like).
-const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
-
-// Jobs write console output meant for a terminal, so a log line arrives with
-// colour codes in it and a progress bar arrives as a series of redraws
-// separated by bare carriage returns. Render what a terminal would be showing
-// at the end of the line: the last redraw, with the control codes removed.
-//
-// The server deliberately keeps those bytes exactly as written — a bare \r is
-// content, not a line break. Deciding what they should look like is this
-// layer's job, and stripping rather than colourising keeps it to textContent,
-// which is what makes log output safe to display at all.
-function terminalise(line) {
-  return line.split("\r").pop().replace(ANSI, "");
-}
-
 const state = {
   jobs: new Map(), // id -> job, authoritative
   open: null, // id of the expanded job, if any
@@ -89,40 +77,6 @@ const state = {
 const $ = (id) => document.getElementById(id);
 
 // ---------------------------------------------------------------- formatting
-
-function formatDuration(seconds) {
-  if (seconds === null || seconds === undefined) return "—";
-  const total = Math.max(0, Math.floor(seconds));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-  if (h) return `${h}h ${String(m).padStart(2, "0")}m`;
-  if (m) return `${m}m ${String(s).padStart(2, "0")}s`;
-  return `${s}s`;
-}
-
-// The server computes duration_seconds only when it sends a frame, so a running
-// job's elapsed time would sit frozen between transitions. Derive it locally
-// instead, and fall back to the server's value once the job has finished.
-function elapsed(job) {
-  if (!job.started_at) return null;
-  if (TERMINAL.has(job.status)) return job.duration_seconds;
-  const started = Date.parse(job.started_at);
-  if (Number.isNaN(started)) return job.duration_seconds;
-  return (Date.now() - started) / 1000;
-}
-
-function formatBytes(n) {
-  if (!n && n !== 0) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let value = n;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
-}
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -235,18 +189,6 @@ async function submit(event) {
   } finally {
     button.disabled = false;
   }
-}
-
-// FastAPI validation errors arrive as a list of objects rather than a string.
-function describe(detail) {
-  if (!detail) return "";
-  if (typeof detail === "string") return detail;
-  if (Array.isArray(detail)) {
-    return detail
-      .map((item) => `${(item.loc || []).slice(1).join(".")}: ${item.msg}`)
-      .join("; ");
-  }
-  return JSON.stringify(detail);
 }
 
 // ---------------------------------------------------------------- job list
