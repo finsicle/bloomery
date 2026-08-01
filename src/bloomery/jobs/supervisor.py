@@ -247,14 +247,16 @@ class Supervisor:
         pipe, which is a worse failure than a large log.
 
         A stat per running job per pass is one cheap syscall, and it does no
-        work at all until a log is actually over the cap.
+        work at all until a log is actually over the cap. On a platform that
+        cannot trim underneath a writer this does nothing at all, and the log is
+        bounded when the job exits instead.
         """
         with self._lock:
             entries = [(entry.job_id, entry.log_path) for entry in self._running.values()]
         # Deliberately outside the lock: this touches the filesystem, and
         # scheduling should not wait behind a multi-megabyte rewrite.
         for job_id, path in entries:
-            dropped = runner.compact_log(path)
+            dropped = runner.compact_log(path, still_writing=True)
             if dropped:
                 log.info("dropped %d bytes from the log for job %s", dropped, job_id)
 

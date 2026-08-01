@@ -888,6 +888,43 @@ class TestLogCompaction:
     def test_a_missing_log_is_not_an_error(self, tmp_path: Path) -> None:
         assert runner.compact_log(tmp_path / "nothing.log") == 0
 
+    def test_the_marker_reads_sensibly_at_any_scale(self, tmp_path: Path) -> None:
+        """A fixed MiB reading said a trimmed log had dropped "0.0 MiB"."""
+        path = tmp_path / "job.log"
+        path.write_bytes(b"".join(f"line {i}\n".encode() for i in range(500)))
+
+        runner.compact_log(path, cap=512, keep=256)
+
+        first = path.read_text(encoding="utf-8").splitlines()[0]
+        assert "0.0 MiB" not in first
+        assert "KiB" in first, first
+
+    def test_a_live_writer_is_left_alone_where_that_is_unsafe(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Corrupting a log to enforce a limit is worse than exceeding it.
+
+        Windows has no O_APPEND for an inherited handle, so a truncation there
+        leaves the child writing at its old offset behind a run of NULs, and the
+        file is immediately back to its previous size anyway.
+        """
+        path = tmp_path / "job.log"
+        path.write_bytes(b"".join(f"line {i}\n".encode() for i in range(20_000)))
+        before = path.read_bytes()
+
+        monkeypatch.setattr(runner, "CAN_TRIM_WHILE_WRITING", False)
+        assert runner.compact_log(path, cap=4096, keep=2048, still_writing=True) == 0
+        assert path.read_bytes() == before
+
+        # Once the job has exited nothing holds the file, so it is trimmed
+        # everywhere — this is what bounds a Windows log.
+        assert runner.compact_log(path, cap=4096, keep=2048) > 0
+        assert path.stat().st_size < len(before)
+
+    @pytest.mark.skipif(
+        not runner.CAN_TRIM_WHILE_WRITING,
+        reason="no O_APPEND for an inherited handle on this platform",
+    )
     def test_a_job_keeps_writing_where_the_log_was_cut(self, tmp_path: Path) -> None:
         """The reason this truncates in place instead of replacing the file.
 
@@ -969,6 +1006,44 @@ class TestLogCompaction:
         assert path.stat().st_size < oversized
         assert path.read_text(encoding="utf-8").startswith("[bloomery]")
 
+    def test_the_supervisor_bounds_a_log_when_the_job_exits(
+        self, store: JobStore, tmp_path: Path, stub_command, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Runs on every platform, and is the whole of the bound on Windows.
+
+        A job removed from _running is never looked at again, so if its final
+        output is not trimmed here it stays on disk forever.
+        """
+        monkeypatch.setattr(runner, "LOG_CAP_BYTES", 4096)
+        monkeypatch.setattr(runner, "LOG_KEEP_BYTES", 1024)
+        # Writes well past the cap and exits immediately, so nothing is trimmed
+        # while it runs even where that is allowed.
+        stub_command(
+            lambda job: [
+                sys.executable,
+                "-c",
+                "print('x' * 79 + '\\n', end='')\n" * 1
+                + "print(('y' * 79 + '\\n') * 2000, end='')",
+            ]
+        )
+        sup = Supervisor(store=store, home=tmp_path, poll_seconds=0.05)
+        job = sup.submit(JobKind.PREPARE, {})
+
+        for _ in range(400):
+            sup.tick()
+            if store.get(job.id).status.terminal:
+                break
+            time.sleep(0.02)
+
+        assert store.get(job.id).status.terminal, "job never finished"
+        path = log_path_for(tmp_path, job.id)
+        assert path.stat().st_size < 10_000, "the log was not trimmed when the job exited"
+        assert path.read_text(encoding="utf-8").startswith("[bloomery]")
+
+    @pytest.mark.skipif(
+        not runner.CAN_TRIM_WHILE_WRITING,
+        reason="logs are bounded at exit rather than during the run on this platform",
+    )
     def test_the_supervisor_bounds_a_running_job(
         self, store: JobStore, tmp_path: Path, stub_command, monkeypatch: pytest.MonkeyPatch
     ) -> None:

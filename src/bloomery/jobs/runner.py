@@ -52,6 +52,28 @@ TERMINATE_GRACE_SECONDS = 10.0
 LOG_CAP_BYTES = 32 * 1024 * 1024
 LOG_KEEP_BYTES = 8 * 1024 * 1024
 
+# Whether a log can be trimmed while the job is still writing to it.
+#
+# It can wherever O_APPEND means what POSIX says: append mode belongs to the
+# open file description, so every write goes to the file's current end no matter
+# what happened to it in between. Truncating underneath a running job is then
+# safe — its next line simply arrives at the new end.
+#
+# Windows does not give that for an inherited handle. There, append is emulated
+# by the C runtime seeking to the end before each write, inside the process that
+# opened the file. The child receives the handle as its stdout and writes through
+# it directly, carrying its own file pointer. Truncate underneath it and the next
+# write lands at the old offset: the gap between is filled with NULs and the file
+# is immediately back to the size it was, so the trim achieves nothing and
+# corrupts the log on the way. Confirmed on the Windows matrix, which is why the
+# check is here rather than in a comment.
+#
+# So on Windows a log is only trimmed once its job has exited and nothing holds
+# the file. That leaves a run unbounded while it is going, which is no worse than
+# before this existed, and native Windows is best-effort here anyway — under WSL2
+# this is Linux and gets the full behaviour.
+CAN_TRIM_WHILE_WRITING = os.name != "nt"
+
 
 class JobLaunchError(RuntimeError):
     """The job could not be started at all."""
@@ -284,36 +306,54 @@ def launch(
     return Launched(process=process, command=command, limits_note=limits_note)
 
 
+def _readable(count: int) -> str:
+    """A byte count a person can read, at whatever scale it happens to be.
+
+    Fixed MiB read as "0 MiB" for anything small, which made the marker in a
+    trimmed log say it had dropped nothing.
+    """
+    size = float(count)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"  # pragma: no cover - the loop returns first
+
+
 def compact_log(
     path: Path,
     *,
     cap: int | None = None,
     keep: int | None = None,
+    still_writing: bool = False,
 ) -> int:
     """Trim an oversized log in place, keeping its most recent lines.
 
     Returns the number of bytes dropped, or 0 if nothing needed doing.
+
+    Pass ``still_writing`` when the job that owns this log is alive. On a
+    platform where truncating underneath a writer is unsafe the call then does
+    nothing, rather than corrupting the log to enforce a limit — see
+    ``CAN_TRIM_WHILE_WRITING``.
 
     The bounds are read at call time rather than bound as default arguments, so
     that setting ``runner.LOG_CAP_BYTES`` actually takes effect. A default
     argument would capture the value at import and quietly ignore every later
     change to it.
 
-    Rewritten in place rather than replaced. The running job holds an open
+    Rewritten in place rather than replaced. A running job holds an open
     descriptor to this file: swapping in a new one by rename would leave the job
     writing to an unlinked inode, and everything it logged from then on would go
     nowhere. Truncating the file the job already has is what keeps its output
     arriving.
 
-    That is safe because ``launch`` opens the log with ``"ab"``. Under O_APPEND
-    every write lands at the current end of the file, so a shorter file simply
-    means the next line arrives at the new end — no sparse gap, no interleaving
-    at a stale offset.
-
     A line written in the instant between measuring and truncating is lost. The
     window is microseconds against a cap measured in tens of megabytes, and the
     alternative is stopping the job to take a lock on its own diagnostic output.
     """
+    if still_writing and not CAN_TRIM_WHILE_WRITING:
+        return 0
+
     cap = LOG_CAP_BYTES if cap is None else cap
     keep = LOG_KEEP_BYTES if keep is None else keep
 
@@ -335,9 +375,9 @@ def compact_log(
 
             dropped = size - len(tail)
             marker = (
-                f"[bloomery] {dropped / 1024 / 1024:.1f} MiB of earlier output was "
-                f"dropped to keep this log under {cap // 1024 // 1024} MiB. "
-                f"The job is still running and still writing below.\n"
+                f"[bloomery] {_readable(dropped)} of earlier output was dropped to keep "
+                f"this log under {_readable(cap)}. What follows is the most recent "
+                f"output; anything the job writes from here on is appended below.\n"
             ).encode()
 
             handle.seek(0)
