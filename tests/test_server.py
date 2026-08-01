@@ -430,8 +430,16 @@ class TestWebUi:
         assert response.headers["X-Bloomery-Source"] == DEFAULT_SOURCE_URL
         assert response.headers["X-Bloomery-License"] == "AGPL-3.0-or-later"
 
-    def test_the_assets_ship_with_the_package(self) -> None:
-        """A wheel built without these would serve the API and 404 the page."""
+    def test_every_asset_the_page_needs_is_present(self) -> None:
+        """The set of files STATIC_DIR must contain for the page to work at all.
+
+        This reads the source tree, not a wheel: STATIC_DIR resolves inside
+        src/ under an editable install, which is how the whole matrix runs. So
+        it pins the file list, not the packaging. The `verify the web ui ships`
+        step in .github/workflows/ci.yml is what inspects a built wheel, and it
+        is the only thing that can — nothing here would notice a wheel that
+        shipped without these.
+        """
         from bloomery.server.app import STATIC_DIR
 
         assert (STATIC_DIR / "index.html").is_file()
@@ -439,20 +447,70 @@ class TestWebUi:
         assert (STATIC_DIR / "app.css").is_file()
         assert (STATIC_DIR / "format.js").is_file()
 
-    def test_the_form_offers_only_parameters_the_runner_accepts(self) -> None:
-        """A field the runner filters out would be silently ignored, with no error.
+    def test_the_page_knows_how_much_history_the_snapshot_carries(self) -> None:
+        """The page tells the user when it is showing a truncated list.
 
-        This is the one place the UI duplicates a table that lives in Python, so
-        it is worth asserting the copy has not drifted.
+        It can only say that if its number matches the server's. If the server
+        raised SNAPSHOT_LIMIT and the page did not, the notice would appear
+        while jobs were still arriving; lower it and the notice never appears
+        at all, so the missing jobs go unmentioned.
         """
+        import re
+
+        from bloomery.server.app import SNAPSHOT_LIMIT, STATIC_DIR
+
+        source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        declared = re.search(r"const HISTORY_LIMIT = (\d+);", source)
+        assert declared, "app.js does not declare HISTORY_LIMIT"
+        assert int(declared.group(1)) == SNAPSHOT_LIMIT
+
+    def test_the_form_and_the_runner_offer_the_same_parameters(self) -> None:
+        """Neither table may hold a key the other does not.
+
+        A key in the runner but not the form is a parameter nobody can reach. A
+        key in the form but not the runner is worse: the runner drops what it
+        does not recognise, so the user types a value, the job runs without it,
+        and nothing reports the difference — not the UI, not the log, not the
+        stored params.
+
+        This is the one place the UI duplicates a table that lives in Python.
+        """
+        import re
+
         from bloomery.jobs.runner import _FLAGS, _SWITCHES
         from bloomery.server.app import STATIC_DIR
 
         source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
-        for table in (_FLAGS, _SWITCHES):
-            for kind, entries in table.items():
-                for key in entries:
-                    assert f'key: "{key}"' in source, f"{kind.value}.{key} missing from the form"
+
+        def arm_of(table: str, kind_name: str) -> str:
+            """The array literal for one kind, sliced by bracket depth.
+
+            Depth-counting rather than a regex: the arms sit one after another
+            in the same object, and a non-greedy pattern happily runs from an
+            empty `prepare: []` to the closing bracket of `train`.
+            """
+            start = source.index(f"const {table} = {{")
+            opening = source.index(f"\n  {kind_name}: [", start) + len(f"\n  {kind_name}: ")
+            depth = 0
+            for offset, char in enumerate(source[opening:]):
+                depth += (char == "[") - (char == "]")
+                if depth == 0:
+                    return source[opening : opening + offset + 1]
+            raise AssertionError(f"unterminated {kind_name} arm in {table}")
+
+        for kind in _FLAGS:
+            # Sliced per kind so a key defined for `train` cannot satisfy an
+            # assertion about `bench`.
+            expected = set(_FLAGS[kind]) | set(_SWITCHES[kind])
+            offered: set[str] = set()
+            for table in ("FIELDS", "SWITCHES"):
+                offered |= set(re.findall(r'key:\s*"([^"]+)"', arm_of(table, kind.value)))
+
+            assert offered == expected, (
+                f"{kind.value}: form and runner disagree — "
+                f"only in form: {sorted(offered - expected)}, "
+                f"only in runner: {sorted(expected - offered)}"
+            )
 
 
 # --------------------------------------------------------------------------- #

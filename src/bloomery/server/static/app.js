@@ -15,6 +15,11 @@ import {
 
 const SIZES = ["d4", "d8", "d12", "d24", "d26", "1b", "3b", "7b"];
 
+// How many jobs the page can show. Matches the `limit=100` the server passes to
+// store.find() when it builds the /api/stream snapshot — change one and this
+// number is wrong. Asserted against the server in tests/test_server.py.
+const HISTORY_LIMIT = 100;
+
 // Exactly the parameters the runner accepts, per kind. It filters anything else
 // out silently, so offering an extra field would produce a job that ignores what
 // was typed with no error anywhere. Keep in step with _FLAGS in jobs/runner.py.
@@ -222,6 +227,12 @@ function renderJobs() {
   const host = $("jobs");
   const jobs = sorted();
   $("jobs-empty").hidden = jobs.length > 0;
+  // The snapshot is capped server-side, and it replaces client state wholesale,
+  // so beyond the cap the oldest jobs are simply not here and a reload will not
+  // bring them back. Say so rather than letting the list look complete.
+  const note = $("jobs-note");
+  note.hidden = jobs.length < HISTORY_LIMIT;
+  note.textContent = `Showing the newest ${HISTORY_LIMIT}. Older jobs are in the store but not on this page.`;
   host.replaceChildren();
   for (const job of jobs) host.append(renderJob(job));
   renderCounts();
@@ -326,9 +337,27 @@ async function cancelJob(id, button) {
       // A 200 can carry just {id, status} if the row vanished mid-cancel, so
       // merge rather than replace.
       upsert({ ...state.jobs.get(id), ...job });
+      return; // the re-render replaces this button; leaving it disabled is right
     }
+    // A 409 means it finished between the render and the click. Refresh the row
+    // from the server rather than waiting for a transition that has already
+    // been published and will not come again — that is what left this button
+    // dead before.
+    if (response.status === 409) await refresh(id);
   } catch {
-    button.disabled = false;
+    // network failure: nothing changed server-side, so let them try again
+  }
+  // Re-enable on every path that did not just replace the row. Without this a
+  // cancel that answered 409 disabled the button permanently and said nothing.
+  button.disabled = false;
+}
+
+async function refresh(id) {
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
+    if (response.ok) upsert(await response.json());
+  } catch {
+    // the socket is the primary path; this is only a nudge
   }
 }
 
@@ -339,15 +368,29 @@ function stopLogPolling() {
   state.logTimer = null;
 }
 
+// Schedule the next read unless there is nothing left to read: the panel was
+// closed, or the job has finished and its log file will not change again.
+function scheduleLogPoll(id, delay = 1500) {
+  if (state.open !== id) return;
+  const job = state.jobs.get(id);
+  if (job && TERMINAL.has(job.status)) return;
+  state.logTimer = setTimeout(() => pollLog(id), delay);
+}
+
 async function pollLog(id) {
   if (state.open !== id) return;
   let payload;
   try {
     const response = await fetch(`/api/jobs/${encodeURIComponent(id)}/log?tail=200`);
-    if (!response.ok) return;
+    if (!response.ok) throw new Error(String(response.status));
     payload = await response.json();
   } catch {
-    return; // the socket handler will resync; no need to shout here
+    // A single failed read must not end the tail. Nothing else restarts it —
+    // upsert only polls on the transition into a terminal state, and the
+    // snapshot branch only after a reconnect, so neither fires while a job
+    // keeps running on a healthy socket. Back off a little and keep going.
+    scheduleLogPoll(id, 4000);
+    return;
   }
   if (state.open !== id) return;
 
@@ -367,11 +410,7 @@ async function pollLog(id) {
   // truthiness check is right here — undefined must not read as "complete".
   if (note) note.textContent = payload.truncated ? "earlier lines not shown" : "";
 
-  // Stop once the job is finished: the file will not change again, and this is
-  // reading from disk on a machine that is probably busy training.
-  const job = state.jobs.get(id);
-  if (job && TERMINAL.has(job.status)) return;
-  state.logTimer = setTimeout(() => pollLog(id), 1500);
+  scheduleLogPoll(id);
 }
 
 // ---------------------------------------------------------------- the socket
@@ -397,16 +436,22 @@ function upsert(job) {
 }
 
 function setLink(status, detail) {
-  const lamp = $("link");
-  lamp.className = `link ${status}`;
-  lamp.title = detail;
+  $("link").className = `link ${status}`;
+  // The announced text, for anyone who cannot read the lamp's colour.
+  $("link-text").textContent = detail;
 }
 
 function connect(attempt = 0) {
   const scheme = location.protocol === "https:" ? "wss" : "ws";
   const socket = new WebSocket(`${scheme}://${location.host}/api/stream`);
 
-  socket.addEventListener("open", () => setLink("live", "live"));
+  socket.addEventListener("open", () => {
+    setLink("live", "live");
+    // Reset the backoff, or it only ever grows. Restarting the server a few
+    // times in a session would otherwise leave every later reconnect sitting
+    // at the 15s cap, which is the opposite of the intent below.
+    attempt = 0;
+  });
 
   socket.addEventListener("message", (event) => {
     const frame = JSON.parse(event.data);
@@ -452,9 +497,18 @@ async function loadHost() {
   try {
     // Fetched once. This endpoint re-probes the machine on every call, so
     // polling it would mean shelling out to vendor tools on a loop.
-    report = await (await fetch("/api/host")).json();
-  } catch {
-    box.replaceChildren(el("p", "empty", "Could not read the hardware."));
+    const response = await fetch("/api/host");
+    // Checked explicitly: a FastAPI error body is still valid JSON, so .json()
+    // resolves happily on a 500 and every field below reads undefined. That
+    // renders "cpu —" and "memory — free of —", which a user reads as "this
+    // machine has no detectable CPU" rather than "the probe failed".
+    if (!response.ok) {
+      const detail = describe((await response.json().catch(() => ({}))).detail);
+      throw new Error(detail || `probe failed (${response.status})`);
+    }
+    report = await response.json();
+  } catch (problem) {
+    box.replaceChildren(el("p", "empty", `Could not read the hardware: ${problem.message}`));
     return;
   }
 

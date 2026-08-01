@@ -4,6 +4,8 @@
 
   This page is not built from anything. What you are reading is what runs.
 -->
+<!DOCTYPE html>
+<html lang="en">
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>bloomery</title>
@@ -12,7 +14,13 @@
 <header class="bar">
   <h1>bloomery</h1>
   <div class="counts" id="counts"></div>
-  <div class="link" id="link" title="connecting"></div>
+  <!-- role=status so the connection state is announced rather than carried by
+       the lamp colour alone. The text sits in a visually hidden span because a
+       title attribute on a non-focusable div is not read out. -->
+  <div class="link-state" role="status" aria-live="polite">
+    <span class="link" id="link" aria-hidden="true"></span>
+    <span class="visually-hidden" id="link-text">connecting</span>
+  </div>
 </header>
 
 <main>
@@ -71,6 +79,7 @@
     <h2>Jobs</h2>
     <div id="jobs" class="jobs"></div>
     <p class="empty" id="jobs-empty">Nothing queued yet.</p>
+    <p class="empty" id="jobs-note" hidden></p>
   </section>
 
   <section class="panel" id="host-panel">

@@ -54,6 +54,13 @@ API_PREFIX = "/api"
 # index.html is present in the built wheel for the same reason.
 STATIC_DIR = Path(__file__).parent / "static"
 
+# How many jobs the stream's opening snapshot carries. The page replaces its
+# whole state with each snapshot, so this is also the most history it can show —
+# beyond it the oldest jobs are simply absent, and a reload does not bring them
+# back. The UI names the same number as HISTORY_LIMIT and says so on screen when
+# the list reaches it; a test asserts the two agree.
+SNAPSHOT_LIMIT = 100
+
 # How much of a log to pull back on the first attempt when reading its tail.
 # Quadrupled until enough lines are found, so an ordinary tail costs one read
 # and a log of very long lines still terminates rather than thrashing.
@@ -345,7 +352,7 @@ def _register_routes(app: FastAPI, state: Any) -> None:
                 await websocket.send_json(
                     {
                         "type": "snapshot",
-                        "jobs": [job.to_dict() for job in st.store.find(limit=100)],
+                        "jobs": [job.to_dict() for job in st.store.find(limit=SNAPSHOT_LIMIT)],
                         "source_url": st.source_url(),
                     }
                 )
