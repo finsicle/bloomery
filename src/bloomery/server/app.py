@@ -26,6 +26,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from bloomery import paths
@@ -41,6 +42,17 @@ ENV_SOURCE_URL = "BLOOMERY_SOURCE_URL"
 DEFAULT_SOURCE_URL = "https://github.com/finsicle/bloomery"
 
 API_PREFIX = "/api"
+
+# The web UI, shipped as plain files inside the package. Deliberately not built
+# from anything: a user who wants to know what this page does to their machine
+# can read it in devtools, which is a far better answer to section 13's offer of
+# corresponding source than a minified bundle would be.
+#
+# This lives under server/ rather than at src/bloomery/static/ because that path
+# is in .gitignore, and hatchling honours .gitignore when it builds the wheel —
+# assets there would vanish from the package without failing anything. CI asserts
+# index.html is present in the built wheel for the same reason.
+STATIC_DIR = Path(__file__).parent / "static"
 
 # How much of a log to pull back on the first attempt when reading its tail.
 # Quadrupled until enough lines are found, so an ordinary tail costs one read
@@ -369,3 +381,17 @@ def _register_routes(app: FastAPI, state: Any) -> None:
     @app.exception_handler(ValueError)
     async def value_error(request: Any, exc: ValueError) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # ---------------------------------------------------------------------- ui
+
+    # Mounted last, and it has to be. A mount at "/" matches everything, and
+    # Starlette tries routes in registration order — put this earlier and it
+    # would shadow /health and the whole API.
+    #
+    # html=True serves index.html for "/". The source-advertising middleware
+    # above applies to these responses too, which is the right outcome: the page
+    # a person actually looks at is the served surface section 13 talks about.
+    if STATIC_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+    else:  # pragma: no cover - only if the package was built without its assets
+        log.warning("no web UI at %s; serving the API only", STATIC_DIR)

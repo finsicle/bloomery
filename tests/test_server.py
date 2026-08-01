@@ -385,6 +385,71 @@ class TestHost:
 
 
 # --------------------------------------------------------------------------- #
+# the web ui
+# --------------------------------------------------------------------------- #
+
+
+class TestWebUi:
+    """The UI is static files mounted at the root.
+
+    A mount at "/" matches every path, so the thing most worth testing is not
+    that the page loads but that mounting it did not swallow the API.
+    """
+
+    def test_the_root_serves_the_page(self, client: Any) -> None:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert "bloomery" in response.text
+
+    def test_the_api_still_answers_past_the_catch_all_mount(self, client: Any) -> None:
+        """The regression guard. Mount the UI too early and every one of these 404s."""
+        assert client.get("/health").json()["status"] == "ok"
+        assert "jobs" in client.get("/api/jobs").json()
+        assert client.get("/api/source").json()["license"] == "AGPL-3.0-or-later"
+        assert client.get("/api/host").status_code == 200
+
+    def test_an_unknown_path_is_still_a_404(self, client: Any) -> None:
+        """html=True must not turn every typo into the index page."""
+        assert client.get("/no-such-page").status_code == 404
+
+    def test_the_assets_are_served(self, client: Any) -> None:
+        for path, kind in (("/app.js", "javascript"), ("/app.css", "css")):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert kind in response.headers["content-type"], response.headers["content-type"]
+
+    def test_the_page_carries_the_source_offer_too(self, client: Any) -> None:
+        """Section 13 attaches to the served surface, and this is the surface."""
+        response = client.get("/")
+        assert response.headers["X-Bloomery-Source"] == DEFAULT_SOURCE_URL
+        assert response.headers["X-Bloomery-License"] == "AGPL-3.0-or-later"
+
+    def test_the_assets_ship_with_the_package(self) -> None:
+        """A wheel built without these would serve the API and 404 the page."""
+        from bloomery.server.app import STATIC_DIR
+
+        assert (STATIC_DIR / "index.html").is_file()
+        assert (STATIC_DIR / "app.js").is_file()
+        assert (STATIC_DIR / "app.css").is_file()
+
+    def test_the_form_offers_only_parameters_the_runner_accepts(self) -> None:
+        """A field the runner filters out would be silently ignored, with no error.
+
+        This is the one place the UI duplicates a table that lives in Python, so
+        it is worth asserting the copy has not drifted.
+        """
+        from bloomery.jobs.runner import _FLAGS, _SWITCHES
+        from bloomery.server.app import STATIC_DIR
+
+        source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        for table in (_FLAGS, _SWITCHES):
+            for kind, entries in table.items():
+                for key in entries:
+                    assert f'key: "{key}"' in source, f"{kind.value}.{key} missing from the form"
+
+
+# --------------------------------------------------------------------------- #
 # the stream
 # --------------------------------------------------------------------------- #
 
