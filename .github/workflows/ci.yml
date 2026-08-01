@@ -155,6 +155,38 @@ jobs:
       - name: mypy
         run: mypy src
 
+      # Steps of the existing lint job rather than a job of their own, and
+      # deliberately: a new job would be a new status check, and it would not be
+      # in the branch ruleset's required list. It could fail while the merge
+      # button stayed green — the same gap the missing windows 3.13 entry left.
+      # As steps here they are covered by the already-required `lint` check.
+      #
+      # ruff and mypy do not read JavaScript, so without this a syntax error in
+      # app.js passes every check in this workflow and serves a blank page: the
+      # python tests only assert the files are reachable over HTTP, and the
+      # wheel check only asserts they are present.
+      #
+      # node is preinstalled on GitHub runners and is used here purely as a test
+      # tool. Nothing a user installs or runs needs it, and the project still
+      # has no build step.
+      #
+      # --input-type=module, reading from stdin, is load-bearing. Plain
+      # `node --check file.js` returns 0 for anything node detects as an ES
+      # module, which these are — it will not report a syntax error in a file
+      # containing `import` or `export` at all. Checked against a deliberately
+      # broken file both ways before settling on this form.
+      - name: javascript syntax
+        run: |
+          for file in src/bloomery/server/static/*.js; do
+            echo "checking $file"
+            node --check --input-type=module < "$file"
+          done
+
+      # node:test and node:assert ship with node, so this needs no package.json
+      # and no npm install.
+      - name: javascript tests
+        run: node --test tests/*.test.js
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -194,4 +226,33 @@ jobs:
           assert licences, f"no LICENSE shipped in the wheel: {names}"
 
           print(f"licence metadata ok: {wheel.name} -> {licences[0]}")
+          PY
+
+      # The web UI is plain files inside the package, so it can go missing from
+      # a wheel without breaking a single test: the whole matrix installs
+      # editable and resolves the assets from the source tree. Only a built
+      # wheel shows the truth. Worth pinning because `src/bloomery/static/` is
+      # in .gitignore and hatchling honours .gitignore when it builds — put the
+      # assets one directory over by mistake and `serve` would answer the API
+      # and 404 the page, with everything green.
+      - name: verify the web ui ships
+        run: |
+          uv run --no-project python - <<'PY'
+          import pathlib
+          import zipfile
+
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          names = zipfile.ZipFile(wheel).namelist()
+
+          # Exact names, not endswith: a wheel holding
+          # bloomery/server/static/archive/app.js but no
+          # bloomery/server/static/app.js would satisfy a suffix check while the
+          # page failed to load the script at the URL it actually asks for.
+          ui = set(n for n in names if n.startswith("bloomery/server/static/"))
+          for required in ("index.html", "app.js", "app.css", "format.js"):
+              assert (
+                  f"bloomery/server/static/{required}" in ui
+              ), f"{required} missing from the wheel: {sorted(ui)}"
+
+          print(f"web ui ok: {wheel.name} -> {len(ui)} files")
           PY

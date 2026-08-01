@@ -28,6 +28,7 @@ from bloomery.jobs import JobKind, JobStatus, JobStore, Supervisor  # noqa: E402
 from bloomery.server.app import (  # noqa: E402
     DEFAULT_SOURCE_URL,
     ENV_SOURCE_URL,
+    SNAPSHOT_LIMIT,
     create_app,
 )
 from bloomery.server.events import EventHub  # noqa: E402
@@ -385,6 +386,132 @@ class TestHost:
 
 
 # --------------------------------------------------------------------------- #
+# the web ui
+# --------------------------------------------------------------------------- #
+
+
+class TestWebUi:
+    """The UI is static files mounted at the root.
+
+    A mount at "/" matches every path, so the thing most worth testing is not
+    that the page loads but that mounting it did not swallow the API.
+    """
+
+    def test_the_root_serves_the_page(self, client: Any) -> None:
+        response = client.get("/")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert "bloomery" in response.text
+
+    def test_the_api_still_answers_past_the_catch_all_mount(self, client: Any) -> None:
+        """The regression guard. Mount the UI too early and every one of these 404s."""
+        assert client.get("/health").json()["status"] == "ok"
+        assert "jobs" in client.get("/api/jobs").json()
+        assert client.get("/api/source").json()["license"] == "AGPL-3.0-or-later"
+        assert client.get("/api/host").status_code == 200
+
+    def test_an_unknown_path_is_still_a_404(self, client: Any) -> None:
+        """html=True must not turn every typo into the index page."""
+        assert client.get("/no-such-page").status_code == 404
+
+    def test_the_assets_are_served(self, client: Any) -> None:
+        for path, kind in (
+            ("/app.js", "javascript"),
+            ("/app.css", "css"),
+            # app.js imports this one as a module, so a 404 here is a blank page.
+            ("/format.js", "javascript"),
+        ):
+            response = client.get(path)
+            assert response.status_code == 200, path
+            assert kind in response.headers["content-type"], response.headers["content-type"]
+
+    def test_the_page_carries_the_source_offer_too(self, client: Any) -> None:
+        """Section 13 attaches to the served surface, and this is the surface."""
+        response = client.get("/")
+        assert response.headers["X-Bloomery-Source"] == DEFAULT_SOURCE_URL
+        assert response.headers["X-Bloomery-License"] == "AGPL-3.0-or-later"
+
+    def test_every_asset_the_page_needs_is_present(self) -> None:
+        """The set of files STATIC_DIR must contain for the page to work at all.
+
+        This reads the source tree, not a wheel: STATIC_DIR resolves inside
+        src/ under an editable install, which is how the whole matrix runs. So
+        it pins the file list, not the packaging. The `verify the web ui ships`
+        step in .github/workflows/ci.yml is what inspects a built wheel, and it
+        is the only thing that can — nothing here would notice a wheel that
+        shipped without these.
+        """
+        from bloomery.server.app import STATIC_DIR
+
+        assert (STATIC_DIR / "index.html").is_file()
+        assert (STATIC_DIR / "app.js").is_file()
+        assert (STATIC_DIR / "app.css").is_file()
+        assert (STATIC_DIR / "format.js").is_file()
+
+    def test_the_page_does_not_invent_a_history_limit(self) -> None:
+        """Truncation is the server's to report, so the page must not guess it.
+
+        Counting the received jobs cannot distinguish a complete list that
+        happens to sit on the limit from a truncated one, and the first live
+        transition after a snapshot pushes the client's count past the limit
+        either way.
+        """
+        from bloomery.server.app import STATIC_DIR
+
+        source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        assert "HISTORY_LIMIT" not in source, "the page is guessing at the limit again"
+        assert "frame.truncated" in source
+
+    def test_the_form_and_the_runner_offer_the_same_parameters(self) -> None:
+        """Neither table may hold a key the other does not.
+
+        A key in the runner but not the form is a parameter nobody can reach. A
+        key in the form but not the runner is worse: the runner drops what it
+        does not recognise, so the user types a value, the job runs without it,
+        and nothing reports the difference — not the UI, not the log, not the
+        stored params.
+
+        This is the one place the UI duplicates a table that lives in Python.
+        """
+        import re
+
+        from bloomery.jobs.runner import _FLAGS, _SWITCHES
+        from bloomery.server.app import STATIC_DIR
+
+        source = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        def arm_of(table: str, kind_name: str) -> str:
+            """The array literal for one kind, sliced by bracket depth.
+
+            Depth-counting rather than a regex: the arms sit one after another
+            in the same object, and a non-greedy pattern happily runs from an
+            empty `prepare: []` to the closing bracket of `train`.
+            """
+            start = source.index(f"const {table} = {{")
+            opening = source.index(f"\n  {kind_name}: [", start) + len(f"\n  {kind_name}: ")
+            depth = 0
+            for offset, char in enumerate(source[opening:]):
+                depth += (char == "[") - (char == "]")
+                if depth == 0:
+                    return source[opening : opening + offset + 1]
+            raise AssertionError(f"unterminated {kind_name} arm in {table}")
+
+        for kind in _FLAGS:
+            # Sliced per kind so a key defined for `train` cannot satisfy an
+            # assertion about `bench`.
+            expected = set(_FLAGS[kind]) | set(_SWITCHES[kind])
+            offered: set[str] = set()
+            for table in ("FIELDS", "SWITCHES"):
+                offered |= set(re.findall(r'key:\s*"([^"]+)"', arm_of(table, kind.value)))
+
+            assert offered == expected, (
+                f"{kind.value}: form and runner disagree — "
+                f"only in form: {sorted(offered - expected)}, "
+                f"only in runner: {sorted(expected - offered)}"
+            )
+
+
+# --------------------------------------------------------------------------- #
 # the stream
 # --------------------------------------------------------------------------- #
 
@@ -406,6 +533,40 @@ class TestStream:
         assert event["type"] == "job"
         assert event["job"]["id"] == created["id"]
         assert event["job"]["status"] == "queued"
+
+    def test_a_complete_snapshot_says_so(self, client: Any) -> None:
+        client.post("/api/jobs", json={"kind": "prepare", "params": {}})
+        with client.websocket_connect("/api/stream") as socket:
+            first = socket.receive_json()
+        assert first["truncated"] is False
+        assert first["total"] == 1
+
+    def test_a_snapshot_exactly_at_the_limit_is_not_truncated(
+        self, client: Any, store: JobStore
+    ) -> None:
+        """The case a client cannot work out for itself.
+
+        A list holding exactly SNAPSHOT_LIMIT jobs looks identical whether or
+        not anything was left out, which is why the flag has to come from here.
+        """
+        for _ in range(SNAPSHOT_LIMIT):
+            store.create(JobKind.PREPARE, {})
+        with client.websocket_connect("/api/stream") as socket:
+            first = socket.receive_json()
+        assert len(first["jobs"]) == SNAPSHOT_LIMIT
+        assert first["total"] == SNAPSHOT_LIMIT
+        assert first["truncated"] is False
+
+    def test_a_snapshot_past_the_limit_reports_the_truncation(
+        self, client: Any, store: JobStore
+    ) -> None:
+        for _ in range(SNAPSHOT_LIMIT + 5):
+            store.create(JobKind.PREPARE, {})
+        with client.websocket_connect("/api/stream") as socket:
+            first = socket.receive_json()
+        assert len(first["jobs"]) == SNAPSHOT_LIMIT
+        assert first["total"] == SNAPSHOT_LIMIT + 5
+        assert first["truncated"] is True
 
 
 class TestEventHub:

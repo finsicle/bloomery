@@ -45,7 +45,7 @@ if (-not (Test-Path 'pyproject.toml')) {
 
 Write-Info 'checking for WSL2'
 if ($env:WSL_DISTRO_NAME) {
-    Write-Info "running inside WSL ($env:WSL_DISTRO_NAME) — use install.sh instead"
+    Write-Info "running inside WSL ($env:WSL_DISTRO_NAME) - use install.sh instead"
     exit 1
 }
 Write-Warn 'native Windows is best-effort; WSL2 is the supported path'
@@ -84,8 +84,18 @@ $Bloomery = Join-Path $RepoRoot '.venv\Scripts\bloomery.exe'
 # --------------------------------------------------------------------------- #
 # core install, then immediately report
 # --------------------------------------------------------------------------- #
-Write-Info 'installing bloomery core'
-uv pip install --quiet -e .
+# The serve extra comes with core rather than being optional: `bloomery serve`
+# is the web interface, and an install that cannot open it is a surprise to
+# discover later. It is fastapi, uvicorn, pydantic and websockets - pure Python
+# and small next to the torch install below.
+Write-Info 'installing bloomery core and the web interface'
+uv pip install --quiet -e '.[serve]'
+# $ErrorActionPreference = 'Stop' does not apply to native commands, so without
+# this an install failure falls straight through to `bloomery doctor` and the
+# user sees a confusing second error instead of the real one.
+if ($LASTEXITCODE -ne 0) {
+    Stop-WithError 'installing bloomery failed; the output above says why'
+}
 
 Write-Info 'probing hardware'
 Write-Host ''
@@ -94,7 +104,7 @@ $DoctorStatus = $LASTEXITCODE
 Write-Host ''
 
 if ($DoctorStatus -ne 0) {
-    Write-Warn 'doctor reported a blocking problem — see the notes above'
+    Write-Warn 'doctor reported a blocking problem - see the notes above'
 }
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +116,9 @@ if ($WithTraining) {
     # GPU presence and resolves the matching wheel index. It is only available
     # on `uv pip`, which is why this is not a `uv sync`.
     uv pip install --torch-backend=auto -e ".[train]"
+    if ($LASTEXITCODE -ne 0) {
+        Stop-WithError 'installing PyTorch failed; the output above says why'
+    }
     Write-Info 'verifying torch can see the hardware'
     Write-Host ''
     & $Bloomery doctor

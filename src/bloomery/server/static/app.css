@@ -1,0 +1,526 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Aswin Alexander Sam
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+:root {
+  --bg: #fbfaf8;
+  --panel: #ffffff;
+  --ink: #1b1a17;
+  --muted: #6b6862;
+  --line: #e4e0d8;
+  --accent: #8a4b1e;
+  --accent-ink: #ffffff;
+  --queued: #6b6862;
+  --running: #8a4b1e;
+  --succeeded: #2f6b3a;
+  --failed: #a32b2b;
+  --cancelled: #6b6862;
+  --interrupted: #8a6d1e;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15140f;
+    --panel: #1e1c17;
+    --ink: #ece7dc;
+    --muted: #9a948a;
+    --line: #322e26;
+    --accent: #d98a4a;
+    --accent-ink: #15140f;
+    --queued: #9a948a;
+    --running: #d98a4a;
+    --succeeded: #6fbf7f;
+    --failed: #e07b7b;
+    --cancelled: #9a948a;
+    --interrupted: #d7bb62;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  /* "Segoe UI" is quoted because a family name containing a space is two
+     identifiers otherwise. Browsers forgive it; the syntax rules do not. */
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Off-screen but still announced. Used for text that a sighted user reads from
+   colour or position instead. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+h1 {
+  font-size: 1.1rem;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+h2 {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  margin: 0 0 0.9rem;
+  font-weight: 600;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.9rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.counts {
+  display: flex;
+  gap: 0.75rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  flex-wrap: wrap;
+}
+
+.counts b {
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Connection lamp. The colour is a glance; the announced text lives beside it
+   in a visually hidden span, because colour alone is not a message. */
+.link-state {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  flex: none;
+}
+
+.link {
+  display: block;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.link.live {
+  background: var(--succeeded);
+}
+
+.link.lost {
+  background: var(--failed);
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.25rem;
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 900px) {
+  main {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  #jobs-panel {
+    grid-column: 1 / -1;
+    order: -1;
+  }
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1.1rem;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+  min-width: 0;
+}
+
+/* Caption and hint share one line, so a field with a hint keeps its input at
+   the same height as one without and the columns stay aligned. */
+.caption {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.caption .hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hint {
+  color: var(--muted);
+  font-weight: 400;
+  opacity: 0.8;
+}
+
+input,
+select {
+  font: inherit;
+  font-size: 0.9rem;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.4rem 0.5rem;
+  min-width: 0;
+}
+
+input:focus,
+select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+/* align-items: end so a caption that wraps to two lines makes its label taller
+   without dropping its input below the rest of the row. */
+.row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.7rem;
+  margin-bottom: 0.7rem;
+  align-items: end;
+}
+
+.fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.7rem;
+  align-items: end;
+}
+
+.switches {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 1.1rem;
+  flex-wrap: wrap;
+}
+
+.switches label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.switches input {
+  width: auto;
+}
+
+.resources {
+  margin: 0.9rem 0;
+  border-top: 1px solid var(--line);
+  padding-top: 0.7rem;
+}
+
+.resources summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.resources p {
+  margin: 0.6rem 0;
+  font-size: 0.78rem;
+}
+
+.gpus {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  font-size: 0.82rem;
+}
+
+.gpus label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  margin-top: 0.9rem;
+}
+
+button {
+  font: inherit;
+  font-size: 0.88rem;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-radius: 5px;
+  padding: 0.42rem 0.9rem;
+  cursor: pointer;
+}
+
+button.quiet {
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--line);
+}
+
+button:hover {
+  filter: brightness(1.08);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+  filter: none;
+}
+
+.error {
+  color: var(--failed);
+  font-size: 0.82rem;
+}
+
+/* ------------------------------------------------------------------ jobs */
+
+.jobs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.job {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.job-head {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.6rem 0.75rem;
+  cursor: pointer;
+  background: none;
+  border: none;
+  width: 100%;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+}
+
+.job-head:hover {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+}
+
+/* background:none and border:none above also take the platform focus ring with
+   them in several engines, and :hover answers the pointer only. Without this a
+   keyboard user tabbing through ten queued jobs cannot tell which row they are
+   on until they press Enter and watch what expands. */
+.job-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.pill {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.15rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  flex: none;
+  font-weight: 600;
+}
+
+.pill.queued { color: var(--queued); }
+.pill.running { color: var(--running); }
+.pill.succeeded { color: var(--succeeded); }
+.pill.failed { color: var(--failed); }
+.pill.cancelled { color: var(--cancelled); }
+.pill.interrupted { color: var(--interrupted); }
+
+.job-kind {
+  font-weight: 600;
+}
+
+.job-name {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.job-when {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.job-body {
+  border-top: 1px solid var(--line);
+  padding: 0.75rem;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.5rem 1rem;
+  font-size: 0.82rem;
+}
+
+.facts div {
+  min-width: 0;
+}
+
+.facts dt {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.facts dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.job-error {
+  color: var(--failed);
+  font-size: 0.82rem;
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.note {
+  color: var(--interrupted);
+  font-size: 0.8rem;
+}
+
+.log {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.6rem;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  line-height: 1.45;
+  max-height: 22rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.empty {
+  color: var(--muted);
+  font-size: 0.85rem;
+  margin: 0;
+}
+
+/* ------------------------------------------------------------------ host */
+
+.host {
+  font-size: 0.84rem;
+  display: grid;
+  gap: 0.5rem;
+}
+
+/* Each term/value pair is wrapped in its own cell. Left as bare dt/dd children
+   of a grid they flow as independent items and a value drifts away from the
+   label it belongs to. */
+.host dl {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.6rem 1rem;
+  margin: 0;
+}
+
+.host dl > div {
+  min-width: 0;
+}
+
+.host dt {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.host dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.issue {
+  font-size: 0.8rem;
+  padding: 0.4rem 0.55rem;
+  border-radius: 5px;
+  border-left: 3px solid var(--muted);
+  background: var(--bg);
+}
+
+.issue.error { border-left-color: var(--failed); }
+.issue.warn { border-left-color: var(--interrupted); }
+.issue.info { border-left-color: var(--muted); }
+
+.issue .hint {
+  display: block;
+  margin-top: 0.2rem;
+}
+
+footer {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 1.25rem 2rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+footer a {
+  color: var(--accent);
+}

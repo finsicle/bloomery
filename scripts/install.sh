@@ -72,8 +72,12 @@ fi
 # --------------------------------------------------------------------------- #
 # core install, then immediately report
 # --------------------------------------------------------------------------- #
-info "installing bloomery core"
-uv pip install --quiet -e .
+# The serve extra comes with core rather than being optional: `bloomery serve`
+# is the web interface, and an install that cannot open it is a surprise to
+# discover later. It is fastapi, uvicorn, pydantic and websockets — pure Python
+# and small next to the torch install below.
+info "installing bloomery core and the web interface"
+uv pip install --quiet -e ".[serve]"
 
 info "probing hardware"
 echo

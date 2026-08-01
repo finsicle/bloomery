@@ -1,0 +1,97 @@
+<!--
+  SPDX-FileCopyrightText: 2026 Aswin Alexander Sam
+  SPDX-License-Identifier: AGPL-3.0-or-later
+
+  This page is not built from anything. What you are reading is what runs.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bloomery</title>
+<link rel="stylesheet" href="/app.css" />
+
+<header class="bar">
+  <h1>bloomery</h1>
+  <div class="counts" id="counts"></div>
+  <!-- role=status so the connection state is announced rather than carried by
+       the lamp colour alone. The text sits in a visually hidden span because a
+       title attribute on a non-focusable div is not read out. -->
+  <div class="link-state" role="status" aria-live="polite">
+    <span class="link" id="link" aria-hidden="true"></span>
+    <span class="visually-hidden" id="link-text">connecting</span>
+  </div>
+</header>
+
+<main>
+  <section class="panel" id="submit-panel">
+    <h2>Start a job</h2>
+    <form id="submit" autocomplete="off">
+      <div class="row">
+        <label>
+          <span class="caption"><span>Kind</span></span>
+          <select name="kind" id="kind">
+            <option value="prepare">prepare</option>
+            <option value="train">train</option>
+            <option value="bench">bench</option>
+          </select>
+        </label>
+        <!-- The job's display label. Distinct from the per-kind "name" field
+             below, which is the dataset or run name passed to the command. -->
+        <label>
+          <span class="caption"><span>Label</span><span class="hint">shown in the list</span></span>
+          <input type="text" name="label" maxlength="200" />
+        </label>
+      </div>
+
+      <!-- Fields are generated per kind from the flags the runner actually
+           accepts. Anything else is silently dropped by the runner, so offering
+           it would mean a job that quietly ignores what was typed. -->
+      <div class="fields" id="fields"></div>
+
+      <details class="resources">
+        <summary>Resource limits</summary>
+        <p class="hint">
+          Caps for the job's process. Separate from any <code>cores</code> field
+          above, which is passed to the training command itself.
+        </p>
+        <div class="row">
+          <label>
+            <span class="caption"><span>CPU cores</span><span class="hint">thread cap</span></span>
+            <input type="number" name="res_cores" min="1" step="1" />
+          </label>
+          <label>
+            <span class="caption"><span>Memory</span><span class="hint">GiB</span></span>
+            <input type="number" name="res_memory_gib" min="1" step="1" />
+          </label>
+        </div>
+        <div id="gpu-picker" class="gpus"></div>
+      </details>
+
+      <div class="actions">
+        <button type="submit" id="submit-button">Queue it</button>
+        <span class="error" id="submit-error"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel" id="jobs-panel">
+    <h2>Jobs</h2>
+    <div id="jobs" class="jobs"></div>
+    <p class="empty" id="jobs-empty">Nothing queued yet.</p>
+    <p class="empty" id="jobs-note" hidden></p>
+  </section>
+
+  <section class="panel" id="host-panel">
+    <h2>This machine</h2>
+    <div id="host" class="host">Reading hardware…</div>
+  </section>
+</main>
+
+<footer>
+  <span id="source-note"></span>
+  Free software under the AGPL. If you run a modified version and let other
+  people use it over a network, you must offer them its source.
+</footer>
+
+<script type="module" src="/app.js"></script>
