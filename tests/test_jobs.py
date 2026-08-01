@@ -9,6 +9,8 @@ a queue that has never actually started a process proves very little.
 
 from __future__ import annotations
 
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -820,6 +822,189 @@ class TestRealJob:
         assert done.exit_code == 0
         # The job really did the work, not just exit zero.
         assert (home / "datasets" / "queued-corpus" / "tokens" / "meta.json").is_file()
+
+
+class TestLogCompaction:
+    """Job logs are append-only and nothing rotated them.
+
+    A long training run wrote to one file for hours, so a single job could fill
+    the disk and take the rest of the machine's work down with it.
+    """
+
+    def test_a_log_under_the_cap_is_left_exactly_as_it_was(self, tmp_path: Path) -> None:
+        path = tmp_path / "job.log"
+        path.write_bytes(b"line\n" * 100)
+        before = path.read_bytes()
+
+        assert runner.compact_log(path, cap=1_000_000, keep=1000) == 0
+        assert path.read_bytes() == before
+
+    def test_an_oversized_log_keeps_its_most_recent_lines(self, tmp_path: Path) -> None:
+        path = tmp_path / "job.log"
+        path.write_bytes(b"".join(f"line {i}\n".encode() for i in range(20_000)))
+        size = path.stat().st_size
+
+        dropped = runner.compact_log(path, cap=4096, keep=2048)
+
+        assert dropped > 0
+        text = path.read_text(encoding="utf-8")
+        assert path.stat().st_size < size
+        # The end of a run is what a person reads: the error, or the last loss.
+        assert text.rstrip().endswith("line 19999")
+        assert "line 0\n" not in text
+
+    def test_the_dropped_bytes_are_declared_in_the_log_itself(self, tmp_path: Path) -> None:
+        """Silently shortening a log would make a run look like it never started."""
+        path = tmp_path / "job.log"
+        path.write_bytes(b"".join(f"line {i}\n".encode() for i in range(20_000)))
+
+        runner.compact_log(path, cap=4096, keep=2048)
+
+        first = path.read_text(encoding="utf-8").splitlines()[0]
+        assert first.startswith("[bloomery]")
+        assert "dropped" in first
+
+    def test_compaction_never_leaves_a_partial_line(self, tmp_path: Path) -> None:
+        """The kept window opens mid-line, and that fragment reads as corruption."""
+        path = tmp_path / "job.log"
+        path.write_bytes(b"".join(f"line {i:06d}\n".encode() for i in range(20_000)))
+
+        runner.compact_log(path, cap=4096, keep=2048)
+
+        body = path.read_text(encoding="utf-8").splitlines()[1:]
+        assert all(re.fullmatch(r"line \d{6}", line) for line in body), body[:3]
+
+    def test_compacting_twice_does_not_stack_markers(self, tmp_path: Path) -> None:
+        path = tmp_path / "job.log"
+        path.write_bytes(b"".join(f"line {i}\n".encode() for i in range(20_000)))
+        runner.compact_log(path, cap=4096, keep=2048)
+        path.open("ab").write(b"".join(f"more {i}\n".encode() for i in range(20_000)))
+
+        runner.compact_log(path, cap=4096, keep=2048)
+
+        text = path.read_text(encoding="utf-8")
+        assert text.count("[bloomery]") == 1
+
+    def test_a_missing_log_is_not_an_error(self, tmp_path: Path) -> None:
+        assert runner.compact_log(tmp_path / "nothing.log") == 0
+
+    def test_a_job_keeps_writing_where_the_log_was_cut(self, tmp_path: Path) -> None:
+        """The reason this truncates in place instead of replacing the file.
+
+        The job holds an open descriptor. Renaming a replacement over the top
+        would leave it writing to an unlinked inode and everything it logged
+        afterwards would go nowhere. Truncating the file it already has works
+        because the runner opens the log with "ab": under O_APPEND every write
+        lands at the current end, so a shorter file just means the next line
+        arrives at the new end.
+        """
+        path = tmp_path / "job.log"
+        handle = path.open("ab", buffering=0)
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "import sys, time\n"
+                "for i in range(200):\n"
+                "    print(f'line {i:04d}')\n"
+                "    sys.stdout.flush()\n"
+                "    time.sleep(0.01)\n",
+            ],
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+        )
+        handle.close()
+        try:
+            deadline = time.time() + 10
+            while path.stat().st_size < 400 and time.time() < deadline:
+                time.sleep(0.02)
+
+            dropped = runner.compact_log(path, cap=200, keep=100)
+            assert dropped > 0
+
+            assert child.wait(timeout=30) == 0
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+
+        content = path.read_bytes()
+        # A hole would mean the child wrote at a stale offset past the new end.
+        assert b"\0" not in content
+        text = content.decode("utf-8")
+        assert text.startswith("[bloomery]")
+        # Output from after the cut is present and intact.
+        assert "line 0199" in text
+        assert all(
+            re.fullmatch(r"line \d{4}", line) for line in text.splitlines()[1:] if line.strip()
+        )
+
+    def test_a_log_left_by_a_crashed_supervisor_is_reclaimed(
+        self, store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Nothing bounded this log while the supervisor was gone.
+
+        Once reconcile marks the job interrupted, no later pass looks at it
+        again, so this is the only chance to reclaim the space.
+        """
+        monkeypatch.setattr(runner, "LOG_CAP_BYTES", 4096)
+        monkeypatch.setattr(runner, "LOG_KEEP_BYTES", 1024)
+
+        job = store.create(JobKind.PREPARE, {})
+        path = log_path_for(tmp_path, job.id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"".join(f"line {i}\n".encode() for i in range(20_000)))
+        job.log_path = str(path)
+        store.update(job)
+        # A pid that is not alive, which is what a crash leaves behind.
+        store.mark_started(job.id, pid=2**22, pid_created_at=1.0)
+
+        oversized = path.stat().st_size
+        sup = Supervisor(store=store, home=tmp_path, poll_seconds=0.05)
+        recovered = sup.reconcile()
+
+        assert [j.id for j in recovered] == [job.id]
+        assert store.get(job.id).status is JobStatus.INTERRUPTED
+        assert path.stat().st_size < oversized
+        assert path.read_text(encoding="utf-8").startswith("[bloomery]")
+
+    def test_the_supervisor_bounds_a_running_job(
+        self, store: JobStore, tmp_path: Path, stub_command, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end: the growth path that actually fills a disk."""
+        monkeypatch.setattr(runner, "LOG_CAP_BYTES", 4096)
+        monkeypatch.setattr(runner, "LOG_KEEP_BYTES", 1024)
+        stub_command(
+            lambda job: [
+                sys.executable,
+                "-u",
+                "-c",
+                "import sys, time\n"
+                "for i in range(4000):\n"
+                "    print('x' * 80)\n"
+                "    sys.stdout.flush()\n"
+                "    time.sleep(0.001)\n",
+            ]
+        )
+        sup = Supervisor(store=store, home=tmp_path, poll_seconds=0.05)
+        job = sup.submit(JobKind.PREPARE, {})
+
+        path = log_path_for(tmp_path, job.id)
+        peak = 0
+        for _ in range(400):
+            sup.tick()
+            if path.exists():
+                peak = max(peak, path.stat().st_size)
+            if store.get(job.id).status.terminal:
+                break
+            time.sleep(0.02)
+
+        assert store.get(job.id).status.terminal, "job never finished"
+        # Without compaction this run writes ~320 KiB. The bound is the cap plus
+        # whatever one poll interval adds, not the cap exactly.
+        assert peak < 200_000, f"log reached {peak} bytes despite a 4 KiB cap"
+        assert path.stat().st_size < 200_000
 
 
 class TestOutputEncoding:

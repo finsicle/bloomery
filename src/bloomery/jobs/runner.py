@@ -14,6 +14,7 @@ only possible by setting it before the interpreter starts.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -27,6 +28,8 @@ import psutil
 
 from bloomery.jobs.types import Job, JobKind, ResourceRequest
 
+log = logging.getLogger(__name__)
+
 # How far a process's reported creation time may drift from the recorded one and
 # still be considered the same process. Filesystem and clock granularity vary by
 # platform, so an exact match is not reliable.
@@ -36,6 +39,18 @@ PID_IDENTITY_TOLERANCE = 1.0
 # Long enough for the trainer to finish writing the checkpoint it is midway
 # through, short enough that a cancel feels like a cancel.
 TERMINATE_GRACE_SECONDS = 10.0
+
+# Bounds on a job's log. A training run writes to one file for hours and nothing
+# ever rotated it, so a single job could fill the disk — and when it did, it took
+# the rest of the machine's work with it rather than just its own.
+#
+# The cap is generous because the log is the only account of what a run did, and
+# the kept tail is what a person actually reads: 8 MiB is on the order of a
+# hundred thousand lines. What gets dropped is the middle of a long run, which is
+# repetitive step output. The run's configuration is not lost with it — that
+# lives in the job record, not only in the log.
+LOG_CAP_BYTES = 32 * 1024 * 1024
+LOG_KEEP_BYTES = 8 * 1024 * 1024
 
 
 class JobLaunchError(RuntimeError):
@@ -267,6 +282,72 @@ def launch(
         handle.close()
 
     return Launched(process=process, command=command, limits_note=limits_note)
+
+
+def compact_log(
+    path: Path,
+    *,
+    cap: int | None = None,
+    keep: int | None = None,
+) -> int:
+    """Trim an oversized log in place, keeping its most recent lines.
+
+    Returns the number of bytes dropped, or 0 if nothing needed doing.
+
+    The bounds are read at call time rather than bound as default arguments, so
+    that setting ``runner.LOG_CAP_BYTES`` actually takes effect. A default
+    argument would capture the value at import and quietly ignore every later
+    change to it.
+
+    Rewritten in place rather than replaced. The running job holds an open
+    descriptor to this file: swapping in a new one by rename would leave the job
+    writing to an unlinked inode, and everything it logged from then on would go
+    nowhere. Truncating the file the job already has is what keeps its output
+    arriving.
+
+    That is safe because ``launch`` opens the log with ``"ab"``. Under O_APPEND
+    every write lands at the current end of the file, so a shorter file simply
+    means the next line arrives at the new end — no sparse gap, no interleaving
+    at a stale offset.
+
+    A line written in the instant between measuring and truncating is lost. The
+    window is microseconds against a cap measured in tens of megabytes, and the
+    alternative is stopping the job to take a lock on its own diagnostic output.
+    """
+    cap = LOG_CAP_BYTES if cap is None else cap
+    keep = LOG_KEEP_BYTES if keep is None else keep
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    if size <= cap:
+        return 0
+
+    try:
+        with path.open("r+b") as handle:
+            handle.seek(size - keep)
+            tail = handle.read(keep)
+            # The window opens mid-line; that fragment belongs to a line whose
+            # beginning is being dropped, so it would read as corruption.
+            newline = tail.find(b"\n")
+            tail = tail[newline + 1 :] if newline != -1 else tail
+
+            dropped = size - len(tail)
+            marker = (
+                f"[bloomery] {dropped / 1024 / 1024:.1f} MiB of earlier output was "
+                f"dropped to keep this log under {cap // 1024 // 1024} MiB. "
+                f"The job is still running and still writing below.\n"
+            ).encode()
+
+            handle.seek(0)
+            handle.write(marker + tail)
+            handle.truncate()
+    except OSError:
+        # Losing the log is not worth losing the job over.
+        log.warning("could not compact %s", path, exc_info=True)
+        return 0
+    return dropped
 
 
 def _same_process(process: psutil.Process, created_at: float | None) -> bool:

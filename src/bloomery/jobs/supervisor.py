@@ -45,6 +45,7 @@ class _Running:
     # Fixed once the job starts, so it is recorded here rather than re-read from
     # the store on every scheduling pass while the lock is held.
     exclusive: bool
+    log_path: Path
 
 
 class Supervisor:
@@ -137,6 +138,12 @@ class Supervisor:
                 JobStatus.INTERRUPTED,
                 error="the server stopped while this job was running",
             )
+            # Nothing bounded this log while the supervisor was gone, and once
+            # the job is marked finished nothing else will ever look at it. This
+            # is the one chance to reclaim what a crashed run left behind.
+            if job.log_path:
+                runner.compact_log(Path(job.log_path))
+
             refreshed = self.store.get(job.id)
             if refreshed is not None:
                 recovered.append(refreshed)
@@ -226,14 +233,42 @@ class Supervisor:
     def tick(self) -> None:
         """One scheduling pass. Public so tests can drive it deterministically."""
         self._collect_finished()
+        self._compact_logs()
         self._start_eligible()
 
+    def _compact_logs(self) -> None:
+        """Keep running jobs' logs bounded.
+
+        Checked here rather than by the writer because nothing sits between the
+        job and its log file: the runner hands the descriptor to the child and
+        closes its own copy, so the job keeps writing even if this process dies.
+        Pumping the output through the supervisor instead would bound the file
+        but would also mean a dead supervisor blocks a running job on a full
+        pipe, which is a worse failure than a large log.
+
+        A stat per running job per pass is one cheap syscall, and it does no
+        work at all until a log is actually over the cap.
+        """
+        with self._lock:
+            entries = [(entry.job_id, entry.log_path) for entry in self._running.values()]
+        # Deliberately outside the lock: this touches the filesystem, and
+        # scheduling should not wait behind a multi-megabyte rewrite.
+        for job_id, path in entries:
+            dropped = runner.compact_log(path)
+            if dropped:
+                log.info("dropped %d bytes from the log for job %s", dropped, job_id)
+
     def _collect_finished(self) -> None:
+        finished: list[Path] = []
         with self._lock:
             for job_id, entry in list(self._running.items()):
                 code = entry.launched.process.poll()
                 if code is None:
                     continue
+                # Taken before the entry goes: a job removed from _running is
+                # never looked at again by _compact_logs, so whatever it wrote
+                # between the last pass and exiting would stay on disk forever.
+                finished.append(entry.log_path)
                 del self._running[job_id]
 
                 current = self.store.get(job_id)
@@ -246,6 +281,11 @@ class Supervisor:
                 error = None if code == 0 else _describe_exit(code, entry.launched)
                 self.store.mark_finished(job_id, status, exit_code=code, error=error)
                 self._after_change(job_id)
+
+        # Outside the lock, and after the loop: a final pass over each log that
+        # just stopped growing. Nothing else will ever look at these again.
+        for path in finished:
+            runner.compact_log(path)
 
     def _start_eligible(self) -> None:
         with self._lock:
@@ -283,6 +323,7 @@ class Supervisor:
             launched=launched,
             pid_created_at=pid_created_at,
             exclusive=job.exclusive,
+            log_path=log_path,
         )
         self._after_change(job.id)
         return True
