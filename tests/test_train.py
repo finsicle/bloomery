@@ -289,6 +289,31 @@ class TestPreferenceSampler:
         second = self.sampler(preference_dataset, seed=9).batch(4, cpu_choice.device)
         assert first["input_ids"].equal(second["input_ids"])
 
+    def test_training_preference_data_without_adapters_is_refused(
+        self, preference_dataset: Any, tokenizer: Any, cpu_choice: DeviceChoice, tmp_path: Path
+    ) -> None:
+        """The reference is this model with its adapters off, so there must be some.
+
+        The CLI refuses --method full on preference data, but train() is reached
+        from library callers and from tests too. Without this guard the run gets
+        as far as the first microbatch before dying on an AttributeError naming a
+        peft method, which says nothing about what was wrong.
+        """
+        from bloomery.train.loop import train as run_training
+
+        with pytest.raises(ValueError, match="adapters"):
+            run_training(
+                spec=spec_from_depth(1, vocab=preference_dataset.vocab_size, seq=64),
+                datasets={"prefs": preference_dataset},
+                mixture=single("prefs"),
+                tokenizer=tokenizer,
+                run_dir=tmp_path / "run",
+                config=TrainConfig(steps=1, batch=2, seq=64, eval_every=0, log_every=0),
+                choice=cpu_choice,
+                eos_token_id=0,
+                adapter=None,
+            )
+
     def test_the_factory_picks_the_sampler_from_the_format(
         self, preference_dataset: Any, dataset: Any
     ) -> None:

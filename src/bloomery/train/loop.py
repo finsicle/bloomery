@@ -728,6 +728,20 @@ def train(
     # any() and all() agree here.
     objective: Objective = objective_mod.causal_loss
     if any(info.preference for info in datasets.values()):
+        # The reference the objective scores against is this model with its
+        # adapters switched off, so there have to be adapters. The CLI refuses
+        # --method full on preference data, but train() is reachable without it
+        # — from a library caller, or from a test — and without this the run
+        # builds the model, the optimizer, the samplers and the metrics writer
+        # before dying on the first microbatch with an AttributeError naming a
+        # peft method, which says nothing about what was actually wrong.
+        if not hasattr(model, "disable_adapter"):
+            raise ValueError(
+                "preference training scores a model against its own untuned self, "
+                "which here means the same weights with the LoRA adapters switched "
+                "off — so it needs adapters, and this model has none.\n"
+                "Pass a LoraSettings adapter, or use `bloomery adapt --method lora`."
+            )
         objective = partial(objective_mod.preference_loss, beta=config.dpo_beta)
     history: list[dict[str, Any]] = []
     throughput = Throughput()

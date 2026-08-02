@@ -374,6 +374,16 @@ def prepare(
         documents = synthetic_documents(synthetic)
 
     if preference and not examples:
+        # The mirror of the check below: each flag names the other when it is
+        # handed the other's data, or the message says only that nothing was
+        # found and leaves the two shapes to be told apart by eye.
+        if source is not None and looks_like_conversations(source):
+            _die(
+                f"{source} looks like conversation data rather than preference pairs.\n"
+                "Pack it for supervised fine-tuning instead:\n"
+                f"  bloomery prepare --name {name} --source {source} --chat "
+                f"--tokenizer {tokenizer_from}"
+            )
         _die(
             f"no preference pairs found in {source}. Each line should be a JSON object "
             'holding a "prompt" — a string or a messages list — plus "chosen" and '

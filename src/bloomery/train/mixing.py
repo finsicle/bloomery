@@ -30,6 +30,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
     from bloomery.train.loop import BatchSampler, EvalResult, PreferenceSampler
+    from bloomery.train.objective import Objective
 
 # A component has to get worse by more than this before it is called a
 # regression. Validation loss on a small held-out split is noisy; flagging every
@@ -354,7 +355,7 @@ def evaluate_components(
     *,
     batch: int,
     batches: int,
-    objective: Any = None,
+    objective: Objective | None = None,
 ) -> dict[str, EvalResult]:
     """Held-out score for each component, measured independently."""
     from bloomery.train.loop import evaluate
@@ -367,7 +368,7 @@ def evaluate_components(
             choice,
             batch=batch,
             batches=batches,
-            objective=objective or causal_loss,
+            objective=causal_loss if objective is None else objective,
         )
         for name, sampler in samplers.items()
     }

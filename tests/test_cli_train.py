@@ -1472,6 +1472,36 @@ class TestSupervisedFineTuning:
         assert "preference data" in output
         assert "--preference" in output
 
+    def test_each_flag_names_the_other_when_handed_the_other_s_data(
+        self, instruct: Path, tmp_path: Path
+    ) -> None:
+        """Both directions, or one shape is left to be told from the other by eye."""
+        as_chat = _invoke(
+            "prepare",
+            "--name",
+            "a",
+            "--source",
+            str(self._pairs(tmp_path / "p.jsonl", 5)),
+            "--chat",
+            "--tokenizer",
+            str(instruct),
+        )
+        assert as_chat.exit_code == 1
+        assert "--preference" in plain(as_chat.stdout)
+
+        as_preference = _invoke(
+            "prepare",
+            "--name",
+            "b",
+            "--source",
+            str(self._corpus(tmp_path / "c.jsonl", 5)),
+            "--preference",
+            "--tokenizer",
+            str(instruct),
+        )
+        assert as_preference.exit_code == 1
+        assert "--chat" in plain(as_preference.stdout)
+
     def test_chat_prompts_through_the_template_it_was_trained_with(
         self, instruct: Path, tmp_path: Path
     ) -> None:
