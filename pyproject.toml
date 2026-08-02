@@ -67,6 +67,12 @@ serve = [
     "pydantic>=2.9",
     "websockets>=13.0",
 ]
+# Writing GGUF. The official library from the llama.cpp repository: pure Python,
+# and it ships its own type information. Kept out of core, which stays at three.
+export = [
+    "gguf>=0.10",
+    "numpy>=1.26",
+]
 # Quantized training. CUDA and ROCm only — no macOS wheels exist.
 quant = [
     "bitsandbytes>=0.44; sys_platform != 'darwin'",

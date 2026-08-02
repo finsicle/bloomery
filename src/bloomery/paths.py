@@ -66,6 +66,11 @@ def run_dir(name: str) -> Path:
     return runs_dir() / slug(name)
 
 
+def export_dir(name: str) -> Path:
+    """Everything produced by `export` for one model: the GGUF and its Modelfile."""
+    return exports_dir() / slug(name)
+
+
 def slug(name: str) -> str:
     """Make a user-supplied name safe to use as a directory.
 

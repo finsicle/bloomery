@@ -64,7 +64,7 @@ jobs:
 
       - name: install
         shell: bash
-        run: uv pip install --torch-backend=auto -e ".[dev,train,serve,adapt]"
+        run: uv pip install --torch-backend=auto -e ".[dev,train,serve,adapt,export]"
 
       # Assert the interpreter and the training stack directly. This replaces an
       # earlier trick of failing the build whenever pytest reported any skip,
@@ -82,6 +82,9 @@ jobs:
           # Same reasoning for the adapter tests: they importorskip on peft,
           # so a broken adapt install would skip every LoRA test silently.
           python -c "import peft; print('adapt extra ok', peft.__version__)"
+          # And the export tests, for the same reason: a broken gguf install
+          # would skip every round-trip test rather than failing.
+          python -c "import gguf; print('export extra ok')"
 
       # No retry. One was added here on the theory that the illegal-instruction
       # crashes on Windows were an intermittent fault in the PyTorch wheel that
@@ -147,7 +150,7 @@ jobs:
 
       # The train extra is needed here too: mypy resolves numpy's bundled stubs,
       # and dropping it would turn a type error into an unanalysable import.
-      - run: uv pip install --torch-backend=auto -e ".[dev,train,serve,adapt]"
+      - run: uv pip install --torch-backend=auto -e ".[dev,train,serve,adapt,export]"
 
       - name: ruff check
         run: ruff check .

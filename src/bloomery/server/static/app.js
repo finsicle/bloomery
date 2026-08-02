@@ -65,6 +65,12 @@ const FIELDS = {
     { key: "device", label: "Device", choices: ["cuda", "mps", "cpu"] },
     { key: "seed", label: "Seed", type: "number" },
   ],
+  export: [
+    { key: "run", label: "Run", hint: "a run name from train or adapt" },
+    { key: "checkpoint", label: "Checkpoint", hint: "a path, instead of a run" },
+    { key: "name", label: "Export name", hint: "defaults to the run's" },
+    { key: "quantize", label: "Format", choices: ["f16", "q8_0", "q4_0"] },
+  ],
   bench: [
     { key: "size", label: "Size", choices: SIZES, hint: "named preset" },
     { key: "depth", label: "Depth", type: "number", min: 1 },
@@ -90,6 +96,8 @@ const SWITCHES = {
     { key: "resume", label: "Resume from latest checkpoint" },
     { key: "force", label: "Force" },
   ],
+  // Empty, but required: SWITCHES[kind] is subscripted directly below.
+  export: [],
   bench: [{ key: "grad_checkpoint", label: "Gradient checkpointing" }],
 };
 

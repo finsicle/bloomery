@@ -27,6 +27,7 @@ class JobKind(StrEnum):
     TRAIN = "train"
     ADAPT = "adapt"
     BENCH = "bench"
+    EXPORT = "export"
 
 
 class JobStatus(StrEnum):
@@ -53,6 +54,8 @@ class JobStatus(StrEnum):
 # other because VRAM cannot be partitioned on consumer hardware: two training
 # processes sharing one card do not each get half, they contend for all of it
 # and the second one dies.
+# EXPORT is deliberately absent: it reads a checkpoint and writes a file, so
+# it can run beside a training job rather than queueing behind one.
 EXCLUSIVE_KINDS = frozenset({JobKind.TRAIN, JobKind.ADAPT, JobKind.BENCH})
 
 
