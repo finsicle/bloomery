@@ -14,6 +14,7 @@ only possible by setting it before the interpreter starts.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -27,6 +28,8 @@ import psutil
 
 from bloomery.jobs.types import Job, JobKind, ResourceRequest
 
+log = logging.getLogger(__name__)
+
 # How far a process's reported creation time may drift from the recorded one and
 # still be considered the same process. Filesystem and clock granularity vary by
 # platform, so an exact match is not reliable.
@@ -36,6 +39,40 @@ PID_IDENTITY_TOLERANCE = 1.0
 # Long enough for the trainer to finish writing the checkpoint it is midway
 # through, short enough that a cancel feels like a cancel.
 TERMINATE_GRACE_SECONDS = 10.0
+
+# Bounds on a job's log. A training run writes to one file for hours and nothing
+# ever rotated it, so a single job could fill the disk — and when it did, it took
+# the rest of the machine's work with it rather than just its own.
+#
+# The cap is generous because the log is the only account of what a run did, and
+# the kept tail is what a person actually reads: 8 MiB is on the order of a
+# hundred thousand lines. What gets dropped is the middle of a long run, which is
+# repetitive step output. The run's configuration is not lost with it — that
+# lives in the job record, not only in the log.
+LOG_CAP_BYTES = 32 * 1024 * 1024
+LOG_KEEP_BYTES = 8 * 1024 * 1024
+
+# Whether a log can be trimmed while the job is still writing to it.
+#
+# It can wherever O_APPEND means what POSIX says: append mode belongs to the
+# open file description, so every write goes to the file's current end no matter
+# what happened to it in between. Truncating underneath a running job is then
+# safe — its next line simply arrives at the new end.
+#
+# Windows does not give that for an inherited handle. There, append is emulated
+# by the C runtime seeking to the end before each write, inside the process that
+# opened the file. The child receives the handle as its stdout and writes through
+# it directly, carrying its own file pointer. Truncate underneath it and the next
+# write lands at the old offset: the gap between is filled with NULs and the file
+# is immediately back to the size it was, so the trim achieves nothing and
+# corrupts the log on the way. Confirmed on the Windows matrix, which is why the
+# check is here rather than in a comment.
+#
+# So on Windows a log is only trimmed once its job has exited and nothing holds
+# the file. That leaves a run unbounded while it is going, which is no worse than
+# before this existed, and native Windows is best-effort here anyway — under WSL2
+# this is Linux and gets the full behaviour.
+CAN_TRIM_WHILE_WRITING = os.name != "nt"
 
 
 class JobLaunchError(RuntimeError):
@@ -267,6 +304,122 @@ def launch(
         handle.close()
 
     return Launched(process=process, command=command, limits_note=limits_note)
+
+
+def _readable(count: int) -> str:
+    """A byte count a person can read, at whatever scale it happens to be.
+
+    Fixed MiB read as "0 MiB" for anything small, which made the marker in a
+    trimmed log say it had dropped nothing.
+    """
+    size = float(count)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if size < 1024 or unit == "GiB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GiB"  # pragma: no cover - the loop returns first
+
+
+def compact_log(
+    path: Path,
+    *,
+    cap: int | None = None,
+    keep: int | None = None,
+    still_writing: bool = False,
+) -> int:
+    """Trim an oversized log in place, keeping its most recent lines.
+
+    Returns the number of bytes dropped, or 0 if nothing needed doing.
+
+    Pass ``still_writing`` when the job that owns this log is alive. On a
+    platform where truncating underneath a writer is unsafe the call then does
+    nothing, rather than corrupting the log to enforce a limit — see
+    ``CAN_TRIM_WHILE_WRITING``.
+
+    The bounds are read at call time rather than bound as default arguments, so
+    that setting ``runner.LOG_CAP_BYTES`` actually takes effect. A default
+    argument would capture the value at import and quietly ignore every later
+    change to it.
+
+    Rewritten in place rather than replaced. A running job holds an open
+    descriptor to this file: swapping in a new one by rename would leave the job
+    writing to an unlinked inode, and everything it logged from then on would go
+    nowhere. Truncating the file the job already has is what keeps its output
+    arriving.
+
+    A line the job writes in the instant between measuring and truncating is
+    lost — discarded whole, never spliced, because the rewrite only ever shrinks
+    the file. The window is microseconds against a cap measured in tens of
+    megabytes, and the alternative is stopping the job to take a lock on its own
+    diagnostic output.
+    """
+    if still_writing and not CAN_TRIM_WHILE_WRITING:
+        return 0
+
+    cap = LOG_CAP_BYTES if cap is None else cap
+    keep = LOG_KEEP_BYTES if keep is None else keep
+
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    if size <= cap:
+        return 0
+
+    try:
+        with path.open("r+b") as handle:
+            handle.seek(size - keep)
+            tail = handle.read(keep)
+            # The window opens mid-line; that fragment belongs to a line whose
+            # beginning is being dropped, so it would read as corruption.
+            newline = tail.find(b"\n")
+            if newline != -1:
+                tail = tail[newline + 1 :]
+
+            # It has to end on a line boundary too. A job's `print` is not one
+            # write syscall — the text and its newline can go separately — so
+            # the size measured above may fall between them. Ending mid-line
+            # glues the next line the job writes onto this one, which is how
+            # "line 0085line 0086" appears in a log that never contained it.
+            if tail and not tail.endswith(b"\n"):
+                end = tail.rfind(b"\n")
+                if end != -1:
+                    tail = tail[: end + 1]
+                else:
+                    # No boundary anywhere in the window: one line longer than
+                    # it. A progress display that only ever redrew with bare
+                    # carriage returns looks exactly like this. Terminate the
+                    # fragment rather than discard the only output there is —
+                    # the marker above it already says the beginning went.
+                    tail += b"\n"
+
+            marker = (
+                f"[bloomery] {_readable(size - len(tail))} of earlier output was dropped "
+                f"to keep this log under {_readable(cap)}. What follows is the most "
+                f"recent output; anything the job writes from here on is appended "
+                f"below.\n"
+            ).encode()
+
+            # The rewrite must only ever shrink the file. If marker + tail were
+            # longer than what is on disk — which a small cap makes easy — the
+            # write would extend it, and a line the job appends meanwhile would
+            # land inside the region still being written and come back spliced.
+            # Shrinking means a concurrent append always lands past the end of
+            # the new content, where truncate discards it whole.
+            overflow = len(marker) + len(tail) - size
+            if overflow > 0:
+                cut = tail.find(b"\n", overflow)
+                tail = tail[cut + 1 :] if cut != -1 else b""
+
+            dropped = size - len(tail)
+            handle.seek(0)
+            handle.write(marker + tail)
+            handle.truncate()
+    except OSError:
+        # Losing the log is not worth losing the job over.
+        log.warning("could not compact %s", path, exc_info=True)
+        return 0
+    return dropped
 
 
 def _same_process(process: psutil.Process, created_at: float | None) -> bool:

@@ -187,8 +187,15 @@ class JobStore:
         *,
         status: JobStatus | None = None,
         kind: JobKind | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
     ) -> list[Job]:
+        """Newest first. ``limit=None`` returns every match.
+
+        A limit is right for anything answering a request, where a caller asked
+        for a page. It is wrong where the caller needs the whole set to be
+        correct: results come back newest first, so a cap silently drops the
+        *oldest* rows, and for running jobs those are the long-lived ones.
+        """
         clauses: list[str] = []
         values: list[Any] = []
         if status is not None:
@@ -198,9 +205,12 @@ class JobStore:
             clauses.append("kind = ?")
             values.append(kind.value)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        values.append(limit)
+        bound = ""
+        if limit is not None:
+            bound = " LIMIT ?"
+            values.append(limit)
         rows = self._conn().execute(
-            f"SELECT * FROM jobs {where} ORDER BY rowid DESC LIMIT ?",
+            f"SELECT * FROM jobs {where} ORDER BY rowid DESC{bound}",
             values,
         )
         return [Job.from_row(r) for r in rows]
@@ -224,7 +234,14 @@ class JobStore:
         return Job.from_row(row) if row else None
 
     def running(self) -> list[Job]:
-        return self.find(status=JobStatus.RUNNING, limit=1000)
+        """Every job the store still calls running, with no cap.
+
+        Both callers need the complete set to be correct: reconcile() decides
+        which jobs died with a previous supervisor, and the log compactor decides
+        which logs still need bounding. A cap here dropped the oldest running
+        rows, which are exactly the long-lived jobs those two care about most.
+        """
+        return self.find(status=JobStatus.RUNNING, limit=None)
 
     def counts(self) -> dict[str, int]:
         rows = self._conn().execute("SELECT status, COUNT(*) AS n FROM jobs GROUP BY status")
