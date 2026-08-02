@@ -5,16 +5,24 @@
 from __future__ import annotations
 
 from bloomery.data.corpus import (
+    Example,
     count_bytes,
     iter_documents,
+    iter_examples,
+    looks_like_conversations,
     synthetic_documents,
 )
 from bloomery.data.shards import (
+    FORMAT_PACKED,
+    FORMAT_SFT,
     DatasetInfo,
+    SftError,
     SplitInfo,
     build_dataset,
+    build_sft_dataset,
     dtype_for_vocab,
     load_dataset,
+    open_mask,
     open_split,
 )
 from bloomery.data.tokenizer import (
@@ -29,18 +37,26 @@ from bloomery.data.tokenizer import (
 
 __all__ = [
     "END_OF_TEXT",
+    "FORMAT_PACKED",
+    "FORMAT_SFT",
     "DatasetInfo",
+    "Example",
+    "SftError",
     "SplitInfo",
     "adopt_tokenizer",
     "build_dataset",
+    "build_sft_dataset",
     "count_bytes",
     "dtype_for_vocab",
     "eot_id",
     "fingerprint",
     "id_space",
     "iter_documents",
+    "iter_examples",
+    "looks_like_conversations",
     "load_dataset",
     "load_tokenizer",
+    "open_mask",
     "open_split",
     "synthetic_documents",
     "train_tokenizer",

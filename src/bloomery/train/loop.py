@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from bloomery.arch import suggested_lr, to_llama_config
 from bloomery.capability import ModelSpec
-from bloomery.data.shards import DatasetInfo, open_split
+from bloomery.data.shards import DatasetInfo, open_mask, open_split
 from bloomery.mixture import Mixture
 from bloomery.train import checkpoint
 from bloomery.train.device import DeviceChoice
@@ -36,6 +36,15 @@ from bloomery.train.mixing import (  # noqa: E402 - ordering explained above
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
+
+# What torch's cross-entropy skips. Positions carrying this contribute nothing to
+# the loss, which is how a prompt is excluded from what the model is scored on.
+IGNORE_INDEX = -100
+
+# A batch is a mapping so it can be splatted straight into the model and
+# concatenated generically across a blend's components. Naming it keeps the two
+# call sites and the samplers honest about what they exchange.
+Batch = dict[str, "torch.Tensor"]
 
 
 @dataclass(slots=True)
@@ -75,6 +84,9 @@ class TrainResult:
     best_val_loss: float | None
     tokens_seen: int
     tokens_per_second: float
+    # Tokens the loss was actually computed over. Equal to tokens_seen for a
+    # plain corpus; a fraction of it once a completion mask is in play.
+    trained_tokens: int = 0
     history: list[dict[str, Any]] = field(default_factory=list)
     # Last measured validation loss per blend component, and any component that
     # ended worse than its own best. Empty for a single-dataset run with no
@@ -247,15 +259,36 @@ class BatchSampler:
     def tokens(self) -> int:
         return self._length
 
-    def batch(self, size: int, device: torch.device) -> torch.Tensor:
+    def batch(self, size: int, device: torch.device) -> Batch:
+        """One batch of windows, with the labels to score them against.
+
+        For a plain corpus the labels *are* the inputs, which is what next-token
+        prediction means and what this returned before there was anything else.
+        For a conversation corpus the prompt positions carry ``IGNORE_INDEX``, so
+        the loss counts only what the model was meant to produce.
+
+        The labels are deliberately not shifted. The model does that internally,
+        so a shifted label tensor here would move the mask a position away from
+        the token it belongs to.
+        """
         import numpy as np
         import torch
 
         data = open_split(self._info, self._split)
         starts = self._rng.integers(0, self._length - self._seq - 1, size=size)
         window = np.stack([data[i : i + self._seq] for i in starts]).astype(np.int64)
-        tensor = torch.from_numpy(window)
-        return tensor.to(device, non_blocking=True)
+        inputs = torch.from_numpy(window).to(device, non_blocking=True)
+
+        mask = open_mask(self._info, self._split)
+        if mask is None:
+            return {"input_ids": inputs, "labels": inputs}
+
+        keep = np.stack([mask[i : i + self._seq] for i in starts]).astype(bool)
+        labels = np.where(keep, window, IGNORE_INDEX)
+        return {
+            "input_ids": inputs,
+            "labels": torch.from_numpy(labels).to(device, non_blocking=True),
+        }
 
 
 def lr_at(step: int, config: TrainConfig, peak: float) -> float:
@@ -301,9 +334,9 @@ def evaluate(
     counted = 0
     with torch.no_grad():
         for _ in range(batches):
-            inputs = sampler.batch(batch, choice.device)
+            drawn = sampler.batch(batch, choice.device)
             with autocast_for(choice):
-                loss = model(input_ids=inputs, labels=inputs).loss
+                loss = model(**drawn).loss
             if torch.isfinite(loss):
                 total += loss.item()
                 counted += 1
@@ -391,6 +424,11 @@ def train(
 
     start_step = 0
     tokens_seen = 0
+    # Distinct from tokens_seen, which counts the window. Under a completion
+    # mask most of the window is prompt, and reporting that as tokens learned
+    # from would overstate the run several-fold. run.jsonl is a published
+    # contract, so this is a new number rather than a quiet redefinition.
+    trained_tokens = 0
     best_val: float | None = None
     resume_state: checkpoint.ResumeState | None = None
     if resume_from is not None:
@@ -469,14 +507,18 @@ def train(
             step_loss = 0.0
 
             for _ in range(config.grad_accum):
-                inputs = train_sampler.batch(config.batch, choice.device)
+                drawn = train_sampler.batch(config.batch, choice.device)
                 with autocast_for(choice):
-                    loss = model(input_ids=inputs, labels=inputs).loss
+                    loss = model(**drawn).loss
                     # Average over accumulation so the gradient matches what a
                     # single large batch would have produced.
                     scaled = loss / config.grad_accum
                 scaler.scale(scaled).backward()
                 step_loss += scaled.item()
+                # What the loss was actually computed over. With a conversation
+                # corpus most of the window is prompt, so the window size stops
+                # describing what the model learned from.
+                trained_tokens += int((drawn["labels"] != IGNORE_INDEX).sum().item())
 
             if config.grad_clip > 0:
                 # Unscale first, or the clip threshold is applied to inflated
@@ -603,6 +645,7 @@ def train(
         final_loss=final_loss,
         best_val_loss=best_val,
         tokens_seen=tokens_seen,
+        trained_tokens=trained_tokens,
         tokens_per_second=throughput.value or 0.0,
         history=history,
         per_component_loss=last_per_component,

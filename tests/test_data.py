@@ -12,6 +12,8 @@ import pytest
 
 from bloomery.data import (
     END_OF_TEXT,
+    FORMAT_PACKED,
+    FORMAT_SFT,
     adopt_tokenizer,
     build_dataset,
     count_bytes,
@@ -20,7 +22,10 @@ from bloomery.data import (
     fingerprint,
     id_space,
     iter_documents,
+    iter_examples,
     load_dataset,
+    looks_like_conversations,
+    open_mask,
     open_split,
     synthetic_documents,
 )
@@ -396,3 +401,186 @@ class TestFingerprintWithoutAFastBackend:
         assert fingerprint(Broken(self.VOCAB, lowercase=False)) != fingerprint(
             self.Slow(self.VOCAB, lowercase=False)
         )
+
+
+# A minimal template with the shape every real one has: role markers, a turn
+# terminator, and a cue that the assistant speaks next.
+CHAT_TEMPLATE = (
+    "{% for m in messages %}<|{{ m['role'] }}|>\n{{ m['content'] }}<|end|>\n{% endfor %}"
+    "{% if add_generation_prompt %}<|assistant|>\n{% endif %}"
+)
+
+
+@pytest.fixture
+def chat_tokenizer(documents: list[str], tmp_path: Path) -> Any:
+    """Its own tokenizer, so setting a template cannot leak into other tests."""
+    from bloomery.data import train_tokenizer
+
+    tokenizer = train_tokenizer(documents[:400], vocab_size=400, out_dir=tmp_path / "chat-tok")
+    tokenizer.chat_template = CHAT_TEMPLATE
+    return tokenizer
+
+
+def write_conversations(path: Path, count: int = 40) -> Path:
+    records = [
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": f"question number {i}"},
+                    {"role": "assistant", "content": f"answer number {i}"},
+                    {"role": "user", "content": "say more"},
+                    {"role": "assistant", "content": f"more about {i}"},
+                ]
+            }
+        )
+        for i in range(count)
+    ]
+    path.write_text("\n".join(records), encoding="utf-8")
+    return path
+
+
+class TestIterExamples:
+    def test_reads_a_messages_list(self, tmp_path: Path) -> None:
+        path = write_conversations(tmp_path / "c.jsonl", count=3)
+        examples = list(iter_examples(path))
+        assert len(examples) == 3
+        assert examples[0].messages[0]["role"] == "user"
+        assert examples[0].has_response
+
+    def test_reads_a_prompt_and_completion_pair(self, tmp_path: Path) -> None:
+        """The same thing with the roles implied, which is how many corpora ship."""
+        path = tmp_path / "p.jsonl"
+        path.write_text(json.dumps({"prompt": "why", "completion": "because"}), encoding="utf-8")
+        (example,) = list(iter_examples(path))
+        assert [turn["role"] for turn in example.messages] == ["user", "assistant"]
+        assert example.messages[1]["content"] == "because"
+
+    def test_a_record_with_no_reply_is_skipped(self, tmp_path: Path) -> None:
+        """With completion-only masking there is nothing in it to learn from.
+
+        Packing it would contribute tokens that are entirely masked, quietly
+        diluting the corpus with examples that teach nothing.
+        """
+        path = tmp_path / "c.jsonl"
+        path.write_text(
+            json.dumps({"messages": [{"role": "user", "content": "hello?"}]}), encoding="utf-8"
+        )
+        assert list(iter_examples(path)) == []
+
+    def test_an_unknown_role_is_refused_rather_than_guessed(self, tmp_path: Path) -> None:
+        """Masking is decided by role, so guessing means training on the wrong half."""
+        path = tmp_path / "c.jsonl"
+        path.write_text(
+            json.dumps({"messages": [{"role": "wizard", "content": "hi"}]}), encoding="utf-8"
+        )
+        assert list(iter_examples(path)) == []
+
+    def test_conversations_are_recognised_as_such(self, tmp_path: Path) -> None:
+        """So the plain path can say what the file is instead of finding nothing."""
+        assert looks_like_conversations(write_conversations(tmp_path / "c.jsonl", count=2))
+        plain = tmp_path / "plain.jsonl"
+        plain.write_text(json.dumps({"text": "just prose"}), encoding="utf-8")
+        assert not looks_like_conversations(plain)
+
+
+class TestSftPacking:
+    """The mask is the feature. If it is wrong the run still trains, and the
+    model learns to repeat questions instead of answering them."""
+
+    def _build(self, tmp_path: Path, tokenizer: Any, **kwargs: Any) -> Any:
+        from bloomery.data import build_sft_dataset, eot_id
+
+        path = write_conversations(tmp_path / "c.jsonl", count=kwargs.pop("count", 40))
+        return build_sft_dataset(
+            iter_examples(path),
+            tokenizer,
+            out_dir=tmp_path / "tokens",
+            eot=eot_id(tokenizer),
+            **kwargs,
+        )
+
+    def test_only_the_assistant_turns_are_trained_on(
+        self, tmp_path: Path, chat_tokenizer: Any
+    ) -> None:
+        """Multi-turn on purpose: a single exchange hides boundary errors."""
+        import numpy as np
+
+        info = self._build(tmp_path, chat_tokenizer, val_fraction=0.1)
+        ids = np.asarray(open_split(info, "train"))
+        mask = np.asarray(open_mask(info, "train"))
+
+        trained = chat_tokenizer.decode(ids[mask == 1])
+        masked = chat_tokenizer.decode(ids[mask == 0])
+
+        assert "answer number" in trained
+        assert "more about" in trained, "the second reply must be trained on too"
+        assert "question number" not in trained, "the prompt was not masked"
+        assert "say more" not in trained
+        assert "<|user|>" not in trained, "role markers belong to the prompt"
+        assert "question number" in masked
+
+    def test_the_reply_terminator_is_trained_on(self, tmp_path: Path, chat_tokenizer: Any) -> None:
+        """Otherwise the model never learns to stop, and runs on past its answer."""
+        import numpy as np
+
+        info = self._build(tmp_path, chat_tokenizer, val_fraction=0.1)
+        ids = np.asarray(open_split(info, "train"))
+        mask = np.asarray(open_mask(info, "train"))
+        assert "<|end|>" in chat_tokenizer.decode(ids[mask == 1])
+
+    def test_the_mask_lines_up_with_the_tokens(self, tmp_path: Path, chat_tokenizer: Any) -> None:
+        info = self._build(tmp_path, chat_tokenizer, val_fraction=0.1)
+        for split in ("train", "val"):
+            assert len(open_split(info, split)) == len(open_mask(info, split))
+
+    def test_some_but_not_all_of_the_corpus_is_trained_on(
+        self, tmp_path: Path, chat_tokenizer: Any
+    ) -> None:
+        """A share at either extreme means the boundaries were not found."""
+        import numpy as np
+
+        info = self._build(tmp_path, chat_tokenizer, val_fraction=0.1)
+        share = float(np.asarray(open_mask(info, "train")).mean())
+        assert 0.1 < share < 0.9, share
+
+    def test_the_dataset_says_it_is_masked(self, tmp_path: Path, chat_tokenizer: Any) -> None:
+        info = self._build(tmp_path, chat_tokenizer, val_fraction=0.1)
+        assert info.format == FORMAT_SFT
+        assert info.masked
+        assert load_dataset(info.root).masked
+
+    def test_a_tokenizer_with_no_chat_template_is_refused(
+        self, tmp_path: Path, tokenizer: Any
+    ) -> None:
+        """Without one there is no telling how the model expects to be addressed."""
+        from bloomery.data import SftError
+
+        with pytest.raises(SftError, match="no chat template"):
+            self._build(tmp_path, tokenizer, val_fraction=0.1)
+
+
+class TestPackedDatasetsStillWork:
+    """The pretraining path must be untouched by any of this."""
+
+    def test_a_plain_dataset_has_no_mask(self, dataset: Any) -> None:
+        assert not dataset.masked
+        assert dataset.format == FORMAT_PACKED
+        assert open_mask(dataset, "train") is None
+
+    def test_meta_written_before_masking_existed_still_loads(self, tmp_path: Path) -> None:
+        """Every dataset already on disk lacks the key. Demanding one breaks them all."""
+        root = tmp_path / "old"
+        root.mkdir()
+        (root / "meta.json").write_text(
+            json.dumps(
+                {
+                    "dtype": "uint16",
+                    "vocab_size": 400,
+                    "splits": [{"name": "train", "tokens": 10, "documents": 1}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        info = load_dataset(root)
+        assert info.format == FORMAT_PACKED
+        assert not info.masked

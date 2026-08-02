@@ -241,8 +241,14 @@ class MixtureSampler:
         counts = self._rng.multinomial(size, self._probs)
         return dict(zip(self._names, (int(c) for c in counts), strict=True))
 
-    def batch(self, size: int, device: torch.device) -> torch.Tensor:
-        """One training batch, drawn across components by weight."""
+    def batch(self, size: int, device: torch.device) -> dict[str, torch.Tensor]:
+        """One training batch, drawn across components by weight.
+
+        Concatenated per field, so a blend can mix a conversation corpus with a
+        plain one: the conversation component's labels carry the completion mask
+        and the plain component's are simply its inputs. Every component was
+        built with the same sequence length, so the rows line up.
+        """
         import torch
 
         if len(self._samplers) == 1:
@@ -251,7 +257,7 @@ class MixtureSampler:
         counts = self.draw_counts(size)
         by_name = dict(zip(self._names, self._samplers, strict=True))
         chunks = [by_name[name].batch(count, device) for name, count in counts.items() if count > 0]
-        return torch.cat(chunks, dim=0)
+        return {key: torch.cat([chunk[key] for chunk in chunks], dim=0) for key in chunks[0]}
 
     def component_samplers(self) -> dict[str, BatchSampler]:
         """Per-component samplers, for evaluating each split on its own."""

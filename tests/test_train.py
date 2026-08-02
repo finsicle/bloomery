@@ -121,19 +121,22 @@ class TestBatchSampler:
     def test_shapes_and_dtype(self, dataset: Any, cpu_choice: DeviceChoice) -> None:
         sampler = BatchSampler(dataset, "train", seq=32, seed=0)
         batch = sampler.batch(4, cpu_choice.device)
-        assert tuple(batch.shape) == (4, 32)
-        assert batch.dtype.is_signed  # int64, as the embedding layer requires
+        assert tuple(batch["input_ids"].shape) == (4, 32)
+        assert batch["input_ids"].dtype.is_signed  # int64, as the embedding layer requires
+        # A plain corpus has nothing masked, so the labels are the inputs. This
+        # is what keeps pretraining bit-identical now that labels are carried.
+        assert batch["labels"].equal(batch["input_ids"])
 
     def test_ids_are_in_vocab_range(self, dataset: Any, cpu_choice: DeviceChoice) -> None:
         sampler = BatchSampler(dataset, "train", seq=32, seed=0)
-        batch = sampler.batch(8, cpu_choice.device)
+        batch = sampler.batch(8, cpu_choice.device)["input_ids"]
         assert int(batch.max()) < dataset.vocab_size
         assert int(batch.min()) >= 0
 
     def test_seeded_sampling_is_reproducible(self, dataset: Any, cpu_choice: DeviceChoice) -> None:
         first = BatchSampler(dataset, "train", seq=16, seed=42).batch(4, cpu_choice.device)
         second = BatchSampler(dataset, "train", seq=16, seed=42).batch(4, cpu_choice.device)
-        assert first.equal(second)
+        assert first["input_ids"].equal(second["input_ids"])
 
     def test_rejects_seq_longer_than_the_split(self, dataset: Any) -> None:
         with pytest.raises(ValueError, match="not enough"):

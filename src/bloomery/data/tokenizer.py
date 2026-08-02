@@ -214,14 +214,24 @@ def fingerprint(tokenizer: Tokenizer) -> str:
     """
     import hashlib
 
+    # Included explicitly, because it is invisible to everything else here. The
+    # template lives on the wrapper rather than the backend, so it is absent from
+    # the canonical form below and from the tokenizer.json the mixture loader
+    # hashes. Two tokenizers differing only in how they lay out a conversation
+    # would otherwise compare equal — and a corpus formatted one way, trained
+    # against a model expecting another, is a model taught a shape it will never
+    # be prompted in. Valid ids, wrong format, no error.
+    template = getattr(tokenizer, "chat_template", None) or ""
+
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is not None:
-        canonical = backend.to_str()
+        canonical = backend.to_str() + template
     else:
         canonical = repr(
             (
                 sorted(tokenizer.get_vocab().items()),
                 _probe_ids(tokenizer),
+                template,
             )
         )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]

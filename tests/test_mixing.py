@@ -52,14 +52,15 @@ class TestMixtureSampler:
         blend = create("b", [Component("alpha", 0.7), Component("beta", 0.3)])
         sampler = MixtureSampler(blend, two_datasets, "train", seq=32, seed=0)
         batch = sampler.batch(16, cpu.device)
-        assert tuple(batch.shape) == (16, 32)
+        assert tuple(batch["input_ids"].shape) == (16, 32)
+        assert tuple(batch["labels"].shape) == (16, 32)
 
     def test_single_component_passes_straight_through(
         self, two_datasets: Any, cpu: DeviceChoice
     ) -> None:
         sampler = MixtureSampler(single("alpha"), two_datasets, "train", seq=32, seed=0)
         assert sampler.names == ("alpha",)
-        assert tuple(sampler.batch(8, cpu.device).shape) == (8, 32)
+        assert tuple(sampler.batch(8, cpu.device)["input_ids"].shape) == (8, 32)
 
     def test_long_run_proportions_track_the_weights(self, two_datasets: Any) -> None:
         """The multinomial draw must converge on the requested split.
@@ -134,7 +135,7 @@ class TestMixtureSampler:
         assert sampler.names == ("alpha",)
         assert sampler.effective_weights == pytest.approx({"alpha": 1.0})
         # And the batch is still the size that was requested.
-        assert tuple(sampler.batch(4, cpu.device).shape) == (4, 512)
+        assert tuple(sampler.batch(4, cpu.device)["input_ids"].shape) == (4, 512)
 
     def test_all_components_unusable_is_an_error(self, two_datasets: Any) -> None:
         blend = create("b", [Component("alpha", 1)])
@@ -146,8 +147,8 @@ class TestMixtureSampler:
         blend = create("b", [Component("alpha", 1), Component("beta", 1)])
         sampler = MixtureSampler(blend, two_datasets, "train", seq=16, seed=0)
         samplers = sampler.component_samplers()
-        first = samplers["alpha"].batch(4, cpu.device)
-        second = samplers["beta"].batch(4, cpu.device)
+        first = samplers["alpha"].batch(4, cpu.device)["input_ids"]
+        second = samplers["beta"].batch(4, cpu.device)["input_ids"]
         assert not first.equal(second)
 
 
