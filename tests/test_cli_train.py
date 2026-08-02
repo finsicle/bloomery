@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from _helpers import plain
@@ -1241,3 +1242,52 @@ class TestSupervisedFineTuning:
         templated = as_prompted(loaded.tokenizer, "hello")
         assert "<|user|>" in templated and "<|assistant|>" in templated
         assert as_prompted(loaded.tokenizer, "hello", raw=True) == "hello"
+
+    def test_the_raw_flag_reaches_generation(self, instruct: Path) -> None:
+        """Exercised through the command, not through as_prompted alone.
+
+        The unit test above proves the templating function is right; it says
+        nothing about whether `chat` still passes the flag to it. Both call
+        sites can be dropped in a refactor with every other test still green.
+        """
+        import bloomery.generate as generate_module
+
+        seen: list[bool] = []
+        real = generate_module.complete
+
+        def record(loaded, prompt, config=None, *, raw=False):  # noqa: ANN001, ANN202
+            seen.append(raw)
+            return real(loaded, prompt, config, raw=raw)
+
+        with mock.patch.object(generate_module, "complete", record):
+            assert (
+                _invoke(
+                    "chat",
+                    "--checkpoint",
+                    str(instruct),
+                    "--prompt",
+                    "hello",
+                    "--max-new-tokens",
+                    "2",
+                    "--device",
+                    "cpu",
+                    "--raw",
+                ).exit_code
+                == 0
+            )
+            assert (
+                _invoke(
+                    "chat",
+                    "--checkpoint",
+                    str(instruct),
+                    "--prompt",
+                    "hello",
+                    "--max-new-tokens",
+                    "2",
+                    "--device",
+                    "cpu",
+                ).exit_code
+                == 0
+            )
+
+        assert seen == [True, False], seen
