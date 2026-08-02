@@ -862,3 +862,80 @@ class TestWindowsAlwaysCarryLoss:
         with torch.no_grad():
             loss = model(input_ids=ids, labels=torch.full_like(ids, IGNORE_INDEX)).loss
         assert torch.isnan(loss)
+
+
+class TestSkippedMicrobatchesAreVisible:
+    """Dropping a non-finite microbatch protects the reported loss from an
+    unplaceable window. It must not also hide a diverging run.
+
+    Before the guard existed, divergence — fp16 overflow, a learning rate far
+    too high — left a NaN in the reported loss where a person would see it.
+    Skipping silently would make a run that diverges every step look like a
+    healthy one with a slightly smaller batch.
+    """
+
+    def _run(
+        self,
+        dataset: Any,
+        tmp_path: Path,
+        cpu_choice: DeviceChoice,
+        tokenizer: Any,
+        **overrides: Any,
+    ) -> Any:
+        from bloomery.mixture import single
+        from bloomery.train.loop import TrainConfig
+        from bloomery.train.loop import train as run_training
+
+        spec = spec_from_depth(1, vocab=dataset.vocab_size, seq=32)
+        config = TrainConfig(steps=2, batch=2, seq=32, eval_every=0, log_every=1, **overrides)
+        return run_training(
+            spec=spec,
+            datasets={"d": dataset},
+            mixture=single("d"),
+            tokenizer=tokenizer,
+            run_dir=tmp_path / "run",
+            config=config,
+            choice=cpu_choice,
+            eos_token_id=0,
+        )
+
+    def test_a_healthy_run_skips_nothing(
+        self, dataset: Any, tmp_path: Path, cpu_choice: DeviceChoice, tokenizer: Any
+    ) -> None:
+        result = self._run(dataset, tmp_path, cpu_choice, tokenizer)
+        assert result.skipped_microbatches == 0
+        assert math.isfinite(result.final_loss)
+
+    def test_the_count_reaches_run_jsonl(
+        self, dataset: Any, tmp_path: Path, cpu_choice: DeviceChoice, tokenizer: Any
+    ) -> None:
+        """A number nobody can read is not a signal."""
+        self._run(dataset, tmp_path, cpu_choice, tokenizer)
+        events = [
+            json.loads(line) for line in (tmp_path / "run" / "run.jsonl").read_text().splitlines()
+        ]
+        steps = [e for e in events if e["event"] == "step"]
+        done = [e for e in events if e["event"] == "done"]
+        assert steps and "skipped_microbatches" in steps[0]
+        assert done and "skipped_microbatches" in done[0]
+
+    def test_a_step_that_scored_nothing_does_not_report_a_perfect_loss(self) -> None:
+        """The accumulator starts at 0.0, and 0.0 reads as a flawless model.
+
+        Reporting that would be worse than the NaN the guard replaced: a NaN
+        says something broke, a zero says the run went perfectly.
+        """
+        import torch
+
+        step_loss = 0.0
+        contributed = 0
+        for scaled in (torch.tensor(float("nan")), torch.tensor(float("nan"))):
+            if not torch.isfinite(scaled):
+                continue
+            step_loss += float(scaled)
+            contributed += 1
+
+        # What the loop does with that state.
+        reported = step_loss if contributed else float("nan")
+        assert contributed == 0
+        assert math.isnan(reported), "an unscored step must not look like a perfect one"

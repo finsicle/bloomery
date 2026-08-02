@@ -87,6 +87,9 @@ class TrainResult:
     # Tokens the loss was actually computed over. Equal to tokens_seen for a
     # plain corpus; a fraction of it once a completion mask is in play.
     trained_tokens: int = 0
+    # Microbatches dropped for a non-finite loss, whether an unplaceable
+    # window or a diverging run.
+    skipped_microbatches: int = 0
     history: list[dict[str, Any]] = field(default_factory=list)
     # Last measured validation loss per blend component, and any component that
     # ended worse than its own best. Empty for a single-dataset run with no
@@ -504,6 +507,11 @@ def train(
     # from would overstate the run several-fold. run.jsonl is a published
     # contract, so this is a new number rather than a quiet redefinition.
     trained_tokens = 0
+    # Microbatches dropped for a non-finite loss. Published because the two
+    # causes look identical from inside the loop and very different from
+    # outside: an occasional drop is an unlucky window, a persistent one is a
+    # diverging run that would otherwise be invisible.
+    skipped_microbatches = 0
     best_val: float | None = None
     resume_state: checkpoint.ResumeState | None = None
     if resume_from is not None:
@@ -581,6 +589,7 @@ def train(
             began = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
+            contributed = 0
 
             for _ in range(config.grad_accum):
                 drawn = train_sampler.batch(config.batch, choice.device)
@@ -590,32 +599,44 @@ def train(
                     # single large batch would have produced.
                     scaled = loss / config.grad_accum
                 if not torch.isfinite(scaled):
-                    # A microbatch with nothing supervised in it scores a mean
-                    # over an empty set. The sampler redraws such windows, so
-                    # reaching here means it could not find one — in which case
-                    # dropping the microbatch is right, and far better than
-                    # adding NaN to the step loss and publishing it as the run's
-                    # result. `evaluate` has guarded this since before masking;
-                    # the training step had not.
+                    # Usually a window the sampler could not place on anything
+                    # supervised, where the score is a mean over an empty set.
+                    # But a diverging run reaches here too — fp16 overflow, a
+                    # learning rate far too high — and that used to be visible as
+                    # a NaN in the reported loss. Skipping without counting would
+                    # make a run that diverges every step look like a healthy one
+                    # with a slightly smaller batch, so the count is published.
+                    skipped_microbatches += 1
                     continue
                 scaler.scale(scaled).backward()
                 step_loss += scaled.item()
+                contributed += 1
                 # What the loss was actually computed over. With a conversation
                 # corpus most of the window is prompt, so the window size stops
                 # describing what the model learned from.
                 trained_tokens += int((drawn["labels"] != IGNORE_INDEX).sum().item())
 
-            if config.grad_clip > 0:
-                # Unscale first, or the clip threshold is applied to inflated
-                # fp16 gradients and does nothing.
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            if contributed:
+                if config.grad_clip > 0:
+                    # Unscale first, or the clip threshold is applied to inflated
+                    # fp16 gradients and does nothing.
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
+                final_loss = step_loss
+            else:
+                # Nothing was scored, so there is nothing to step on: the
+                # gradients are the zeros from zero_grad, and stepping them
+                # applies weight decay for no reason. Reporting a loss of 0.0
+                # here — which is what an untouched accumulator holds — would be
+                # worse than the NaN this guard replaced, because it reads as a
+                # perfect model rather than a broken step.
+                step_loss = float("nan")
+                final_loss = step_loss
 
             tokens_seen += config.tokens_per_step
-            final_loss = step_loss
             rate = throughput.update(config.tokens_per_step, time.perf_counter() - began)
 
             if config.log_every and (step + 1) % config.log_every == 0:
@@ -627,6 +648,7 @@ def train(
                         lr=round(lr, 8),
                         tokens=tokens_seen,
                         trained_tokens=trained_tokens,
+                        skipped_microbatches=skipped_microbatches,
                         tokens_per_second=round(rate, 1),
                     )
                 )
@@ -720,6 +742,7 @@ def train(
                 # only the window overstates the run several-fold — which is the
                 # whole reason this counter exists.
                 trained_tokens=trained_tokens,
+                skipped_microbatches=skipped_microbatches,
                 tokens_per_second=round(throughput.value or 0.0, 1),
                 checkpoint=str(final_path),
                 per_component={k: round(v, 5) for k, v in tracker.best.items()} or None,
@@ -739,6 +762,7 @@ def train(
         best_val_loss=best_val,
         tokens_seen=tokens_seen,
         trained_tokens=trained_tokens,
+        skipped_microbatches=skipped_microbatches,
         tokens_per_second=throughput.value or 0.0,
         history=history,
         per_component_loss=last_per_component,
