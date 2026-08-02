@@ -1166,8 +1166,10 @@ def export(
     target = checkpoint if checkpoint else ckpt.checkpoint_dir(paths.run_dir(run or ""))
     # A run saving right now may have been killed mid-promotion, leaving the
     # checkpoint beside this path rather than at it. Export runs concurrently
-    # with training by design, so it is the command most likely to arrive then.
-    ckpt.restore_interrupted(target)
+    # with training by design, so it is the command most likely to arrive then —
+    # and for the same reason it must only read the aside copy, never move it:
+    # a save in mid-promotion looks exactly like an interrupted one.
+    target = ckpt.resolve(target)
     if not target.is_dir():
         _die(f"{target} does not exist")
 

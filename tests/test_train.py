@@ -1021,8 +1021,14 @@ class TestReplacingACheckpointLeavesNoGap:
         directory.rename(directory.with_name("latest.previous"))
         assert not directory.exists()
 
-        assert ckpt.restore_interrupted(directory) is True
+        # A reader finds it where it lies, without moving anything.
+        assert ckpt.resolve(directory).name == "latest.previous"
         assert ckpt.load_resume_state(directory).step == 1
+        assert directory.with_name("latest.previous").is_dir()
+
+        # The writer is what puts it back.
+        assert ckpt.restore_interrupted(directory) is True
+        assert directory.is_dir()
         assert not directory.with_name("latest.previous").exists()
 
     def test_the_next_save_does_not_destroy_an_interrupted_one(
@@ -1068,3 +1074,30 @@ class TestReplacingACheckpointLeavesNoGap:
 
         assert ckpt.is_resumable(directory)
         assert ckpt.load_resume_state(directory).step == 3
+
+    def test_a_reader_does_not_move_a_checkpoint_out_from_under_a_save(
+        self, tmp_path: Path, tokenizer: Any
+    ) -> None:
+        """Why readers resolve rather than restore.
+
+        A save mid-promotion looks exactly like an interrupted one: the canonical
+        directory is absent and `.previous` holds a checkpoint. A reader that
+        restored would take it, the save's own rename would then land on an
+        occupied path, and its recovery would find nothing to put back — turning
+        a microsecond window into a failed run.
+        """
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+        # The exact state a save is in between its two renames.
+        directory.rename(directory.with_name("latest.previous"))
+
+        before = sorted(path.name for path in tmp_path.iterdir())
+        assert ckpt.resolve(directory).is_dir()
+        assert ckpt.is_resumable(directory)
+        assert ckpt.load_resume_state(directory).step == 1
+
+        assert sorted(path.name for path in tmp_path.iterdir()) == before, (
+            "a read moved something on disk"
+        )
