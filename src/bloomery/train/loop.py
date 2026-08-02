@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from bloomery.arch import suggested_lr, to_llama_config
 from bloomery.capability import ModelSpec
-from bloomery.data.shards import DatasetInfo, open_mask, open_split
+from bloomery.data.shards import DatasetInfo, open_mask, open_preference_split, open_split
 from bloomery.mixture import Mixture
 from bloomery.train import checkpoint
 from bloomery.train.device import DeviceChoice
@@ -385,6 +385,125 @@ class BatchSampler:
 
         replacements = self._rng.choice(self._supervised_blocks, size=len(starts))
         return np.where(barren, replacements, starts)
+
+
+class PreferenceSampler:
+    """Draws whole preference pairs and lays them out as one batch.
+
+    A batch of ``size`` pairs comes back as ``2 * size`` rows: the chosen answers
+    first, then the rejected ones in the same order. Row ``i`` and row
+    ``i + size`` are the two halves of one comparison, and the loss relies on
+    that pairing, so it is stated here rather than left to be inferred.
+
+    This is the first batch in the project carrying an ``attention_mask``. The
+    packed and SFT paths never need one because a window is dense by
+    construction; a preference pair has whatever length it has, so short ones are
+    padded and the padding has to be excluded from attention as well as from the
+    loss.
+    """
+
+    def __init__(self, info: DatasetInfo, split: str, *, seq: int, seed: int) -> None:
+        import numpy as np
+
+        self._info = info
+        self._split = split
+        self._seq = seq
+        self._rng = np.random.default_rng(seed)
+
+        _, index = open_preference_split(info, split)
+        prompt, chosen, rejected = (index[:, column, 1] for column in range(3))
+        # An answer alone longer than the window leaves no room for the prompt it
+        # answers, and truncating into the answer would change what is being
+        # compared. Such a pair is dropped rather than mangled.
+        self._usable = np.flatnonzero(np.maximum(chosen, rejected) < seq)
+        self._dropped = int(len(index) - len(self._usable))
+        if self._usable.size == 0:
+            raise ValueError(
+                f"split {split!r} has no preference pair whose answers fit in {seq} "
+                "tokens. Use a longer --seq, or check that the corpus was packed "
+                "against the right chat template."
+            )
+        self._tokens = int(prompt.sum() + chosen.sum() + rejected.sum())
+        # How much prompt has to go to make room, per usable pair. Driven by the
+        # longer of the two answers and applied to both, or the two rows would
+        # condition on different prompts and compare nothing.
+        room = seq - np.maximum(chosen, rejected)[self._usable]
+        self._keep = np.minimum(prompt[self._usable], room)
+        self._truncated = int((self._keep < prompt[self._usable]).sum())
+
+    @property
+    def tokens(self) -> int:
+        return self._tokens
+
+    @property
+    def dropped(self) -> int:
+        """Pairs whose answers do not fit the window at all."""
+        return self._dropped
+
+    @property
+    def truncated(self) -> int:
+        """Pairs whose prompt is cut to make room, identically on both sides."""
+        return self._truncated
+
+    def batch(self, size: int, device: torch.device) -> Batch:
+        """``2 * size`` rows: the chosen answers, then the rejected ones.
+
+        Right-padded, which is the opposite of what generation wants. Left
+        padding would need the position ids corrected to match, and that is a
+        second thing to get wrong for no gain here — nothing generates from these
+        rows, they only ever produce log-probabilities.
+
+        The prompt is truncated from the left when it does not fit, keeping the
+        end that the answer actually follows from. Both rows lose the same
+        number of tokens, so what they are conditioned on stays identical.
+        """
+        import numpy as np
+        import torch
+
+        streams, index = open_preference_split(self._info, self._split)
+        picks = self._rng.choice(len(self._usable), size=size)
+
+        ids = np.zeros((2 * size, self._seq), dtype=np.int64)
+        labels = np.full((2 * size, self._seq), IGNORE_INDEX, dtype=np.int64)
+        attention = np.zeros((2 * size, self._seq), dtype=np.int64)
+
+        for row, pick in enumerate(picks):
+            example = self._usable[pick]
+            keep = int(self._keep[pick])
+            start, length = index[example, 0]
+            prompt = streams["prompt"][start + length - keep : start + length]
+
+            for offset, part in ((0, "chosen"), (size, "rejected")):
+                start, length = index[example, 1 if part == "chosen" else 2]
+                answer = streams[part][start : start + length]
+                span = keep + len(answer)
+                ids[row + offset, :keep] = prompt
+                ids[row + offset, keep:span] = answer
+                # Only the answer is scored. The prompt is what both rows share,
+                # so a loss over it would be identical on each side and cancel —
+                # it would add noise to the comparison and nothing else.
+                labels[row + offset, keep:span] = answer
+                attention[row + offset, :span] = 1
+
+        return {
+            "input_ids": torch.from_numpy(ids).to(device, non_blocking=True),
+            "labels": torch.from_numpy(labels).to(device, non_blocking=True),
+            "attention_mask": torch.from_numpy(attention).to(device, non_blocking=True),
+        }
+
+
+def sampler_for(
+    info: DatasetInfo, split: str, *, seq: int, seed: int
+) -> BatchSampler | PreferenceSampler:
+    """The sampler this dataset's format calls for.
+
+    One factory rather than a branch at each construction site, so a caller that
+    does not care about the format — which is all of them — does not have to
+    learn about it.
+    """
+    if info.preference:
+        return PreferenceSampler(info, split, seq=seq, seed=seed)
+    return BatchSampler(info, split, seq=seq, seed=seed)
 
 
 def lr_at(step: int, config: TrainConfig, peak: float) -> float:

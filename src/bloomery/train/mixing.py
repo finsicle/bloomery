@@ -29,7 +29,7 @@ from bloomery.train.device import DeviceChoice
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
-    from bloomery.train.loop import BatchSampler
+    from bloomery.train.loop import BatchSampler, PreferenceSampler
 
 # A component has to get worse by more than this before it is called a
 # regression. Validation loss on a small held-out split is noisy; flagging every
@@ -177,15 +177,21 @@ class MixtureSampler:
     ) -> None:
         import numpy as np
 
-        from bloomery.train.loop import BatchSampler
+        from bloomery.train.loop import sampler_for
 
         self.mixture = mixture
         self.split = split
         self._rng = np.random.default_rng(seed)
+        # Uniform across the blend, because resolve() refuses a mixed one. The
+        # two batch shapes have different keys and different meanings for a row,
+        # so there is no sensible way to concatenate one with the other.
+        self.preference = any(
+            info.preference for name, info in datasets.items() if name in mixture.datasets
+        )
 
         weights = mixture.weights()
         self._names: list[str] = []
-        self._samplers: list[BatchSampler] = []
+        self._samplers: list[BatchSampler | PreferenceSampler] = []
         self._probs: list[float] = []
         self.skipped: dict[str, str] = {}
 
@@ -196,7 +202,7 @@ class MixtureSampler:
             try:
                 # Offset the seed per component so two components do not draw
                 # the same offsets from differently sized arrays.
-                sampler = BatchSampler(info, split, seq=seq, seed=seed + index * 7919)
+                sampler = sampler_for(info, split, seq=seq, seed=seed + index * 7919)
             except (ValueError, FileNotFoundError) as exc:
                 self.skipped[name] = str(exc)
                 continue
@@ -257,9 +263,23 @@ class MixtureSampler:
         counts = self.draw_counts(size)
         by_name = dict(zip(self._names, self._samplers, strict=True))
         chunks = [by_name[name].batch(count, device) for name, count in counts.items() if count > 0]
+
+        if self.preference:
+            # A preference batch is two stacked halves, and row i pairs with row
+            # i + half. Concatenating whole chunks would put one component's
+            # chosen rows opposite another's rejected ones — every comparison
+            # between two unrelated answers, and nothing that looks wrong.
+            return {
+                key: torch.cat(
+                    [chunk[key][: len(chunk[key]) // 2] for chunk in chunks]
+                    + [chunk[key][len(chunk[key]) // 2 :] for chunk in chunks],
+                    dim=0,
+                )
+                for key in chunks[0]
+            }
         return {key: torch.cat([chunk[key] for chunk in chunks], dim=0) for key in chunks[0]}
 
-    def component_samplers(self) -> dict[str, BatchSampler]:
+    def component_samplers(self) -> dict[str, BatchSampler | PreferenceSampler]:
         """Per-component samplers, for evaluating each split on its own."""
         return dict(zip(self._names, self._samplers, strict=True))
 
