@@ -66,8 +66,8 @@ const FIELDS = {
     { key: "seed", label: "Seed", type: "number" },
   ],
   export: [
-    { key: "run", label: "Run", hint: "a run name from train or adapt" },
-    { key: "checkpoint", label: "Checkpoint", hint: "a path, instead of a run" },
+    { key: "run", label: "Run", hint: "a run name — or a checkpoint below, not both" },
+    { key: "checkpoint", label: "Checkpoint", hint: "a path — or a run above, not both" },
     { key: "name", label: "Export name", hint: "defaults to the run's" },
     { key: "quantize", label: "Format", choices: ["f16", "q8_0", "q4_0"] },
   ],

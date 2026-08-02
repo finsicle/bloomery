@@ -101,10 +101,27 @@ def save(
         + "\n"
     )
 
-    # Replace only once everything is on disk.
+    # Replace only once everything is on disk — and never leave a moment with no
+    # checkpoint at all. Deleting the old one first opens a window where a kill,
+    # or a rename that fails, loses the good checkpoint and puts nothing in its
+    # place. The old one is moved aside instead, and only discarded once the new
+    # one is where it belongs.
+    #
+    # Not academic: `export` reads runs/<name>/latest while a run may be saving,
+    # and that window is exactly when it finds nothing there.
+    previous = directory.with_name(directory.name + ".previous")
+    if previous.exists():
+        shutil.rmtree(previous)
     if directory.exists():
-        shutil.rmtree(directory)
-    staging.rename(directory)
+        directory.rename(previous)
+    try:
+        staging.rename(directory)
+    except OSError:
+        # Put the old one back rather than leaving the caller with neither.
+        if previous.exists() and not directory.exists():
+            previous.rename(directory)
+        raise
+    shutil.rmtree(previous, ignore_errors=True)
     return directory
 
 

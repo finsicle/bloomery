@@ -55,11 +55,15 @@ class TestRoundTrip:
     """What was written must be what the model held."""
 
     @pytest.mark.parametrize(
-        ("quantization", "tolerance"),
-        [("f16", 1e-2), ("q8_0", 5e-2), ("q4_0", 1.0)],
+        ("quantization", "share"),
+        # As a fraction of each tensor's own spread. An absolute bound is
+        # meaningless here: a freshly built model initialises to a standard
+        # deviation around 0.02, so a tolerance of 1.0 would admit all zeros,
+        # or the wrong tensor entirely.
+        [("f16", 0.01), ("q8_0", 0.05), ("q4_0", 0.6)],
     )
     def test_weights_survive(
-        self, model: Any, tokenizer: Any, tmp_path: Path, quantization: str, tolerance: float
+        self, model: Any, tokenizer: Any, tmp_path: Path, quantization: str, share: float
     ) -> None:
         out = tmp_path / f"{quantization}.gguf"
         to_gguf(model, tokenizer, out, quantization=quantization)
@@ -75,8 +79,23 @@ class TestRoundTrip:
         ):
             expected = state[source].to(torch.float32).numpy()
             got = as_float(written[name]).reshape(expected.shape)
+
+            spread = float(np.abs(expected).max())
             error = float(np.abs(got - expected).max())
-            assert error <= tolerance, f"{name} drifted by {error} at {quantization}"
+            assert error <= share * spread, (
+                f"{name} drifted by {error} at {quantization}, "
+                f"more than {share:.0%} of its {spread:.4f} range"
+            )
+            # And it must actually be this tensor, not merely something small.
+            # Correlation is undefined for a constant tensor — the norms
+            # initialise to all ones — so those are checked for equality
+            # instead, which is the stronger claim anyway.
+            if float(expected.std()) > 0:
+                assert np.corrcoef(got.ravel(), expected.ravel())[0, 1] > 0.9, (
+                    f"{name} does not track the weights it came from at {quantization}"
+                )
+            else:
+                assert np.allclose(got, expected), f"{name} changed at {quantization}"
 
     def test_the_output_head_is_written_though_it_is_tied(
         self, model: Any, tokenizer: Any, tmp_path: Path
@@ -196,6 +215,87 @@ class TestTokenizerTravels:
             tokenizer.chat_template = None
 
 
+class TestMetadataLlamaCppWillAccept:
+    """Fields whose wrong value produces a file that writes and will not load.
+
+    The same class of failure as the missing merges: nothing here errors at
+    write time, and llama.cpp refuses the result.
+    """
+
+    def test_the_architecture_is_the_one_llama_cpp_registers(
+        self, model: Any, tokenizer: Any, tmp_path: Path
+    ) -> None:
+        """A mistral checkpoint must still say llama.
+
+        Its tensor layout is Llama's, and llama.cpp has one registry entry for
+        the family. Writing `general.architecture = "mistral"` produces
+        "unknown model architecture" on load — there is no such entry.
+        """
+        out = tmp_path / "arch.gguf"
+        model.config.model_type = "mistral"
+        try:
+            result = to_gguf(model, tokenizer, out)
+        finally:
+            model.config.model_type = "llama"
+
+        field = GGUFReader(str(out)).fields["general.architecture"]
+        written = bytes(field.parts[field.data[0]]).decode()
+        assert written == "llama", written
+        # Reported as what it actually is, which is a different question.
+        assert result.architecture == "mistral"
+
+    def test_the_token_list_matches_the_embedding_rows(
+        self, model: Any, tokenizer: Any, tmp_path: Path
+    ) -> None:
+        """Fewer entries than rows and llama.cpp reads the two as disagreeing."""
+        out = tmp_path / "rows.gguf"
+        to_gguf(model, tokenizer, out)
+        reader = GGUFReader(str(out))
+        tokens = reader.fields["tokenizer.ggml.tokens"]
+        embedding = next(t for t in reader.tensors if t.name == "token_embd.weight")
+
+        assert len(tokens.data) == model.config.vocab_size
+        assert len(tokens.data) == int(embedding.shape[1])
+
+    def test_a_sparse_vocabulary_keeps_every_token_at_its_own_id(
+        self, model: Any, tokenizer: Any, tmp_path: Path
+    ) -> None:
+        """Sorting only reproduces ids when they happen to be contiguous.
+
+        Published checkpoints reserve blocks of ids. Sorting a vocabulary with a
+        gap shifts every token after it by one, so the model tokenizes to ids
+        that mean something else — with nothing reporting it.
+        """
+
+        class Sparse:
+            """Ids 0, 1 and 9, as a reserved block would leave them."""
+
+            chat_template = None
+            all_special_tokens: list[str] = []
+            is_fast = True
+            backend_tokenizer = tokenizer.backend_tokenizer
+
+            def get_vocab(self) -> dict[str, int]:
+                return {"a": 0, "b": 1, "z": 9}
+
+        model.config.vocab_size = 10
+        original = model.get_input_embeddings().weight.shape[0]
+        try:
+            out = tmp_path / "sparse.gguf"
+            to_gguf(model, tokenizer, out)  # a sanity export, real tokenizer
+            from bloomery.export import _vocabulary
+
+            tokens, _ = _vocabulary(Sparse(), Sparse)
+        finally:
+            model.config.vocab_size = original
+
+        assert len(tokens) == 10
+        assert tokens[0] == "a"
+        assert tokens[1] == "b"
+        assert tokens[9] == "z", "the gap shifted a token onto the wrong id"
+        assert tokens[5].startswith("["), "an unnamed row still needs an entry"
+
+
 class TestRefusals:
     def test_an_architecture_we_cannot_map_is_refused_by_name(self) -> None:
         """`adapt --method full` can produce one, and a wrong mapping is silent."""
@@ -205,6 +305,18 @@ class TestRefusals:
 
         with pytest.raises(ExportError, match="mamba"):
             architecture_of(NotLlama())
+
+    def test_a_model_with_no_output_layer_is_refused(self, tokenizer: Any, tmp_path: Path) -> None:
+        """Refused, rather than reaching the user as a KeyError traceback."""
+
+        class Hollow:
+            config = type("C", (), {"model_type": "llama", "num_hidden_layers": 1})()
+
+            def state_dict(self) -> dict[str, Any]:
+                return {}
+
+        with pytest.raises(ExportError, match="nothing to write"):
+            to_gguf(Hollow(), tokenizer, tmp_path / "hollow.gguf")
 
     def test_an_unknown_quantization_is_refused(
         self, model: Any, tokenizer: Any, tmp_path: Path

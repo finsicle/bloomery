@@ -56,6 +56,12 @@ class JobStatus(StrEnum):
 # and the second one dies.
 # EXPORT is deliberately absent: it reads a checkpoint and writes a file, so
 # it can run beside a training job rather than queueing behind one.
+#
+# That concurrency used to be unsafe. checkpoint.save deleted `latest` before
+# renaming the new one into place, so an export starting in that window found
+# nothing there. The save now moves the old checkpoint aside instead, leaving
+# no moment when the directory is absent — which is what makes running the two
+# together sound, rather than a note saying to be careful.
 EXCLUSIVE_KINDS = frozenset({JobKind.TRAIN, JobKind.ADAPT, JobKind.BENCH})
 
 

@@ -33,6 +33,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # nothing else does.
 SUPPORTED_ARCHITECTURES = frozenset({"llama", "mistral"})
 
+# What goes in `general.architecture`, which is not the same question as which
+# checkpoints can be read. llama.cpp has one registry entry for this family and
+# it is called llama — there is no `mistral` in it, so writing the model_type
+# through produces a file that fails to load with "unknown model architecture".
+GGUF_ARCHITECTURE = "llama"
+
 # What `--quantize` accepts, mapped to the ggml type. Everything here is
 # implemented in the `gguf` package's own quantizer, which is the reference one.
 # The K-quants (q4_K, q5_K, q6_K) are deliberately absent: that package can read
@@ -139,15 +145,26 @@ def to_gguf(
     # so it is usually here. Deriving it from the embedding when it is not keeps
     # both paths working: GGUF always wants an output projection.
     if "lm_head.weight" not in state:
+        embedding = state.get("model.embed_tokens.weight")
+        if embedding is None:
+            # Refused rather than left to raise KeyError, which would reach the
+            # user as a traceback past every handler this module's callers have.
+            raise ExportError(
+                "this checkpoint has neither an output projection nor a token "
+                "embedding, so there is nothing to write as GGUF's output layer. "
+                "It does not look like a causal language model."
+            )
         state = dict(state)
-        state["lm_head.weight"] = state["model.embed_tokens.weight"]
+        state["lm_head.weight"] = embedding
 
     # The official mapping rather than a hand-written table, so a rename upstream
     # is not something this has to notice.
     names = get_tensor_name_map(MODEL_ARCH.LLAMA, config.num_hidden_layers)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = GGUFWriter(str(out_path), architecture)
+    # GGUF_ARCHITECTURE, not the model_type: llama.cpp registers this family
+    # under one name, and `architecture` is kept for what we report back.
+    writer = GGUFWriter(str(out_path), GGUF_ARCHITECTURE)
     try:
         writer.add_block_count(config.num_hidden_layers)
         # The sequence length the model was trained at, not a capability of the
@@ -276,6 +293,35 @@ def _add_rope(writer: Any, config: Any) -> None:
         writer.add_rope_freq_base(float(theta))
 
 
+def _vocabulary(tokenizer: Any, config: Any) -> tuple[list[str], set[str]]:
+    """The token list, indexed by id, sized to the embedding table.
+
+    Built by position rather than by sorting the vocabulary, because sorting only
+    reproduces the ids when they happen to be contiguous. Tokenizers this project
+    trains are; ones that arrive with a published checkpoint need not be. They
+    reserve blocks of ids, and they are routinely shorter than ``vocab_size`` —
+    the embedding has rows nothing is named for.
+
+    Sorting a sparse vocabulary silently shifts every token after the first gap
+    by one, so the model tokenizes to ids that mean something else. Nothing
+    errors; the output is simply wrong.
+    """
+    vocab = tokenizer.get_vocab()
+    size = int(getattr(config, "vocab_size", 0)) or (max(vocab.values(), default=-1) + 1)
+
+    by_id: dict[int, str] = {}
+    for token, index in vocab.items():
+        position = int(index)
+        if 0 <= position < size:
+            by_id[position] = token
+
+    # An unnamed row still needs an entry, or the token list is shorter than the
+    # embedding and llama.cpp reads the two as disagreeing about the vocabulary.
+    tokens = [by_id.get(index, f"[UNUSED_{index}]") for index in range(size)]
+    added = {token for token in getattr(tokenizer, "all_special_tokens", []) or [] if token}
+    return tokens, added
+
+
 def _merges(tokenizer: Any) -> list[str]:
     """The BPE merge rules, as GGUF wants them: one space-joined pair per entry.
 
@@ -316,9 +362,7 @@ def _add_tokenizer(writer: Any, tokenizer: Any, config: Any) -> None:
     tokenizer this project trains is — see the module docstring for why naming it
     outright is safe here and is not for a general converter.
     """
-    vocab = tokenizer.get_vocab()
-    tokens = [token for token, _ in sorted(vocab.items(), key=lambda item: item[1])]
-    added = {token for token in getattr(tokenizer, "all_special_tokens", []) or []}
+    tokens, added = _vocabulary(tokenizer, config)
 
     writer.add_tokenizer_model("gpt2")
     writer.add_tokenizer_pre("default")

@@ -1189,17 +1189,40 @@ def export(
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
 
+    # Cleared on every exit, not only on ExportError. A full disk raises OSError
+    # and a long quantization pass can take a KeyboardInterrupt, and either would
+    # otherwise leave a partial GGUF sitting in exports/<name>.tmp.
+    placed = False
     try:
         with console.status(f"writing {quantize} gguf"):
             result = to_gguf(model, tokenizer, staging / gguf_name, quantization=quantize)
         write_modelfile(staging, tokenizer)
-    except ExportError as exc:
-        shutil.rmtree(staging, ignore_errors=True)
-        _die(str(exc))
 
-    if destination.exists():
-        shutil.rmtree(destination)
-    staging.rename(destination)
+        # The old export is moved aside rather than deleted, so there is never a
+        # moment with no export at all — a kill between the two, or a rename that
+        # fails across filesystems, would otherwise take the previous good GGUF
+        # and put nothing in its place.
+        previous = destination.with_name(destination.name + ".previous")
+        if previous.exists():
+            shutil.rmtree(previous)
+        if destination.exists():
+            destination.rename(previous)
+        try:
+            staging.rename(destination)
+        except OSError:
+            if previous.exists() and not destination.exists():
+                previous.rename(destination)
+            raise
+        placed = True
+        shutil.rmtree(previous, ignore_errors=True)
+    except ExportError as exc:
+        _die(str(exc))
+    except OSError as exc:
+        _die(f"could not write the export: {exc}")
+    finally:
+        if not placed:
+            shutil.rmtree(staging, ignore_errors=True)
+
     result = replace(result, path=destination / gguf_name)
 
     if as_json:

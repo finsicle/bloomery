@@ -182,8 +182,9 @@ instead.
 
 Checkpoints are ordinary Hugging Face directories. `AutoModelForCausalLM.from_pretrained`
 loads them, which is the whole reason bloomery emits a Llama-architecture model
-rather than inventing one — vLLM and anything else in the ecosystem read them
-directly.
+rather than inventing one — vLLM and other runtimes that read Llama-architecture
+Hugging Face checkpoints load them directly. (A LoRA run writes adapters rather
+than a whole model; `export` folds those in.)
 
 GGUF is the exception, and `export` writes it here rather than shelling out.
 llama.cpp's converter identifies a tokenizer by hashing its output against a

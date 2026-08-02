@@ -939,3 +939,69 @@ class TestSkippedMicrobatchesAreVisible:
         reported = step_loss if contributed else float("nan")
         assert contributed == 0
         assert math.isnan(reported), "an unscored step must not look like a perfect one"
+
+
+class TestReplacingACheckpointLeavesNoGap:
+    """There must never be a moment with no checkpoint at all.
+
+    Deleting the old one before renaming the new one into place opens a window
+    where a kill, or a rename that fails, takes the good checkpoint and puts
+    nothing back. `export` reads runs/<name>/latest while a run may be saving,
+    and that window is exactly when it finds nothing there.
+    """
+
+    def _save(self, directory: Path, tokenizer: Any, *, step: int) -> Path:
+        import torch
+
+        from bloomery.train import checkpoint as ckpt
+
+        model = build_model(spec_from_depth(1, vocab=64, seq=16), eos_token_id=0, seed=0)
+        return ckpt.save(
+            directory,
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+            step=step,
+            tokens_seen=step * 10,
+            best_val_loss=None,
+        )
+
+    def test_a_second_save_replaces_the_first(self, tmp_path: Path, tokenizer: Any) -> None:
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+        self._save(directory, tokenizer, step=2)
+
+        assert ckpt.load_resume_state(directory).step == 2
+        # And nothing is left lying about that a reader could mistake for one.
+        assert not directory.with_name("latest.previous").exists()
+        assert not directory.with_name("latest.tmp").exists()
+
+    def test_the_old_checkpoint_survives_a_failed_rename(
+        self, tmp_path: Path, tokenizer: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case the window existed for: something goes wrong mid-swap.
+
+        A cross-filesystem rename raises, and the caller must still have the
+        checkpoint it had before rather than neither.
+        """
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+
+        real = Path.rename
+
+        def refuse(self: Path, target: Any) -> None:
+            if self.name.endswith(".tmp"):
+                raise OSError("cross-device link")
+            real(self, target)
+
+        monkeypatch.setattr(Path, "rename", refuse)
+        with pytest.raises(OSError):
+            self._save(directory, tokenizer, step=2)
+        monkeypatch.undo()
+
+        assert directory.is_dir(), "the previous checkpoint was lost"
+        assert ckpt.load_resume_state(directory).step == 1
