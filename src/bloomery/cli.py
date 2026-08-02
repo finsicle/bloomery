@@ -29,6 +29,18 @@ console = Console()
 
 SIZES = ", ".join(LADDER_BY_KEY)
 
+# Default peak learning rates for continuing an existing model. Both are far
+# below the from-scratch rate `suggested_lr` derives from width: that value is
+# chosen to move randomly initialised weights a long way, and applying it to
+# trained weights is how continued pretraining destroys what it was given.
+# Adapters tolerate more because the base is frozen and only the low-rank update
+# is being learned.
+_ADAPT_LR: dict[Method, float] = {
+    Method.FULL: 2e-5,
+    Method.LORA: 2e-4,
+    Method.QLORA: 2e-4,
+}
+
 
 def _quiet_transformers() -> None:
     """Silence progress bars and advisory warnings.
@@ -127,6 +139,105 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+# --------------------------------------------------------------------------- #
+# shared by train and adapt
+# --------------------------------------------------------------------------- #
+#
+# Both commands run the same loop and report the same events, so the reporting
+# lives here rather than being written twice. It was written twice first, and the
+# copies had already drifted: one lost the note explaining why per-component
+# evaluation exists, and the other never gained the low-headroom warning.
+
+
+def _report_fit(fit: Any, *, force: bool) -> None:
+    """Print the memory estimate, and refuse the run if it will not fit."""
+    console.print(
+        f"memory     ~{fit.required / GIB:.1f} GiB needed of "
+        f"{fit.budget.total / GIB:.1f} GiB  [dim]{fit.budget.source}[/dim]"
+    )
+    if fit.fits:
+        if fit.spare < 0.25:
+            console.print(
+                f"[yellow]           only {fit.spare:.0%} spare — "
+                "an out-of-memory error is plausible[/yellow]"
+            )
+        return
+
+    lines = [
+        f"this configuration needs about {fit.required / GIB:.1f} GiB but only "
+        f"{fit.budget.total / GIB:.1f} GiB is available ({fit.budget.source}).",
+    ]
+    if fit.suggestions():
+        lines.append("\ntry one of:")
+        lines.extend(f"  {option}" for option in fit.suggestions())
+    lines.append(
+        "\nThe estimate is conservative and assumes AdamW in bf16. Pass --force to start anyway."
+    )
+    if not force:
+        _die("\n".join(lines))
+    console.print("[yellow]--force given; starting despite the estimate[/yellow]")
+
+
+def _training_events(progress: Any, task: Any) -> Any:
+    """Bridge the loop's events to the live display."""
+
+    def on_event(event: dict[str, Any]) -> None:
+        if event["event"] == "step":
+            progress.update(
+                task,
+                completed=event["step"],
+                description=(f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"),
+            )
+        elif event["event"] == "eval":
+            line = (
+                f"  [dim]step {event['step']}[/dim]  "
+                f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
+                f"ppl {event['perplexity']}"
+            )
+            per = event.get("per_component") or {}
+            if len(per) > 1:
+                line += (
+                    "  [dim]" + " ".join(f"{k} {v:.3f}" for k, v in sorted(per.items())) + "[/dim]"
+                )
+            progress.console.print(line)
+            # The point of per-component evaluation: name the corpus that is
+            # getting worse, while there is still time to raise its weight.
+            for component, delta in (event.get("regressed") or {}).items():
+                progress.console.print(
+                    f"  [yellow]forgetting[/yellow]  {component} is {delta:.4f} above its best"
+                )
+
+    return on_event
+
+
+def _report_result(result: Any, blend: Any, name: str) -> None:
+    """Print what the run achieved, and what to do about anything it forgot."""
+    console.print()
+    console.print(f"final loss [bold]{result.final_loss:.4f}[/bold]")
+    if result.best_val_loss is not None:
+        console.print(f"best val   [bold]{result.best_val_loss:.4f}[/bold]")
+    console.print(f"throughput {result.tokens_per_second:,.0f} tok/s")
+    if len(result.per_component_loss) > 1:
+        console.print()
+        console.print("per component")
+        for component, loss in sorted(result.per_component_loss.items()):
+            flag = (
+                f"  [yellow]+{result.regressed[component]:.4f} over best[/yellow]"
+                if component in result.regressed
+                else ""
+            )
+            console.print(f"  {component:<24} {loss:.4f}{flag}")
+        if result.regressed:
+            console.print(
+                "\n[yellow]Some components ended worse than their best.[/yellow] "
+                "Raise their weight, or mark them as replay:\n"
+                f"  [bold]bloomery mix add {blend.name} "
+                f"--replay {next(iter(result.regressed))}:0.2[/bold]"
+            )
+    console.print(f"checkpoint {result.checkpoint}")
+    console.print(f"\nnext:  [bold]bloomery chat --run {name}[/bold]")
+
+
 def _spec_summary(capability: Any, method: Method) -> dict[str, Any] | None:
     row = capability.largest_fitting(method)
     if row is None:
@@ -154,6 +265,12 @@ def prepare(
         0, "--synthetic", help="Instead of a source, generate N synthetic documents."
     ),
     vocab: int = typer.Option(8192, "--vocab", help="Tokenizer vocabulary size."),
+    tokenizer_from: str | None = typer.Option(
+        None,
+        "--tokenizer",
+        help="Use an existing model's tokenizer instead of training one. "
+        "Required to prepare a corpus for `adapt`.",
+    ),
     val_fraction: float = typer.Option(
         0.01, "--val-fraction", help="Fraction of documents held out for validation."
     ),
@@ -163,9 +280,15 @@ def prepare(
     Do this once per corpus. Training runs then read the packed tokens directly,
     so the cost of tokenizing is paid a single time however many models you
     train on it.
+
+    Pass --tokenizer to pack for a model that already exists. Its embedding table
+    is indexed by its own tokenizer's ids, so a corpus packed with any other
+    tokenizer is unreadable to it — and unreadable in the quiet way, where
+    training runs and converges to nothing.
     """
     _quiet_transformers()
     from bloomery.data import (
+        adopt_tokenizer,
         build_dataset,
         count_bytes,
         eot_id,
@@ -195,15 +318,25 @@ def prepare(
     tok_path = paths.tokenizer_dir(name)
     tokens_path = paths.tokens_dir(name)
 
-    with console.status(f"training a {vocab}-token vocabulary over {len(documents)} documents"):
-        tokenizer = train_tokenizer(documents, vocab_size=vocab, out_dir=tok_path)
-    actual_vocab = len(tokenizer)
-    console.print(f"tokenizer  [bold]{actual_vocab}[/bold] tokens → {tok_path}")
-    if actual_vocab < vocab:
+    if tokenizer_from:
+        with console.status(f"adopting the tokenizer from {tokenizer_from}"):
+            try:
+                tokenizer = adopt_tokenizer(tokenizer_from, tok_path)
+            except ValueError as exc:
+                _die(str(exc))
         console.print(
-            f"[dim]corpus supported only {actual_vocab} merges, fewer than the {vocab} "
-            "requested; that is normal for a small corpus[/dim]"
+            f"tokenizer  [bold]{len(tokenizer)}[/bold] tokens  [dim]from {tokenizer_from}[/dim]"
         )
+    else:
+        with console.status(f"training a {vocab}-token vocabulary over {len(documents)} documents"):
+            tokenizer = train_tokenizer(documents, vocab_size=vocab, out_dir=tok_path)
+        actual_vocab = len(tokenizer)
+        console.print(f"tokenizer  [bold]{actual_vocab}[/bold] tokens → {tok_path}")
+        if actual_vocab < vocab:
+            console.print(
+                f"[dim]corpus supported only {actual_vocab} merges, fewer than the {vocab} "
+                "requested; that is normal for a small corpus[/dim]"
+            )
 
     with console.status("tokenizing and packing"):
         try:
@@ -223,7 +356,17 @@ def prepare(
         f"tokens     [bold]{train_split.tokens:,}[/bold] train / "
         f"{val_split.tokens:,} val  ({info.dtype}) → {tokens_path}"
     )
-    console.print(f"\nnext:  [bold]bloomery train --data {name} --name run1[/bold]")
+    if tokenizer_from:
+        # This corpus was packed for a specific model, so `train` is the wrong
+        # next step: it would build a fresh random model around that model's
+        # vocabulary — for a large one, an expensive way to get nothing anybody
+        # wanted, and it would succeed, so nothing would signal the mistake.
+        console.print(
+            f"\nnext:  [bold]bloomery adapt --from {tokenizer_from} "
+            f"--data {name} --name adapt1[/bold]"
+        )
+    else:
+        console.print(f"\nnext:  [bold]bloomery train --data {name} --name run1[/bold]")
 
 
 # --------------------------------------------------------------------------- #
@@ -367,30 +510,7 @@ def train(
         gradient_checkpointing=grad_checkpoint,
         device_type=choice.type,
     )
-    console.print(
-        f"memory     ~{fit.required / GIB:.1f} GiB needed of "
-        f"{fit.budget.total / GIB:.1f} GiB  [dim]{fit.budget.source}[/dim]"
-    )
-    if not fit.fits:
-        lines = [
-            f"this configuration needs about {fit.required / GIB:.1f} GiB but only "
-            f"{fit.budget.total / GIB:.1f} GiB is available ({fit.budget.source}).",
-        ]
-        if fit.suggestions():
-            lines.append("\ntry one of:")
-            lines.extend(f"  {option}" for option in fit.suggestions())
-        lines.append(
-            "\nThe estimate is conservative and assumes AdamW in bf16. "
-            "Pass --force to start anyway."
-        )
-        if not force:
-            _die("\n".join(lines))
-        console.print("[yellow]--force given; starting despite the estimate[/yellow]")
-    elif fit.spare < 0.25:
-        console.print(
-            f"[yellow]           only {fit.spare:.0%} spare — "
-            "an out-of-memory error is plausible[/yellow]"
-        )
+    _report_fit(fit, force=force)
     console.print()
 
     columns = (
@@ -403,35 +523,7 @@ def train(
     with Progress(*columns, console=console) as progress:
         task = progress.add_task("training", total=steps, completed=0)
 
-        def on_event(event: dict[str, Any]) -> None:
-            if event["event"] == "step":
-                progress.update(
-                    task,
-                    completed=event["step"],
-                    description=(
-                        f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"
-                    ),
-                )
-            elif event["event"] == "eval":
-                line = (
-                    f"  [dim]step {event['step']}[/dim]  "
-                    f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
-                    f"ppl {event['perplexity']}"
-                )
-                per = event.get("per_component") or {}
-                if len(per) > 1:
-                    line += (
-                        "  [dim]"
-                        + " ".join(f"{k} {v:.3f}" for k, v in sorted(per.items()))
-                        + "[/dim]"
-                    )
-                progress.console.print(line)
-                # The point of per-component evaluation: name the corpus that is
-                # getting worse, while there is still time to raise its weight.
-                for component, delta in (event.get("regressed") or {}).items():
-                    progress.console.print(
-                        f"  [yellow]forgetting[/yellow]  {component} is {delta:.4f} above its best"
-                    )
+        on_event = _training_events(progress, task)
 
         try:
             result = run_training(
@@ -454,30 +546,258 @@ def train(
             console.print("\n[yellow]interrupted[/yellow] — no checkpoint written this step")
             raise typer.Exit(code=130) from None
 
-    console.print()
-    console.print(f"final loss [bold]{result.final_loss:.4f}[/bold]")
-    if result.best_val_loss is not None:
-        console.print(f"best val   [bold]{result.best_val_loss:.4f}[/bold]")
-    console.print(f"throughput {result.tokens_per_second:,.0f} tok/s")
-    if len(result.per_component_loss) > 1:
-        console.print()
-        console.print("per component")
-        for component, loss in sorted(result.per_component_loss.items()):
-            flag = (
-                f"  [yellow]+{result.regressed[component]:.4f} over best[/yellow]"
-                if component in result.regressed
-                else ""
-            )
-            console.print(f"  {component:<24} {loss:.4f}{flag}")
-        if result.regressed:
+    _report_result(result, blend, name)
+
+
+# --------------------------------------------------------------------------- #
+# adapt
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def adapt(
+    from_model: str = typer.Option(
+        ...,
+        "--from",
+        "-f",
+        help="Model to continue: a checkpoint directory or a Hugging Face repo id.",
+    ),
+    data: str | None = typer.Option(
+        None, "--data", "-d", help="Single dataset name from `prepare`."
+    ),
+    mix: str | None = typer.Option(
+        None, "--mix", "-m", help="Mixture name from `mix create`. Use instead of --data."
+    ),
+    mix_version: int | None = typer.Option(
+        None, "--mix-version", help="Pin a mixture version. Defaults to the newest."
+    ),
+    name: str = typer.Option("adapt1", "--name", "-n", help="Name for this run."),
+    method: str = typer.Option(
+        "lora",
+        "--method",
+        help="full (every weight) or lora (adapters against a frozen base).",
+    ),
+    lora_r: int = typer.Option(16, "--lora-r", help="Adapter rank."),
+    lora_alpha: int = typer.Option(32, "--lora-alpha", help="Adapter scaling."),
+    lora_dropout: float = typer.Option(0.05, "--lora-dropout", help="Adapter dropout."),
+    steps: int = typer.Option(200, "--steps", help="Optimizer steps."),
+    batch: int = typer.Option(4, "--batch", help="Sequences per step."),
+    seq: int = typer.Option(512, "--seq", help="Tokens per sequence."),
+    grad_accum: int = typer.Option(1, "--grad-accum", help="Micro-batches per step."),
+    lr: float | None = typer.Option(
+        None, "--lr", help="Peak LR. Defaults far below a from-scratch rate."
+    ),
+    eval_every: int = typer.Option(50, "--eval-every", help="Steps between evaluations."),
+    save_every: int = typer.Option(
+        0, "--save-every", help="Steps between snapshots (0 = end only)."
+    ),
+    cores: int | None = typer.Option(None, "--cores", help="Cap CPU threads."),
+    device: str | None = typer.Option(None, "--device", help="Force cuda / mps / cpu."),
+    grad_checkpoint: bool = typer.Option(
+        False, "--grad-checkpoint", help="Trade compute for memory."
+    ),
+    resume: bool = typer.Option(False, "--resume", help="Continue from the latest checkpoint."),
+    force: bool = typer.Option(
+        False, "--force", help="Start even if the memory estimate says it will not fit."
+    ),
+    seed: int = typer.Option(1337, "--seed"),
+) -> None:
+    """Continue training a model that already exists.
+
+    The opposite of `train`, which starts from the initialiser. Here the weights
+    are someone else's — your own earlier run, or a published checkpoint — and
+    this carries on from them on your corpus.
+
+    The corpus must have been packed with that model's tokenizer, since its
+    embedding table is indexed by that tokenizer's ids:
+
+      bloomery prepare --name mine --source ./docs --tokenizer <the same model>
+
+    A mixture with a replay component is the way to keep what the model already
+    knew: `mix create` a blend of your corpus and something resembling its
+    original data, and the per-component evaluation will name whatever starts
+    getting worse.
+    """
+    _quiet_transformers()
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeElapsedColumn,
+    )
+
+    from bloomery import mixture as mix_mod
+    from bloomery.arch import spec_from_model_config
+    from bloomery.capability import check_fit
+    from bloomery.data import load_tokenizer
+    from bloomery.train import checkpoint as ckpt
+    from bloomery.train.device import choose, thread_limit
+    from bloomery.train.loop import (
+        LoraSettings,
+        ModelLoadError,
+        TrainConfig,
+        load_model,
+        trainable_fraction,
+    )
+    from bloomery.train.loop import train as run_training
+    from bloomery.train.mixing import check_tokenizer_matches
+    from bloomery.train.mixing import resolve as resolve_mixture
+
+    if bool(data) == bool(mix):
+        _die("give exactly one of --data or --mix")
+
+    try:
+        chosen = Method(method)
+    except ValueError:
+        _die(f"unknown method {method!r}; choose one of: full, lora")
+    if chosen is Method.QLORA:
+        _die("qlora is not available yet; choose full or lora")
+
+    try:
+        blend = mix_mod.load(mix, mix_version) if mix else mix_mod.single(data or "")
+        resolved = resolve_mixture(blend)
+    except mix_mod.MixtureError as exc:
+        _die(str(exc))
+    except FileNotFoundError as exc:
+        _die(str(exc))
+
+    thread_limit(cores)
+    choice = choose(device)
+
+    # Loaded before anything else is reported, because everything reported about
+    # the model comes off the real thing rather than off a preset.
+    with console.status(f"loading {from_model}"):
+        try:
+            model = load_model(from_model)
+            # Not Path(from_model): a repo id is not a path, and converting one
+            # rewrites its separator on Windows.
+            model_tokenizer = load_tokenizer(from_model)
+        except ModelLoadError as exc:
+            _die(str(exc))
+        except Exception as exc:  # noqa: BLE001 - tokenizer loading raises many types
+            _die(f"could not load the tokenizer for {from_model!r}: {exc}")
+
+    # The guard the whole feature depends on. Token ids from another tokenizer
+    # address unrelated symbols in this model's embedding table, and nothing
+    # downstream would ever report it.
+    try:
+        check_tokenizer_matches(resolved, model_tokenizer, from_model)
+    except mix_mod.MixtureError as exc:
+        _die(str(exc))
+
+    trainable, total = trainable_fraction(model)
+    try:
+        spec = spec_from_model_config(
+            model.config, seq=seq, batch=batch, params=total, label=str(from_model)
+        )
+    except ValueError as exc:
+        # Reachable: from_pretrained accepts architectures whose config carries
+        # no attention-head count at all, so the model loads and only this fails.
+        # The message explains what is wrong, and a traceback would bury it.
+        _die(str(exc))
+    adapter = (
+        LoraSettings(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
+        if chosen is Method.LORA
+        else None
+    )
+
+    config = TrainConfig(
+        steps=steps,
+        batch=batch,
+        seq=seq,
+        grad_accum=grad_accum,
+        # A from-scratch peak would undo what the model already knows: that rate
+        # is chosen to move randomly initialised weights a long way, and these
+        # weights are not random.
+        lr=lr if lr is not None else _ADAPT_LR[chosen],
+        eval_every=eval_every,
+        save_every=save_every,
+        seed=seed,
+        gradient_checkpointing=grad_checkpoint,
+    )
+
+    train_tokens = sum(i.split("train").tokens for i in resolved.datasets.values())
+    console.print(f"base       [bold]{from_model}[/bold]  {format_params(total)} params")
+    console.print(
+        f"model      {spec.layers}L × {spec.hidden}d × {spec.heads}h  "
+        f"{spec.vocab:,} vocab  [dim]{spec.key}[/dim]"
+    )
+    console.print(f"method     [bold]{chosen.label}[/bold]  [dim]lr {config.lr:g}[/dim]")
+    console.print(f"device     {choice.label()}  [dim]{choice.reason}[/dim]")
+    console.print(
+        f"data       {train_tokens:,} train tokens  "
+        f"[dim]{config.tokens_per_step:,} tokens/step[/dim]"
+    )
+    if len(blend.components) > 1:
+        console.print(f"mixture    [bold]{blend.describe()}[/bold]")
+        if blend.replay_share() == 0:
             console.print(
-                "\n[yellow]Some components ended worse than their best.[/yellow] "
-                "Raise their weight, or mark them as replay:\n"
-                f"  [bold]bloomery mix add {blend.name} "
-                f"--replay {next(iter(result.regressed))}:0.2[/bold]"
+                "[yellow]           no component is marked as replay — "
+                "the model may forget what it already knew[/yellow]"
             )
-    console.print(f"checkpoint {result.checkpoint}")
-    console.print(f"\nnext:  [bold]bloomery chat --run {name}[/bold]")
+
+    report = probe_host_report(include_torch=False)
+    fit = check_fit(
+        report,
+        spec,
+        method=chosen,
+        batch=batch,
+        seq=seq,
+        gradient_checkpointing=grad_checkpoint,
+        device_type=choice.type,
+        fixed_shape=True,
+    )
+    _report_fit(fit, force=force)
+
+    run_path = paths.run_dir(name)
+    resume_from = None
+    if resume:
+        candidate = ckpt.checkpoint_dir(run_path)
+        if not ckpt.is_resumable(candidate):
+            _die(f"nothing resumable at {candidate}")
+        resume_from = candidate
+        console.print(f"resuming   [dim]{candidate}[/dim]")
+    console.print()
+
+    columns = (
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+    )
+    with Progress(*columns, console=console) as progress:
+        task = progress.add_task("adapting", total=steps, completed=0)
+
+        on_event = _training_events(progress, task)
+
+        try:
+            result = run_training(
+                spec=spec,
+                datasets=resolved.datasets,
+                mixture=blend,
+                tokenizer=model_tokenizer,
+                run_dir=run_path,
+                config=config,
+                choice=choice,
+                eos_token_id=resolved.eos_token_id,
+                resume_from=resume_from,
+                # Resuming reloads the adapters that were saved, so they must not
+                # be created fresh on top of them.
+                base_model=None if resume_from else from_model,
+                adapter=None if resume_from else adapter,
+                on_event=on_event,
+            )
+        except (ValueError, ModelLoadError) as exc:
+            progress.stop()
+            _die(str(exc))
+        except KeyboardInterrupt:
+            progress.stop()
+            console.print("\n[yellow]interrupted[/yellow] — no checkpoint written this step")
+            raise typer.Exit(code=130) from None
+
+    _report_result(result, blend, name)
 
 
 # --------------------------------------------------------------------------- #

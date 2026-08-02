@@ -619,3 +619,108 @@ class TestCpuBf16Gate:
 
         monkeypatch.setattr(torch, "cpu", Hostile())
         assert _cpu_bf16_is_native() is False
+
+
+class TestAdapterTraining:
+    """Adapters against a frozen base.
+
+    Uses a checkpoint this suite trains rather than a download: bloomery writes
+    ordinary Hugging Face directories, so one stands in for "someone else's
+    model" with no network involved.
+    """
+
+    def test_attaching_adapters_freezes_everything_else(self, cpu_choice: DeviceChoice) -> None:
+        peft = pytest.importorskip("peft", reason="adapters need the adapt extra")
+        assert peft
+        from bloomery.train.loop import LoraSettings, attach_adapter, trainable_fraction
+
+        spec = spec_from_depth(2, vocab=400, seq=64)
+        model = build_model(spec, eos_token_id=0, seed=0)
+        _, before = trainable_fraction(model)
+
+        adapted = attach_adapter(model, LoraSettings(r=4, alpha=8, dropout=0.0))
+        trainable, total = trainable_fraction(adapted)
+
+        assert trainable < total
+        # Only the low-rank update is learned; the base is along for the ride.
+        assert trainable / total < 0.2
+        assert all(
+            not param.requires_grad
+            for name, param in adapted.named_parameters()
+            if "lora_" not in name
+        )
+        assert total >= before
+
+    def test_adapters_still_learn(self, cpu_choice: DeviceChoice) -> None:
+        """A frozen base with nothing trainable would look identical from outside."""
+        pytest.importorskip("peft", reason="adapters need the adapt extra")
+        import torch
+
+        from bloomery.train.loop import LoraSettings, attach_adapter
+
+        spec = spec_from_depth(2, vocab=400, seq=64)
+        adapted = attach_adapter(
+            build_model(spec, eos_token_id=0, seed=0), LoraSettings(r=4, alpha=8, dropout=0.0)
+        )
+        optimizer = torch.optim.AdamW([p for p in adapted.parameters() if p.requires_grad], lr=1e-2)
+        batch = torch.randint(0, 400, (2, 32))
+
+        before = adapted(input_ids=batch, labels=batch).loss.item()
+        for _ in range(8):
+            loss = adapted(input_ids=batch, labels=batch).loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+        after = adapted(input_ids=batch, labels=batch).loss.item()
+
+        assert after < before
+
+    def test_an_adapter_checkpoint_loads_its_base(self, tmp_path: Path) -> None:
+        """Adapters are a diff, so opening one means opening the model it diffs against."""
+        pytest.importorskip("peft", reason="adapters need the adapt extra")
+        from bloomery.train.loop import (
+            LoraSettings,
+            attach_adapter,
+            is_adapter_dir,
+            load_model,
+            trainable_fraction,
+        )
+
+        base_dir = tmp_path / "base"
+        spec = spec_from_depth(2, vocab=400, seq=64)
+        build_model(spec, eos_token_id=0, seed=0).save_pretrained(str(base_dir))
+
+        adapter_dir = tmp_path / "adapter"
+        attach_adapter(
+            load_model(base_dir), LoraSettings(r=4, alpha=8, dropout=0.0)
+        ).save_pretrained(str(adapter_dir))
+
+        assert is_adapter_dir(adapter_dir)
+        assert not is_adapter_dir(base_dir)
+
+        reloaded = load_model(adapter_dir)
+        trainable, total = trainable_fraction(reloaded)
+        assert trainable > 0, "a resumed adapter run must still have something to train"
+        assert total > trainable
+
+    def test_adapters_without_a_reachable_base_say_so(self, tmp_path: Path) -> None:
+        """The failure mode of a small artifact: the thing it diffs against is gone."""
+        pytest.importorskip("peft", reason="adapters need the adapt extra")
+        import json
+
+        from bloomery.train.loop import ModelLoadError, load_model
+
+        orphan = tmp_path / "orphan"
+        orphan.mkdir()
+        (orphan / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": str(tmp_path / "gone")})
+        )
+
+        with pytest.raises(ModelLoadError, match="could not be loaded"):
+            load_model(orphan)
+
+    def test_loading_a_model_that_is_not_there_is_reported(self, tmp_path: Path) -> None:
+        from bloomery.train.loop import ModelLoadError, load_model
+
+        with pytest.raises(ModelLoadError, match="could not load a model"):
+            load_model(tmp_path / "nothing")

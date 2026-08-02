@@ -368,7 +368,9 @@ class TestDemo:
 
 
 class TestHelp:
-    @pytest.mark.parametrize("command", ["prepare", "train", "chat", "bench", "demo", "doctor"])
+    @pytest.mark.parametrize(
+        "command", ["prepare", "train", "adapt", "chat", "bench", "demo", "doctor"]
+    )
     def test_every_command_has_help(self, command: str) -> None:
         result = _invoke(command, "--help")
         assert result.exit_code == 0
@@ -376,7 +378,7 @@ class TestHelp:
 
     def test_root_lists_commands(self) -> None:
         result = _invoke()
-        for command in ("prepare", "train", "chat", "bench", "demo", "doctor"):
+        for command in ("prepare", "train", "adapt", "chat", "bench", "demo", "doctor"):
             assert command in plain(result.stdout)
 
 
@@ -781,3 +783,254 @@ class TestMemoryGuard:
         on_cpu = check_fit(report, LADDER_BY_KEY["1b"], batch=4, seq=1024, device_type="cpu")
         assert on_gpu.fits
         assert not on_cpu.fits
+
+
+class TestAdapt:
+    """Continuing a model that already exists.
+
+    The base model is a real from-scratch run rather than a download: bloomery
+    checkpoints are ordinary Hugging Face directories, so one serves as "someone
+    else's model" without the suite ever touching the network.
+    """
+
+    @pytest.fixture
+    def base(self, isolated_home: Path) -> Path:
+        """A trained checkpoint, and a corpus packed with its tokenizer."""
+        assert (
+            _invoke("prepare", "--name", "c", "--synthetic", "400", "--vocab", "300").exit_code == 0
+        )
+        assert (
+            _invoke(
+                "train",
+                "--data",
+                "c",
+                "--name",
+                "b",
+                "--depth",
+                "1",
+                "--steps",
+                "4",
+                "--batch",
+                "4",
+                "--seq",
+                "32",
+                "--device",
+                "cpu",
+            ).exit_code
+            == 0
+        )
+        checkpoint = isolated_home / "runs/b/latest"
+        assert (
+            _invoke(
+                "prepare",
+                "--name",
+                "mine",
+                "--synthetic",
+                "400",
+                "--tokenizer",
+                str(checkpoint),
+            ).exit_code
+            == 0
+        )
+        return checkpoint
+
+    def test_lora_writes_adapters_not_a_whole_model(self, base: Path, isolated_home: Path) -> None:
+        """The point of adapters: a few megabytes of diff, not a copy of the base."""
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(base),
+            "--data",
+            "mine",
+            "--name",
+            "a",
+            "--steps",
+            "4",
+            "--batch",
+            "2",
+            "--seq",
+            "32",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        out = isolated_home / "runs/a/latest"
+        assert (out / "adapter_config.json").is_file()
+        assert (out / "adapter_model.safetensors").is_file()
+        assert not (out / "model.safetensors").is_file()
+
+    def test_full_adaptation_writes_a_whole_model(self, base: Path, isolated_home: Path) -> None:
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(base),
+            "--data",
+            "mine",
+            "--name",
+            "f",
+            "--method",
+            "full",
+            "--steps",
+            "4",
+            "--batch",
+            "2",
+            "--seq",
+            "32",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        out = isolated_home / "runs/f/latest"
+        assert (out / "config.json").is_file()
+        assert (out / "model.safetensors").is_file()
+
+    def test_a_corpus_the_model_cannot_read_is_refused(self, base: Path) -> None:
+        """The guard the whole feature rests on.
+
+        Token ids from another tokenizer address unrelated symbols in this
+        model's embedding table. Nothing downstream raises: the run trains, the
+        loss settles somewhere unremarkable, and the model comes out worse than
+        it went in with no indication why.
+        """
+        assert (
+            _invoke("prepare", "--name", "alien", "--synthetic", "400", "--vocab", "500").exit_code
+            == 0
+        )
+
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(base),
+            "--data",
+            "alien",
+            "--name",
+            "x",
+            "--steps",
+            "2",
+            "--batch",
+            "2",
+            "--seq",
+            "32",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 1
+        output = plain(result.stdout)
+        assert "different tokenizer" in output
+        # The fix has to be in the message; it is not guessable from the error.
+        assert "--tokenizer" in output
+
+    def test_the_run_reports_the_base_and_the_method(self, base: Path) -> None:
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(base),
+            "--data",
+            "mine",
+            "--name",
+            "r",
+            "--steps",
+            "2",
+            "--batch",
+            "2",
+            "--seq",
+            "32",
+            "--device",
+            "cpu",
+        )
+        output = plain(result.stdout)
+        assert "base" in output
+        assert "LoRA" in output
+
+    def test_an_unknown_method_is_refused(self, base: Path) -> None:
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(base),
+            "--data",
+            "mine",
+            "--name",
+            "x",
+            "--method",
+            "sideways",
+        )
+        assert result.exit_code == 1
+        assert "unknown method" in plain(result.stdout)
+
+    def test_a_missing_model_is_reported_clearly(self, isolated_home: Path) -> None:
+        assert (
+            _invoke("prepare", "--name", "c", "--synthetic", "400", "--vocab", "300").exit_code == 0
+        )
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(isolated_home / "nope"),
+            "--data",
+            "c",
+            "--name",
+            "x",
+            "--steps",
+            "2",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 1
+
+    def test_chat_can_open_what_a_lora_run_produced(self, base: Path) -> None:
+        """Adapters are not a model, so loading one means loading its base too."""
+        assert (
+            _invoke(
+                "adapt",
+                "--from",
+                str(base),
+                "--data",
+                "mine",
+                "--name",
+                "a",
+                "--steps",
+                "4",
+                "--batch",
+                "2",
+                "--seq",
+                "32",
+                "--device",
+                "cpu",
+            ).exit_code
+            == 0
+        )
+        result = _invoke(
+            "chat", "--run", "a", "--prompt", "hello", "--max-new-tokens", "4", "--device", "cpu"
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+
+    def test_resuming_continues_rather_than_restarting(
+        self, base: Path, isolated_home: Path
+    ) -> None:
+        for steps in ("4", "8"):
+            args = [
+                "adapt",
+                "--from",
+                str(base),
+                "--data",
+                "mine",
+                "--name",
+                "a",
+                "--steps",
+                steps,
+                "--batch",
+                "2",
+                "--seq",
+                "32",
+                "--device",
+                "cpu",
+            ]
+            if steps == "8":
+                args.append("--resume")
+            assert _invoke(*args).exit_code == 0
+
+        events = [
+            json.loads(line)
+            for line in (isolated_home / "runs/a/run.jsonl").read_text().splitlines()
+        ]
+        finished = [e["step"] for e in events if e["event"] == "done"]
+        assert finished == [4, 8], finished

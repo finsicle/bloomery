@@ -95,11 +95,145 @@ def _batched(documents: Iterable[str]) -> Iterator[list[str]]:
         yield batch
 
 
-def load_tokenizer(path: Path) -> Tokenizer:
-    """Load a tokenizer previously saved by :func:`train_tokenizer`."""
+def load_tokenizer(path: str | Path) -> Tokenizer:
+    """Load a tokenizer from a directory or a Hugging Face repository id.
+
+    Takes ``str`` as well as ``Path`` because a repository id is not a path.
+    Routing ``Qwen/Qwen2-0.5B`` through ``Path`` rewrites the separator on
+    Windows and the lookup then fails, in a way that would never show up on a
+    machine where the separator happens to be a slash.
+    """
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(str(path))
+
+
+def adopt_tokenizer(source: str | Path, out_dir: Path) -> Tokenizer:
+    """Take an existing model's tokenizer instead of training a new one.
+
+    ``source`` is a local directory or a Hugging Face repository id.
+
+    Continuing to train a model means writing into an embedding table indexed by
+    *its* tokenizer's ids, so a corpus for that model has to be packed with that
+    tokenizer. This is what makes such a corpus possible; without it every
+    dataset carries a tokenizer bloomery invented, and no existing model can
+    read it.
+
+    The tokenizer is saved into the dataset alongside the tokens so the dataset
+    stays self-describing — the same shape ``prepare`` already produces, and the
+    same shape the mixture loader expects.
+    """
+    from transformers import AutoTokenizer
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(str(source))
+    except Exception as exc:  # noqa: BLE001 - transformers raises many types here
+        raise ValueError(
+            f"could not load a tokenizer from {source!r}: {exc}\n"
+            "Give a local model directory or a Hugging Face repository id."
+        ) from exc
+
+    if tokenizer.eos_token_id is None and tokenizer.bos_token_id is None:
+        raise ValueError(
+            f"the tokenizer at {source!r} declares neither an end-of-text nor a "
+            "beginning-of-text token, so documents cannot be separated in the "
+            "packed stream."
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer.save_pretrained(str(out_dir))
+    return tokenizer
+
+
+def id_space(tokenizer: Tokenizer) -> int:
+    """The smallest array width that can hold every id this tokenizer emits.
+
+    Counting entries is not enough. ``vocab_size`` excludes added tokens and
+    ``len()`` includes them, but both are counts, and an id is not bounded by
+    how many of them there are: a tokenizer can hold 32,001 entries where one
+    sits at id 128,255, which several published models do because they reserve a
+    block of special tokens at the top.
+
+    Sizing the packed array from a count is then how that token silently wraps in
+    ``uint16``, coming back as whatever it collides with, with nothing reporting
+    it. So take the highest id actually in use.
+    """
+    counts = [int(tokenizer.vocab_size), len(tokenizer)]
+    # Guarded rather than assumed: every tokenizer `prepare` writes has this,
+    # but widening an array is a decision worth making from what is actually
+    # there, not from a call that might not exist on some future backend.
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if callable(get_vocab):
+        counts.append(max(get_vocab().values(), default=-1) + 1)
+    return max(counts)
+
+
+# Text the fallback fingerprint runs through a tokenizer to see what it does with
+# it. Chosen to move under the transformations that separate two tokenizers
+# sharing a vocabulary: letter case, accents and other combining marks, runs of
+# whitespace, punctuation attachment, digit grouping, and non-Latin scripts.
+_PROBE = (
+    "The Quick brown FOX\n"
+    "  spaced\tout  \n"
+    "café CAFÉ café\n"
+    "hello, world! (don't) [x]=1;\n"
+    "1234567890 3.14 -7\n"
+    "日本語 Ελληνικά Привет 🙂\n"
+)
+
+
+def fingerprint(tokenizer: Tokenizer) -> str:
+    """Identify a tokenizer by what it does, not by the file it came from.
+
+    The mixture loader compares datasets by hashing ``tokenizer.json`` directly,
+    which is right there: both sides were written by this project, so identical
+    tokenizers give identical bytes.
+
+    That does not hold when one side is someone else's model. Saving a tokenizer
+    re-serialises it, and a re-serialised file need not be byte-identical to the
+    original even though the tokenizer is the same. Hashing the backend's own
+    canonical form compares the vocabulary and merges instead, which is what
+    actually has to match.
+
+    A tokenizer with no fast backend has no such canonical form, and that case is
+    reachable: ``AutoTokenizer`` returns a slow tokenizer for any model that
+    ships no fast implementation, and ``adopt_tokenizer`` will happily take one.
+    Hashing its vocabulary alone would be unsafe in the worst direction — two
+    tokenizers can share a vocabulary and still assign different ids to the same
+    text, because normalisation happens before the lookup. One that lowercases
+    and one that does not would fingerprint identically, and this comparison is
+    what stands between a user and training on ids that mean nothing to their
+    model.
+
+    So the fallback also asks the tokenizer what it actually produces for a fixed
+    probe. That captures normalisation, case folding and pre-tokenisation by
+    observing them rather than by trying to enumerate them. It is not a proof of
+    equality — two tokenizers agreeing on the probe could still differ on some
+    other input — but it fails in the safe direction far more often, and a
+    difference it does see is a real one.
+    """
+    import hashlib
+
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is not None:
+        canonical = backend.to_str()
+    else:
+        canonical = repr(
+            (
+                sorted(tokenizer.get_vocab().items()),
+                _probe_ids(tokenizer),
+            )
+        )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _probe_ids(tokenizer: Tokenizer) -> list[int] | str:
+    """What this tokenizer makes of :data:`_PROBE`, for the fallback fingerprint."""
+    try:
+        encoded = tokenizer(_PROBE, add_special_tokens=False)["input_ids"]
+    except Exception as exc:  # noqa: BLE001 - a tokenizer that cannot encode is a difference too
+        return f"unencodable: {type(exc).__name__}"
+    return [int(i) for i in encoded]
 
 
 def eot_id(tokenizer: Tokenizer) -> int:

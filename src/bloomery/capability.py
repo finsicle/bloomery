@@ -93,6 +93,10 @@ class ModelSpec:
     seq: int
     batch: int
     note: str = ""
+    # The real count, when one is known. Set for a model loaded from a
+    # checkpoint, where the shape is someone else's and the closed form below
+    # does not describe it.
+    params_override: int | None = None
 
     @property
     def params(self) -> int:
@@ -104,7 +108,15 @@ class ModelSpec:
 
         Checks out against real models: the d12 entry lands on 123.5M against
         GPT-2 small's 124M, and the 7B entry on 6.98B against Llama-7B's 6.74B.
+
+        Those assumptions are ours, and they only hold for models this project
+        builds. A checkpoint with grouped-query attention, untied embeddings or a
+        different MLP ratio breaks all three, and this number is multiplied by
+        the per-parameter state cost to decide whether a run is refused — so when
+        the real count is known it is used instead of guessed.
         """
+        if self.params_override is not None:
+            return self.params_override
         return self.vocab * self.hidden + self.layers * 12 * self.hidden**2
 
 
@@ -322,6 +334,10 @@ class FitCheck:
     gradient_checkpointing: bool
     required: int
     budget: Budget
+    # Set when the shape is not ours to change — an existing checkpoint. Advice
+    # about picking a smaller model is then useless, and a different method is
+    # the lever that remains.
+    fixed_shape: bool = False
 
     @property
     def fits(self) -> bool:
@@ -378,9 +394,25 @@ class FitCheck:
                 verdict = "fits" if reduced <= self.budget.total else "still short"
                 options.append(f"{label}  (~{reduced / GIB:.1f} GiB, {verdict})")
 
-        smaller = _largest_depth_that_fits(self)
-        if smaller is not None:
-            options.append(f"--depth {smaller}  (the largest depth that fits as configured)")
+        if self.fixed_shape:
+            # The model is someone else's; only how it is trained can change.
+            if self.method is Method.FULL:
+                lora = estimate_memory(
+                    self.spec,
+                    Method.LORA,
+                    batch=self.batch,
+                    seq=self.seq,
+                    gradient_checkpointing=self.gradient_checkpointing,
+                )
+                verdict = "fits" if lora <= self.budget.total else "still short"
+                options.append(
+                    f"--method lora  (~{lora / GIB:.1f} GiB, {verdict}; trains adapters "
+                    "against a frozen base)"
+                )
+        else:
+            smaller = _largest_depth_that_fits(self)
+            if smaller is not None:
+                options.append(f"--depth {smaller}  (the largest depth that fits as configured)")
 
         return options
 
@@ -413,6 +445,7 @@ def check_fit(
     seq: int,
     gradient_checkpointing: bool = False,
     device_type: str | None = None,
+    fixed_shape: bool = False,
 ) -> FitCheck:
     """Estimate whether a training configuration fits before it is started.
 
@@ -420,6 +453,9 @@ def check_fit(
     out-of-memory error is that the error arrives whenever the allocator happens
     to hit the ceiling — which can be twenty minutes in, after the tokenizer,
     the packing and the model build have all succeeded.
+
+    ``fixed_shape`` says the model already exists, so the advice on a refusal
+    should be about how to train it rather than about training a smaller one.
     """
     return FitCheck(
         spec=spec,
@@ -435,6 +471,7 @@ def check_fit(
             gradient_checkpointing=gradient_checkpointing,
         ),
         budget=derive_budget(report, device_type=device_type),
+        fixed_shape=fixed_shape,
     )
 
 

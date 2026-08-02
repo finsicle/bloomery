@@ -119,6 +119,44 @@ def resolve(mixture: Mixture) -> ResolvedMixture:
     )
 
 
+def check_tokenizer_matches(resolved: ResolvedMixture, model_tokenizer: Any, source: str) -> None:
+    """Refuse a corpus that the model cannot read.
+
+    The same failure the mixture guard above exists to prevent, one level out. A
+    model's embedding table is indexed by *its* tokenizer's ids; hand it a corpus
+    packed with another and token 4,211 addresses an unrelated symbol. Nothing
+    raises. The run trains, the loss falls to somewhere unremarkable, and the
+    model comes out worse than it started with no indication why.
+
+    Compared on what the tokenizers do rather than on the files they came from,
+    because one side was written by this project and the other was not — see
+    :func:`bloomery.data.fingerprint`.
+    """
+    from bloomery.data import fingerprint, id_space
+    from bloomery.mixture import MixtureError
+
+    if fingerprint(resolved.tokenizer) == fingerprint(model_tokenizer):
+        return
+
+    corpus = ", ".join(resolved.mixture.datasets)
+    raise MixtureError(
+        f"the corpus was packed with a different tokenizer than {source} uses, so its "
+        f"token ids mean different things to that model:\n"
+        f"  corpus  {corpus}: {id_space(resolved.tokenizer):,} ids, "
+        f"tokenizer {fingerprint(resolved.tokenizer)}\n"
+        f"  model   {source}: {id_space(model_tokenizer):,} ids, "
+        f"tokenizer {fingerprint(model_tokenizer)}\n"
+        # Every component, not just the first. A replay blend is the arrangement
+        # this is most often used with, and naming one of its datasets sends the
+        # user round the same refusal again for the next.
+        "Re-pack every component against the model's own tokenizer:\n"
+        + "\n".join(
+            f"  bloomery prepare --name {name} --source ... --tokenizer {source}"
+            for name in resolved.mixture.datasets
+        )
+    )
+
+
 class MixtureSampler:
     """Draws batches across a blend in proportion to component weights.
 

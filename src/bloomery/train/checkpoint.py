@@ -127,4 +127,13 @@ def load_resume_state(
 
 
 def is_resumable(directory: Path) -> bool:
-    return (directory / TRAINER_STATE).is_file() and (directory / "config.json").is_file()
+    """Whether a run can be picked up from this directory.
+
+    Needs the optimizer state, plus weights in one of the two shapes a run
+    writes: a whole model, or the adapters a LoRA run produced. Checking only for
+    ``config.json`` would report every adapter checkpoint as unresumable, which
+    is the shape a long adaptation run leaves behind.
+    """
+    if not (directory / TRAINER_STATE).is_file():
+        return False
+    return (directory / "config.json").is_file() or (directory / "adapter_config.json").is_file()

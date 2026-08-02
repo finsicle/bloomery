@@ -12,10 +12,13 @@ import pytest
 
 from bloomery.data import (
     END_OF_TEXT,
+    adopt_tokenizer,
     build_dataset,
     count_bytes,
     dtype_for_vocab,
     eot_id,
+    fingerprint,
+    id_space,
     iter_documents,
     load_dataset,
     open_split,
@@ -230,3 +233,166 @@ class TestBuildDataset:
     def test_unknown_split(self, dataset: Any) -> None:
         with pytest.raises(KeyError):
             dataset.split("test")
+
+
+class TestIdSpace:
+    """Sizing the packed array from the wrong number wraps ids in silence."""
+
+    def test_counts_added_tokens(self, documents: list[str], tmp_path: Path) -> None:
+        """Trains its own tokenizer: add_tokens mutates in place, and the shared
+        fixture is session-scoped, so doing this to it would leak the extra
+        tokens into every later test that touches it."""
+        from bloomery.data import train_tokenizer
+
+        local = train_tokenizer(documents[:200], vocab_size=300, out_dir=tmp_path / "local")
+        base = local.vocab_size
+        local.add_tokens(["<|extra_one|>", "<|extra_two|>"])
+
+        assert len(local) > base
+        assert id_space(local) == len(local)
+
+    def test_an_id_above_the_entry_count_still_widens_the_array(self) -> None:
+        """Counting entries is not the same as bounding ids.
+
+        A tokenizer can hold a few thousand entries with one of them at id
+        128,255 — several published models reserve a block of special tokens at
+        the top. Both counts then say uint16, and that token wraps.
+        """
+
+        class Sparse:
+            vocab_size = 32_000
+
+            def __len__(self) -> int:
+                return 32_001
+
+            def get_vocab(self) -> dict[str, int]:
+                return {"a": 0, "<|reserved|>": 128_255}
+
+        assert id_space(Sparse()) == 128_256
+        assert dtype_for_vocab(id_space(Sparse())) == "uint32"
+
+    def test_a_vocabulary_just_under_the_limit_is_not_packed_as_uint16(self) -> None:
+        """The concrete failure: base vocab below 65,536, added tokens above it.
+
+        Sizing from ``vocab_size`` alone gives uint16, and every added token's id
+        comes back as whatever it collides with, with nothing reporting it.
+        """
+
+        class Tokenizer:
+            vocab_size = 65_530
+
+            def __len__(self) -> int:
+                return 65_540
+
+        assert dtype_for_vocab(Tokenizer.vocab_size) == "uint16"
+        assert dtype_for_vocab(id_space(Tokenizer())) == "uint32"
+
+
+class TestAdoptTokenizer:
+    """Packing a corpus for a model that already exists."""
+
+    def test_adopting_reproduces_the_source_tokenizer(self, tmp_path: Path, tokenizer: Any) -> None:
+        """What makes a corpus for an existing model possible at all."""
+        source = tmp_path / "source"
+        tokenizer.save_pretrained(str(source))
+        original = tokenizer
+
+        adopted = adopt_tokenizer(source, tmp_path / "adopted")
+        adopted_dir = tmp_path / "adopted"
+
+        assert (adopted_dir / "tokenizer.json").is_file()
+        assert fingerprint(adopted) == fingerprint(original)
+        assert adopted("hello world")["input_ids"] == original("hello world")["input_ids"]
+
+    def test_a_source_that_is_not_a_tokenizer_is_refused(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with pytest.raises(ValueError, match="could not load a tokenizer"):
+            adopt_tokenizer(empty, tmp_path / "out")
+
+
+class TestFingerprint:
+    """Identity by behaviour, not by the bytes a file happens to have.
+
+    The mixture guard hashes ``tokenizer.json`` directly, which is right when
+    both sides were written by this project. It is not right when one side is
+    someone else's model: saving re-serialises, and a re-serialised file need
+    not be byte-identical to the original.
+    """
+
+    def test_survives_a_save_and_reload(self, tmp_path: Path, tokenizer: Any) -> None:
+        from bloomery.data import load_tokenizer
+
+        before = fingerprint(tokenizer)
+        tokenizer.save_pretrained(str(tmp_path / "saved"))
+        assert fingerprint(load_tokenizer(tmp_path / "saved")) == before
+
+    def test_differs_for_a_different_vocabulary(self, tmp_path: Path, documents: Any) -> None:
+        from bloomery.data import train_tokenizer
+
+        small = train_tokenizer(documents, vocab_size=300, out_dir=tmp_path / "a")
+        large = train_tokenizer(documents, vocab_size=500, out_dir=tmp_path / "b")
+        assert fingerprint(small) != fingerprint(large)
+
+
+class TestFingerprintWithoutAFastBackend:
+    """A tokenizer with no fast backend has no canonical serialisation.
+
+    Reachable: AutoTokenizer returns a slow tokenizer for any model shipping no
+    fast implementation, and ``adopt_tokenizer`` takes whatever it is given.
+    Hashing the vocabulary alone would be unsafe in the worst direction, because
+    normalisation happens before the lookup — so two tokenizers can share a
+    vocabulary and still assign different ids to the same text.
+    """
+
+    class Slow:
+        """Only the surface ``fingerprint`` uses, and deliberately no backend."""
+
+        def __init__(self, vocab: dict[str, int], *, lowercase: bool) -> None:
+            self._vocab = vocab
+            self._lowercase = lowercase
+
+        def get_vocab(self) -> dict[str, int]:
+            return dict(self._vocab)
+
+        def __call__(self, text: str, **_: Any) -> dict[str, list[int]]:
+            prepared = text.lower() if self._lowercase else text
+            return {"input_ids": [self._vocab.get(ch, 0) for ch in prepared]}
+
+    VOCAB = {"A": 1, "a": 2, "B": 3, "b": 4}
+
+    def test_the_same_vocabulary_with_different_normalisation_differs(self) -> None:
+        """The case that made the vocabulary-only fingerprint unsafe.
+
+        A false match here does not raise. It lets the run start on ids that
+        address the wrong symbols, which is what this comparison exists to stop.
+        """
+        folding = self.Slow(self.VOCAB, lowercase=True)
+        faithful = self.Slow(self.VOCAB, lowercase=False)
+
+        assert folding.get_vocab() == faithful.get_vocab()
+        assert fingerprint(folding) != fingerprint(faithful)
+
+    def test_two_identical_slow_tokenizers_still_match(self) -> None:
+        """Failing safe must not mean failing always."""
+        assert fingerprint(self.Slow(self.VOCAB, lowercase=True)) == fingerprint(
+            self.Slow(self.VOCAB, lowercase=True)
+        )
+
+    def test_a_different_vocabulary_still_differs(self) -> None:
+        other = dict(self.VOCAB) | {"C": 5}
+        assert fingerprint(self.Slow(self.VOCAB, lowercase=False)) != fingerprint(
+            self.Slow(other, lowercase=False)
+        )
+
+    def test_a_tokenizer_that_cannot_encode_does_not_crash_the_comparison(self) -> None:
+        """A refusal to encode is itself a difference worth recording."""
+
+        class Broken(TestFingerprintWithoutAFastBackend.Slow):
+            def __call__(self, text: str, **_: Any) -> dict[str, list[int]]:
+                raise RuntimeError("no")
+
+        assert fingerprint(Broken(self.VOCAB, lowercase=False))
+        assert fingerprint(Broken(self.VOCAB, lowercase=False)) != fingerprint(
+            self.Slow(self.VOCAB, lowercase=False)
+        )
