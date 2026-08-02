@@ -22,6 +22,7 @@ from bloomery.capability import ModelSpec
 from bloomery.data.shards import DatasetInfo, open_mask, open_preference_split, open_split
 from bloomery.mixture import Mixture
 from bloomery.train import checkpoint
+from bloomery.train import objective as objective_mod
 from bloomery.train.device import DeviceChoice
 from bloomery.train.metrics import MetricsWriter, Throughput
 
@@ -33,18 +34,15 @@ from bloomery.train.mixing import (  # noqa: E402 - ordering explained above
     evaluate_components,
     weighted_mean,
 )
+from bloomery.train.objective import IGNORE_INDEX, Batch, LossParts, Objective
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
-# What torch's cross-entropy skips. Positions carrying this contribute nothing to
-# the loss, which is how a prompt is excluded from what the model is scored on.
-IGNORE_INDEX = -100
-
-# A batch is a mapping so it can be splatted straight into the model and
-# concatenated generically across a blend's components. Naming it keeps the two
-# call sites and the samplers honest about what they exchange.
-Batch = dict[str, "torch.Tensor"]
+# Re-exported from bloomery.train.objective, which owns them now that what a
+# batch contains depends on what is being optimised. Kept importable from here
+# because the samplers below build them and every caller already looks here.
+__all__ = ["IGNORE_INDEX", "Batch", "LossParts", "Objective"]
 
 
 @dataclass(slots=True)
@@ -533,30 +531,67 @@ def autocast_for(choice: DeviceChoice) -> Any:
     return torch.autocast(device_type=choice.type, dtype=choice.dtype)
 
 
+@dataclass(frozen=True, slots=True)
+class EvalResult:
+    """A held-out score, plus whatever else the objective measured.
+
+    A bare float would be enough for language modelling. Preference training has
+    a second number worth seeing — how often the preferred answer actually scores
+    higher — and it comes from the same forward passes, so computing it in a
+    second evaluation pass would double the most expensive non-training work in
+    a run.
+    """
+
+    loss: float
+    extras: dict[str, float] = field(default_factory=dict)
+
+
 def evaluate(
     model: Any,
-    sampler: BatchSampler,
+    sampler: BatchSampler | PreferenceSampler,
     choice: DeviceChoice,
     *,
     batch: int,
     batches: int,
-) -> float:
+    objective: Objective = objective_mod.causal_loss,
+) -> EvalResult:
     """Mean loss over a fixed number of held-out batches."""
     import torch
 
     model.eval()
     total = 0.0
     counted = 0
+    extras: dict[str, float] = {}
     with torch.no_grad():
         for _ in range(batches):
             drawn = sampler.batch(batch, choice.device)
             with autocast_for(choice):
-                loss = model(**drawn).loss
-            if torch.isfinite(loss):
-                total += loss.item()
+                parts = objective(model, drawn)
+            if torch.isfinite(parts.loss):
+                total += parts.loss.item()
                 counted += 1
+                for name, value in parts.extras.items():
+                    extras[name] = extras.get(name, 0.0) + value
     model.train()
-    return total / counted if counted else float("nan")
+    if not counted:
+        return EvalResult(loss=float("nan"))
+    return EvalResult(
+        loss=total / counted,
+        extras={name: value / counted for name, value in extras.items()},
+    )
+
+
+def _perplexity(val_loss: float, objective: Objective) -> float | None:
+    """``exp(loss)``, but only where the loss is a log-likelihood.
+
+    A preference loss is not one. Publishing ``exp`` of it gives a plausible
+    number — a fresh DPO run would report a perplexity of 2.0 — into a file this
+    project calls a contract, and a plausible wrong number is worse than an
+    absent one.
+    """
+    if objective is not objective_mod.causal_loss:
+        return None
+    return round(math.exp(min(val_loss, 20)), 2) if math.isfinite(val_loss) else None
 
 
 def train(
@@ -681,6 +716,11 @@ def train(
         tracker.first.update(resume_state.component_first)
     last_per_component: dict[str, float] = {}
     last_regressed: dict[str, float] = {}
+    # Chosen from the data, not from a flag. A field on TrainConfig would be a
+    # second source of truth for one fact — and it is written into every
+    # checkpoint's run.json, so a run could record an objective its own dataset
+    # contradicts.
+    objective: Objective = objective_mod.causal_loss
     history: list[dict[str, Any]] = []
     throughput = Throughput()
     final_loss = float("nan")
@@ -727,14 +767,15 @@ def train(
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
             contributed = 0
+            step_extras: dict[str, float] = {}
 
             for _ in range(config.grad_accum):
                 drawn = train_sampler.batch(config.batch, choice.device)
                 with autocast_for(choice):
-                    loss = model(**drawn).loss
+                    parts = objective(model, drawn)
                     # Average over accumulation so the gradient matches what a
                     # single large batch would have produced.
-                    scaled = loss / config.grad_accum
+                    scaled = parts.loss / config.grad_accum
                 if not torch.isfinite(scaled):
                     # Usually a window the sampler could not place on anything
                     # supervised, where the score is a mean over an empty set.
@@ -750,8 +791,11 @@ def train(
                 contributed += 1
                 # What the loss was actually computed over. With a conversation
                 # corpus most of the window is prompt, so the window size stops
-                # describing what the model learned from.
-                trained_tokens += int((drawn["labels"] != IGNORE_INDEX).sum().item())
+                # describing what the model learned from. Only the objective can
+                # answer it, since only it knows which positions counted.
+                trained_tokens += parts.supervised_tokens
+                for name, value in parts.extras.items():
+                    step_extras[name] = step_extras.get(name, 0.0) + value
 
             if contributed:
                 if config.grad_clip > 0:
@@ -787,6 +831,15 @@ def train(
                         trained_tokens=trained_tokens,
                         skipped_microbatches=skipped_microbatches,
                         tokens_per_second=round(rate, 1),
+                        # Averaged over the microbatches that contributed, not
+                        # over grad_accum: the non-finite guard above can drop
+                        # some, and dividing by the wrong denominator would make
+                        # these shrink on exactly the steps already going wrong.
+                        **{
+                            name: round(total / contributed, 5)
+                            for name, total in step_extras.items()
+                            if contributed
+                        },
                     )
                 )
 
@@ -800,17 +853,23 @@ def train(
                 # aggregate is reported too, but it is dominated by whichever
                 # component carries the most weight, so on its own it can fall
                 # while an older corpus is being forgotten.
-                per_component = evaluate_components(
+                scored = evaluate_components(
                     model,
                     val_sampler.component_samplers(),
                     choice,
                     batch=config.batch,
                     batches=config.eval_batches,
+                    objective=objective,
                 )
+                per_component = {name: result.loss for name, result in scored.items()}
                 regressed = tracker.update(per_component)
                 last_per_component = per_component
                 last_regressed = regressed
                 val_loss = weighted_mean(per_component, val_sampler.effective_weights)
+                val_extras: dict[str, float] = {}
+                for result in scored.values():
+                    for name, value in result.extras.items():
+                        val_extras[name] = val_extras.get(name, 0.0) + value / len(scored)
 
                 if math.isfinite(val_loss) and (best_val is None or val_loss < best_val):
                     best_val = val_loss
@@ -821,11 +880,10 @@ def train(
                         step=step + 1,
                         val_loss=round(val_loss, 5),
                         best_val_loss=round(best_val, 5) if best_val is not None else None,
-                        perplexity=round(math.exp(min(val_loss, 20)), 2)
-                        if math.isfinite(val_loss)
-                        else None,
+                        perplexity=_perplexity(val_loss, objective),
                         per_component={k: round(v, 5) for k, v in per_component.items()},
                         regressed={k: round(v, 5) for k, v in regressed.items()} or None,
+                        **{f"val_{name}": round(v, 5) for name, v in val_extras.items()},
                     )
                 )
 

@@ -29,7 +29,7 @@ from bloomery.train.device import DeviceChoice
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
-    from bloomery.train.loop import BatchSampler, PreferenceSampler
+    from bloomery.train.loop import BatchSampler, EvalResult, PreferenceSampler
 
 # A component has to get worse by more than this before it is called a
 # regression. Validation loss on a small held-out split is noisy; flagging every
@@ -335,17 +335,26 @@ class ForgettingTracker:
 
 def evaluate_components(
     model: Any,
-    samplers: dict[str, BatchSampler],
+    samplers: dict[str, BatchSampler | PreferenceSampler],
     choice: DeviceChoice,
     *,
     batch: int,
     batches: int,
-) -> dict[str, float]:
-    """Mean validation loss for each component, measured independently."""
+    objective: Any = None,
+) -> dict[str, EvalResult]:
+    """Held-out score for each component, measured independently."""
     from bloomery.train.loop import evaluate
+    from bloomery.train.objective import causal_loss
 
     return {
-        name: evaluate(model, sampler, choice, batch=batch, batches=batches)
+        name: evaluate(
+            model,
+            sampler,
+            choice,
+            batch=batch,
+            batches=batches,
+            objective=objective or causal_loss,
+        )
         for name, sampler in samplers.items()
     }
 
