@@ -54,6 +54,7 @@ const FIELDS = {
     { key: "lora_r", label: "Adapter rank", type: "number", min: 1 },
     { key: "lora_alpha", label: "Adapter scaling", type: "number", min: 1 },
     { key: "lora_dropout", label: "Adapter dropout", type: "number", min: 0, step: "0.01" },
+    { key: "beta", label: "Beta", hint: "preference data only", type: "number", min: 0, step: "0.01" },
     { key: "steps", label: "Steps", type: "number", min: 1 },
     { key: "batch", label: "Batch", type: "number", min: 1 },
     { key: "seq", label: "Sequence length", type: "number", min: 1 },

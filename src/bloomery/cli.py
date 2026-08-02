@@ -185,17 +185,25 @@ def _training_events(progress: Any, task: Any) -> Any:
 
     def on_event(event: dict[str, Any]) -> None:
         if event["event"] == "step":
-            progress.update(
-                task,
-                completed=event["step"],
-                description=(f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"),
-            )
+            description = f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"
+            # For preference training the loss alone says almost nothing — it
+            # starts at ln 2 and creeps down whatever the model is learning. The
+            # margin is the number that says which answer it now prefers.
+            if "reward_margin" in event:
+                description += f"  margin {event['reward_margin']:+.3f}"
+            progress.update(task, completed=event["step"], description=description)
         elif event["event"] == "eval":
             line = (
                 f"  [dim]step {event['step']}[/dim]  "
                 f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
                 f"ppl {event['perplexity']}"
             )
+            if "val_reward_accuracy" in event:
+                line = (
+                    f"  [dim]step {event['step']}[/dim]  "
+                    f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
+                    f"prefers the better answer {event['val_reward_accuracy']:.0%} of the time"
+                )
             per = event.get("per_component") or {}
             if len(per) > 1:
                 line += (
