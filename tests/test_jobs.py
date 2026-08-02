@@ -1016,8 +1016,8 @@ class TestLogCompaction:
         )
         handle.close()
         try:
-            deadline = time.time() + 10
-            while path.stat().st_size < 400 and time.time() < deadline:
+            deadline = time.monotonic() + 10
+            while path.stat().st_size < 400 and time.monotonic() < deadline:
                 time.sleep(0.02)
 
             dropped = runner.compact_log(path, cap=200, keep=100)
@@ -1162,8 +1162,8 @@ class TestLogCompaction:
         # A wall-clock deadline rather than a fixed iteration count: a loaded CI
         # runner takes far longer per pass than this machine does, and a count
         # tuned here fails there for no reason to do with the code.
-        deadline = time.time() + 120
-        while time.time() < deadline:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
             sup.tick()
             if store.get(job.id).status.terminal:
                 break
@@ -1203,8 +1203,8 @@ class TestLogCompaction:
         peak = 0
         # A wall-clock deadline rather than a fixed iteration count, which was
         # tuned on a fast machine and timed out on a loaded CI runner.
-        deadline = time.time() + 120
-        while time.time() < deadline:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
             sup.tick()
             if path.exists():
                 peak = max(peak, path.stat().st_size)
