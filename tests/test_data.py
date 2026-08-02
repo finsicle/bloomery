@@ -23,8 +23,10 @@ from bloomery.data import (
     id_space,
     iter_documents,
     iter_examples,
+    iter_preferences,
     load_dataset,
     looks_like_conversations,
+    looks_like_preferences,
     open_mask,
     open_split,
     synthetic_documents,
@@ -481,6 +483,379 @@ class TestIterExamples:
         plain = tmp_path / "plain.jsonl"
         plain.write_text(json.dumps({"text": "just prose"}), encoding="utf-8")
         assert not looks_like_conversations(plain)
+
+
+def write_preferences(path: Path, count: int = 40) -> Path:
+    records = [
+        json.dumps(
+            {
+                "prompt": f"question number {i}",
+                "chosen": f"a good answer to {i}",
+                "rejected": f"a poor answer to {i}",
+            }
+        )
+        for i in range(count)
+    ]
+    path.write_text("\n".join(records), encoding="utf-8")
+    return path
+
+
+class TestIterPreferences:
+    def test_reads_a_string_prompt(self, tmp_path: Path) -> None:
+        path = write_preferences(tmp_path / "p.jsonl", count=3)
+        examples = list(iter_preferences(path))
+        assert len(examples) == 3
+        assert [turn["role"] for turn in examples[0].messages] == ["user"]
+        assert examples[0].chosen.startswith("a good")
+
+    def test_reads_a_messages_prompt(self, tmp_path: Path) -> None:
+        """A preference pair can follow several turns, not only a single question."""
+        path = tmp_path / "p.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "prompt": [
+                        {"role": "user", "content": "hello"},
+                        {"role": "assistant", "content": "hi"},
+                        {"role": "user", "content": "and now?"},
+                    ],
+                    "chosen": "this",
+                    "rejected": "that",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (example,) = list(iter_preferences(path))
+        assert [turn["role"] for turn in example.messages] == ["user", "assistant", "user"]
+
+    def test_a_pair_with_identical_answers_is_skipped(self, tmp_path: Path) -> None:
+        """It carries no preference: the loss is constant and its gradient zero."""
+        path = tmp_path / "p.jsonl"
+        path.write_text(
+            json.dumps({"prompt": "q", "chosen": "same", "rejected": "same"}), encoding="utf-8"
+        )
+        assert list(iter_preferences(path)) == []
+
+    def test_a_missing_side_is_skipped(self, tmp_path: Path) -> None:
+        path = tmp_path / "p.jsonl"
+        path.write_text(json.dumps({"prompt": "q", "chosen": "only one"}), encoding="utf-8")
+        assert list(iter_preferences(path)) == []
+
+    def test_a_prompt_already_ending_in_a_reply_is_refused(self, tmp_path: Path) -> None:
+        """Both answers are the assistant's turn, so the prompt must stop before one.
+
+        Otherwise the record renders two assistant turns in a row, which no chat
+        template describes and which puts the mask where neither answer is.
+        """
+        path = tmp_path / "p.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "prompt": [
+                        {"role": "user", "content": "q"},
+                        {"role": "assistant", "content": "already answered"},
+                    ],
+                    "chosen": "this",
+                    "rejected": "that",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert list(iter_preferences(path)) == []
+
+    def test_an_unknown_role_is_refused_rather_than_guessed(self, tmp_path: Path) -> None:
+        path = tmp_path / "p.jsonl"
+        path.write_text(
+            json.dumps(
+                {
+                    "prompt": [{"role": "wizard", "content": "hi"}],
+                    "chosen": "this",
+                    "rejected": "that",
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert list(iter_preferences(path)) == []
+
+    def test_preferences_are_recognised_as_such(self, tmp_path: Path) -> None:
+        """So a path that cannot read them names the flag that can."""
+        assert looks_like_preferences(write_preferences(tmp_path / "p.jsonl", count=2))
+        assert not looks_like_preferences(write_conversations(tmp_path / "c.jsonl", count=2))
+        assert not looks_like_conversations(write_preferences(tmp_path / "q.jsonl", count=2))
+
+
+class TestPreferenceEncoding:
+    """The prompt has to come out token-identical for both answers.
+
+    DPO compares two answers under one condition. If the prompt tokenizes
+    differently depending on what follows it, the comparison is between two
+    different questions and the training signal is noise wearing a loss value.
+    """
+
+    def example(self, chosen: str = "the better answer", rejected: str = "worse") -> Any:
+        from bloomery.data import PreferenceExample
+
+        return PreferenceExample(
+            ({"role": "user", "content": "a question"},), chosen=chosen, rejected=rejected
+        )
+
+    def test_the_prompt_is_a_real_prefix_of_both_renderings(self, chat_tokenizer: Any) -> None:
+        """The property shards.py says may not be assumed, so it is checked.
+
+        BPE merges across a join: tokenizing a prefix on its own does not tell
+        you where that prefix ends inside the whole. This asserts the boundary
+        found in character space lands where the tokens actually split.
+        """
+        from bloomery.data import eot_id
+        from bloomery.data.shards import encode_preference
+
+        eot = eot_id(chat_tokenizer)
+        encoded, reason = encode_preference(self.example(), chat_tokenizer, eot=eot)
+        assert encoded is not None, reason
+        prompt, chosen, rejected = encoded
+
+        for content, answer in (("the better answer", chosen), ("worse", rejected)):
+            messages = [
+                {"role": "user", "content": "a question"},
+                {"role": "assistant", "content": content},
+            ]
+            text = chat_tokenizer.apply_chat_template(messages, tokenize=False)
+            whole = list(chat_tokenizer(text, add_special_tokens=False)["input_ids"])
+            assert whole == [*prompt, *answer[:-1]], "the boundary is not where the tokens split"
+        assert chosen[-1] == eot and rejected[-1] == eot
+
+    class Stub:
+        """One token per character, and ">" marks where the assistant speaks.
+
+        A stub rather than a trained tokenizer because the behaviour under test
+        is a property of BPE in general, not of whichever merges a fixture
+        happened to learn — and a fixture that does not happen to merge at the
+        join would make the test pass by doing nothing.
+
+        With ``contagious``, the two characters before the marker become one
+        token whenever the answer begins with a vowel: the prompt tokenizes
+        differently depending on what follows it, which is exactly what
+        `shards.py:253` says may not be assumed away.
+        """
+
+        is_fast = True
+        chat_template = "x"
+
+        def __init__(self, contagious: bool = False) -> None:
+            self.contagious = contagious
+
+        def apply_chat_template(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+            text = "".join(
+                (">" + m["content"] if m["role"] == "assistant" else m["content"]) for m in messages
+            )
+            return text + ">" if kwargs.get("add_generation_prompt") else text
+
+        def __call__(self, text: str, **kwargs: Any) -> dict[str, Any]:
+            offsets = [(i, i + 1) for i in range(len(text))]
+            marker = text.find(">")
+            if self.contagious and marker > 1 and text[marker + 1 : marker + 2] in set("aeiou"):
+                offsets = [*offsets[: marker - 2], (marker - 2, marker), *offsets[marker:]]
+            return {
+                "input_ids": [sum(ord(c) for c in text[a:b]) for a, b in offsets],
+                "offset_mapping": offsets,
+            }
+
+    def test_a_prompt_that_retokenizes_differently_is_dropped(self) -> None:
+        """The failure this whole path exists to catch.
+
+        When the prompt's own tokens depend on which answer follows, the two
+        answers are no longer being compared under one condition. Nothing about
+        the resulting file looks wrong — the loss is a number, training runs, and
+        what it converges to is noise.
+        """
+        from bloomery.data.shards import DROP_PROMPT_DIVERGED, encode_preference
+
+        encoded, reason = encode_preference(
+            self.example(chosen="alpha", rejected="beta"), self.Stub(contagious=True), eot=0
+        )
+        assert encoded is None
+        assert reason == DROP_PROMPT_DIVERGED
+
+    def test_a_stable_boundary_still_packs(self) -> None:
+        """The guard must not reject every pair, only the ones that diverge."""
+        from bloomery.data.shards import encode_preference
+
+        encoded, reason = encode_preference(self.example("alpha", "beta"), self.Stub(), eot=7)
+        assert encoded is not None, reason
+        prompt, chosen, rejected = encoded
+        assert prompt == [ord(c) for c in "a question>"]
+        assert chosen == [*(ord(c) for c in "alpha"), 7]
+        assert rejected == [*(ord(c) for c in "beta"), 7]
+
+
+class TestPreferencePacking:
+    def build(self, tokenizer: Any, tmp_path: Path, count: int = 40) -> Any:
+        from bloomery.data import eot_id, iter_preferences
+        from bloomery.data.shards import build_preference_dataset
+
+        path = write_preferences(tmp_path / "p.jsonl", count=count)
+        return build_preference_dataset(
+            iter_preferences(path),
+            tokenizer,
+            out_dir=tmp_path / "packed",
+            eot=eot_id(tokenizer),
+            val_fraction=0.1,
+        )
+
+    def test_every_pair_round_trips(self, chat_tokenizer: Any, tmp_path: Path) -> None:
+        """Read every example back and check it is the one that went in."""
+        from bloomery.data import eot_id, iter_preferences, load_dataset
+        from bloomery.data.shards import encode_preference, open_preference_split
+
+        info = self.build(chat_tokenizer, tmp_path)
+        assert load_dataset(tmp_path / "packed").format == "dpo"
+
+        eot = eot_id(chat_tokenizer)
+        wanted = [
+            encode_preference(e, chat_tokenizer, eot=eot)[0]
+            for e in iter_preferences(tmp_path / "p.jsonl")
+        ]
+        wanted = [w for w in wanted if w is not None]
+
+        seen = []
+        for split in ("train", "val"):
+            streams, index = open_preference_split(info, split)
+            assert len(index) == info.split(split).documents
+            for row in index:
+                seen.append(
+                    tuple(
+                        streams[part][start : start + length].tolist()
+                        for part, (start, length) in zip(
+                            ("prompt", "chosen", "rejected"), row, strict=True
+                        )
+                    )
+                )
+
+        assert len(seen) == len(wanted)
+        # The two splits partition the corpus: every packed example is one that
+        # went in, exactly once, with its three parts still together.
+        assert sorted(seen) == sorted(tuple(map(list, w)) for w in wanted)
+
+    def test_the_index_lands_on_the_right_boundaries(
+        self, chat_tokenizer: Any, tmp_path: Path
+    ) -> None:
+        """An off-by-one here reads one example's answer against another's prompt."""
+        from bloomery.data.shards import open_preference_split
+
+        info = self.build(chat_tokenizer, tmp_path)
+        streams, index = open_preference_split(info, "train")
+        for column, part in enumerate(("prompt", "chosen", "rejected")):
+            starts = index[:, column, 0]
+            lengths = index[:, column, 1]
+            assert starts[0] == 0
+            # Back to back with no gaps and no overlap.
+            assert list(starts[1:]) == list((starts + lengths)[:-1])
+            assert starts[-1] + lengths[-1] == len(streams[part])
+
+    def test_the_split_token_count_covers_all_three_streams(
+        self, chat_tokenizer: Any, tmp_path: Path
+    ) -> None:
+        from bloomery.data.shards import open_preference_split
+
+        info = self.build(chat_tokenizer, tmp_path)
+        for split in ("train", "val"):
+            streams, _ = open_preference_split(info, split)
+            assert info.split(split).tokens == sum(len(s) for s in streams.values())
+
+    def merging(self, chat_tokenizer: Any) -> Any:
+        """The real tokenizer, except answers starting with "!" merge at the join.
+
+        Contrived, and it has to be: a well-behaved template packs every pair.
+        The accounting only matters for the pairs that cannot be split, so
+        exercising it needs a tokenizer that fails to split some.
+        """
+
+        class Merging:
+            is_fast = True
+            chat_template = CHAT_TEMPLATE
+
+            def apply_chat_template(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+                return str(chat_tokenizer.apply_chat_template(messages, **kwargs))
+
+            def __call__(self, text: str, **kwargs: Any) -> Any:
+                encoded = chat_tokenizer(text, **kwargs)
+                if "!" not in text or "offset_mapping" not in encoded:
+                    return encoded
+                # Glue the token before the "!" to the one after it, so the
+                # boundary token now spans both sides of the join.
+                ids = list(encoded["input_ids"])
+                offsets = list(encoded["offset_mapping"])
+                cut = next(i for i, (a, b) in enumerate(offsets) if text[a:b].startswith("!"))
+                merged = (offsets[cut - 1][0], offsets[cut][1])
+                return {
+                    "input_ids": [*ids[: cut - 1], ids[cut], *ids[cut + 1 :]],
+                    "offset_mapping": [*offsets[: cut - 1], merged, *offsets[cut + 1 :]],
+                }
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(chat_tokenizer, name)
+
+            def __len__(self) -> int:
+                return len(chat_tokenizer)
+
+        return Merging()
+
+    def test_dropped_pairs_are_recorded_rather_than_vanishing(
+        self, chat_tokenizer: Any, tmp_path: Path
+    ) -> None:
+        """A corpus quietly smaller than its file is what you cannot debug later."""
+        from bloomery.data import PreferenceExample, eot_id, load_dataset
+        from bloomery.data.shards import DROP_PROMPT_DIVERGED, build_preference_dataset
+
+        good = [
+            PreferenceExample(
+                ({"role": "user", "content": f"q{i}"},), chosen=f"good {i}", rejected=f"bad {i}"
+            )
+            for i in range(20)
+        ]
+        bad = [
+            PreferenceExample(({"role": "user", "content": "q"},), chosen="!merged", rejected="ok")
+            for _ in range(3)
+        ]
+        info = build_preference_dataset(
+            [*good, *bad],
+            self.merging(chat_tokenizer),
+            out_dir=tmp_path / "packed",
+            eot=eot_id(chat_tokenizer),
+            val_fraction=0.1,
+        )
+        assert info.dropped == {DROP_PROMPT_DIVERGED: 3}
+        assert sum(s.documents for s in info.splits) == 20
+        # And it survives the sidecar, which is where it is read months later.
+        assert load_dataset(tmp_path / "packed").dropped == {DROP_PROMPT_DIVERGED: 3}
+
+    def test_a_corpus_of_nothing_usable_is_an_error(
+        self, chat_tokenizer: Any, tmp_path: Path
+    ) -> None:
+        """Rather than an empty dataset that fails later, further from the cause."""
+        from bloomery.data import PreferenceExample, SftError, eot_id
+        from bloomery.data.shards import build_preference_dataset
+
+        with pytest.raises(SftError, match="no preference pairs"):
+            build_preference_dataset(
+                [
+                    PreferenceExample(
+                        ({"role": "user", "content": "q"},), chosen="!merged", rejected="ok"
+                    )
+                ],
+                self.merging(chat_tokenizer),
+                out_dir=tmp_path / "packed",
+                eot=eot_id(chat_tokenizer),
+                val_fraction=0.0,
+            )
+
+    def test_a_packed_dataset_is_not_readable_as_preferences(
+        self, dataset: Any, tmp_path: Path
+    ) -> None:
+        from bloomery.data.shards import open_preference_split
+
+        with pytest.raises(ValueError, match="not preference pairs"):
+            open_preference_split(dataset, "train")
 
 
 class TestSftPacking:

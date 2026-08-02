@@ -147,6 +147,7 @@ _FLAGS: dict[JobKind, dict[str, str]] = {
         "lora_r": "--lora-r",
         "lora_alpha": "--lora-alpha",
         "lora_dropout": "--lora-dropout",
+        "beta": "--beta",
         "steps": "--steps",
         "batch": "--batch",
         "seq": "--seq",

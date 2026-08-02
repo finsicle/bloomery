@@ -29,7 +29,8 @@ from bloomery.train.device import DeviceChoice
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
-    from bloomery.train.loop import BatchSampler
+    from bloomery.train.loop import BatchSampler, EvalResult, PreferenceSampler
+    from bloomery.train.objective import Objective
 
 # A component has to get worse by more than this before it is called a
 # regression. Validation loss on a small held-out split is noisy; flagging every
@@ -107,6 +108,20 @@ def resolve(mixture: Mixture) -> ResolvedMixture:
             "Re-prepare the components against one tokenizer before blending them."
         )
 
+    # Conversations blend with plain text on purpose — that is replay, and the
+    # plain component is simply trained on in full. Preference pairs do not: a
+    # preference batch is two answers to one prompt scored against each other,
+    # and a text batch is a window scored against itself. There is no row shape
+    # that is both, so a blend of the two is refused rather than approximated.
+    preference = {name for name, info in datasets.items() if info.preference}
+    if preference and len(preference) != len(datasets):
+        detail = "\n".join(f"  {name}: {info.format}" for name, info in datasets.items())
+        raise MixtureError(
+            f"mixture {mixture.name!r} blends preference pairs with ordinary text, and "
+            f"the two are not the same kind of training:\n{detail}\n"
+            "Train the preference data as its own run, after the rest."
+        )
+
     # Safe to take the tokenizer from any component now that they are identical.
     source = mixture.datasets[0]
     tokenizer = load_tokenizer(paths.tokenizer_dir(source))
@@ -177,15 +192,21 @@ class MixtureSampler:
     ) -> None:
         import numpy as np
 
-        from bloomery.train.loop import BatchSampler
+        from bloomery.train.loop import sampler_for
 
         self.mixture = mixture
         self.split = split
         self._rng = np.random.default_rng(seed)
+        # Uniform across the blend, because resolve() refuses a mixed one. The
+        # two batch shapes have different keys and different meanings for a row,
+        # so there is no sensible way to concatenate one with the other.
+        self.preference = any(
+            info.preference for name, info in datasets.items() if name in mixture.datasets
+        )
 
         weights = mixture.weights()
         self._names: list[str] = []
-        self._samplers: list[BatchSampler] = []
+        self._samplers: list[BatchSampler | PreferenceSampler] = []
         self._probs: list[float] = []
         self.skipped: dict[str, str] = {}
 
@@ -196,7 +217,7 @@ class MixtureSampler:
             try:
                 # Offset the seed per component so two components do not draw
                 # the same offsets from differently sized arrays.
-                sampler = BatchSampler(info, split, seq=seq, seed=seed + index * 7919)
+                sampler = sampler_for(info, split, seq=seq, seed=seed + index * 7919)
             except (ValueError, FileNotFoundError) as exc:
                 self.skipped[name] = str(exc)
                 continue
@@ -257,9 +278,23 @@ class MixtureSampler:
         counts = self.draw_counts(size)
         by_name = dict(zip(self._names, self._samplers, strict=True))
         chunks = [by_name[name].batch(count, device) for name, count in counts.items() if count > 0]
+
+        if self.preference:
+            # A preference batch is two stacked halves, and row i pairs with row
+            # i + half. Concatenating whole chunks would put one component's
+            # chosen rows opposite another's rejected ones — every comparison
+            # between two unrelated answers, and nothing that looks wrong.
+            return {
+                key: torch.cat(
+                    [chunk[key][: len(chunk[key]) // 2] for chunk in chunks]
+                    + [chunk[key][len(chunk[key]) // 2 :] for chunk in chunks],
+                    dim=0,
+                )
+                for key in chunks[0]
+            }
         return {key: torch.cat([chunk[key] for chunk in chunks], dim=0) for key in chunks[0]}
 
-    def component_samplers(self) -> dict[str, BatchSampler]:
+    def component_samplers(self) -> dict[str, BatchSampler | PreferenceSampler]:
         """Per-component samplers, for evaluating each split on its own."""
         return dict(zip(self._names, self._samplers, strict=True))
 
@@ -315,17 +350,26 @@ class ForgettingTracker:
 
 def evaluate_components(
     model: Any,
-    samplers: dict[str, BatchSampler],
+    samplers: dict[str, BatchSampler | PreferenceSampler],
     choice: DeviceChoice,
     *,
     batch: int,
     batches: int,
-) -> dict[str, float]:
-    """Mean validation loss for each component, measured independently."""
+    objective: Objective | None = None,
+) -> dict[str, EvalResult]:
+    """Held-out score for each component, measured independently."""
     from bloomery.train.loop import evaluate
+    from bloomery.train.objective import causal_loss
 
     return {
-        name: evaluate(model, sampler, choice, batch=batch, batches=batches)
+        name: evaluate(
+            model,
+            sampler,
+            choice,
+            batch=batch,
+            batches=batches,
+            objective=causal_loss if objective is None else objective,
+        )
         for name, sampler in samplers.items()
     }
 

@@ -147,6 +147,184 @@ class TestBatchSampler:
             BatchSampler(dataset, "nonexistent", seq=8, seed=0)
 
 
+@pytest.fixture(scope="module")
+def preference_dataset(tokenizer: Any, tmp_path_factory: Any) -> Any:
+    """A packed preference corpus with answers of deliberately uneven length."""
+    from bloomery.data import PreferenceExample, build_preference_dataset, eot_id
+
+    # Which side is longer alternates deliberately. With the chosen answer always
+    # the longer one, a truncation rule driven by the chosen length alone would
+    # be indistinguishable from one driven by the longer of the two.
+    examples = [
+        PreferenceExample(
+            ({"role": "user", "content": f"question {i} " + "padding " * (i % 5)},),
+            chosen=f"a good answer to {i} " + "more " * (i % 4),
+            rejected=f"a poor answer to {i} " + "worse " * (3 - i % 4),
+        )
+        for i in range(40)
+    ]
+    tokenizer.chat_template = (
+        "{% for m in messages %}<|{{ m['role'] }}|>\n{{ m['content'] }}<|end|>\n{% endfor %}"
+        "{% if add_generation_prompt %}<|assistant|>\n{% endif %}"
+    )
+    return build_preference_dataset(
+        examples,
+        tokenizer,
+        out_dir=tmp_path_factory.mktemp("pref"),
+        eot=eot_id(tokenizer),
+        val_fraction=0.1,
+    )
+
+
+class TestPreferenceSampler:
+    """Both rows of a pair must differ only in the answer.
+
+    If they differ anywhere else the model is being asked to prefer one of two
+    answers to two different questions, and the loss will happily report a number
+    for that.
+    """
+
+    def sampler(self, preference_dataset: Any, seq: int = 64, seed: int = 0) -> Any:
+        from bloomery.train.loop import PreferenceSampler
+
+        return PreferenceSampler(preference_dataset, "train", seq=seq, seed=seed)
+
+    def test_a_batch_is_chosen_rows_then_rejected_rows(
+        self, preference_dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        batch = self.sampler(preference_dataset).batch(4, cpu_choice.device)
+        assert tuple(batch["input_ids"].shape) == (8, 64)
+        assert tuple(batch["attention_mask"].shape) == (8, 64)
+        assert tuple(batch["labels"].shape) == (8, 64)
+
+    def test_the_two_halves_of_a_pair_share_a_prompt_exactly(
+        self, preference_dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        """The invariant the whole format exists to hold."""
+        from bloomery.train.loop import IGNORE_INDEX
+
+        batch = self.sampler(preference_dataset).batch(6, cpu_choice.device)
+        ids, labels = batch["input_ids"], batch["labels"]
+        for row in range(6):
+            chosen_prompt = (labels[row] == IGNORE_INDEX) & (batch["attention_mask"][row] == 1)
+            rejected_prompt = (labels[row + 6] == IGNORE_INDEX) & (
+                batch["attention_mask"][row + 6] == 1
+            )
+            assert chosen_prompt.equal(rejected_prompt), "the prompts are different lengths"
+            assert ids[row][chosen_prompt].equal(ids[row + 6][rejected_prompt])
+
+    def test_only_the_answer_is_scored(
+        self, preference_dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        """A loss over the shared prompt would be identical on both sides and cancel."""
+        from bloomery.train.loop import IGNORE_INDEX
+
+        batch = self.sampler(preference_dataset).batch(4, cpu_choice.device)
+        scored = batch["labels"] != IGNORE_INDEX
+        assert scored.any(dim=1).all(), "a row with nothing scored contributes no gradient"
+        # Where a label survives it is the input at that position, never a shift.
+        assert batch["labels"][scored].equal(batch["input_ids"][scored])
+
+    def test_padding_is_excluded_from_attention_and_from_the_loss(
+        self, preference_dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        from bloomery.train.loop import IGNORE_INDEX
+
+        batch = self.sampler(preference_dataset).batch(8, cpu_choice.device)
+        padding = batch["attention_mask"] == 0
+        assert padding.any(), "these answers are uneven, so something must be padded"
+        assert (batch["labels"][padding] == IGNORE_INDEX).all()
+        # Right-padded: every attended position comes before every padded one.
+        for row in batch["attention_mask"]:
+            assert row.tolist() == sorted(row.tolist(), reverse=True)
+        # And the content is where the mask says it is. Without this the mask
+        # could be right-padded while the tokens sat at the other end, which is
+        # a row of padding fed to the model as if it were a prompt.
+        assert (batch["input_ids"][padding] == 0).all()
+        for row in range(batch["input_ids"].shape[0]):
+            attended = batch["attention_mask"][row] == 1
+            assert int(batch["input_ids"][row][attended].count_nonzero()) > 0
+
+    def test_a_pair_too_long_for_the_window_is_dropped_not_mangled(
+        self, preference_dataset: Any
+    ) -> None:
+        """Truncating into an answer would change what is being compared."""
+        roomy = self.sampler(preference_dataset, seq=64)
+        cramped = self.sampler(preference_dataset, seq=32)
+        assert roomy.dropped == 0
+        # Some, not all: a window that fits nothing is a refusal, tested below.
+        assert 0 < cramped.dropped < len(roomy._usable)
+
+    def test_a_long_prompt_is_cut_by_the_same_amount_on_both_sides(
+        self, preference_dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        """Cutting each side to fit its own answer would leave two prompts."""
+        from bloomery.train.loop import IGNORE_INDEX
+
+        sampler = self.sampler(preference_dataset, seq=40)
+        assert sampler.truncated > 0, "nothing was truncated, so this proves nothing"
+        batch = sampler.batch(8, cpu_choice.device)
+        for row in range(8):
+            chosen = int(
+                ((batch["labels"][row] == IGNORE_INDEX) & (batch["attention_mask"][row] == 1)).sum()
+            )
+            rejected = int(
+                (
+                    (batch["labels"][row + 8] == IGNORE_INDEX)
+                    & (batch["attention_mask"][row + 8] == 1)
+                ).sum()
+            )
+            assert chosen == rejected
+
+    def test_a_window_too_small_for_any_pair_is_refused_by_name(
+        self, preference_dataset: Any
+    ) -> None:
+        with pytest.raises(ValueError, match="no preference pair"):
+            self.sampler(preference_dataset, seq=4)
+
+    def test_seeded_sampling_is_reproducible(
+        self, preference_dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        first = self.sampler(preference_dataset, seed=9).batch(4, cpu_choice.device)
+        second = self.sampler(preference_dataset, seed=9).batch(4, cpu_choice.device)
+        assert first["input_ids"].equal(second["input_ids"])
+
+    def test_training_preference_data_without_adapters_is_refused(
+        self, preference_dataset: Any, tokenizer: Any, cpu_choice: DeviceChoice, tmp_path: Path
+    ) -> None:
+        """The reference is this model with its adapters off, so there must be some.
+
+        The CLI refuses --method full on preference data, but train() is reached
+        from library callers and from tests too. Without this guard the run gets
+        as far as the first microbatch before dying on an AttributeError naming a
+        peft method, which says nothing about what was wrong.
+        """
+        from bloomery.train.loop import train as run_training
+
+        with pytest.raises(ValueError, match="adapters"):
+            run_training(
+                spec=spec_from_depth(1, vocab=preference_dataset.vocab_size, seq=64),
+                datasets={"prefs": preference_dataset},
+                mixture=single("prefs"),
+                tokenizer=tokenizer,
+                run_dir=tmp_path / "run",
+                config=TrainConfig(steps=1, batch=2, seq=64, eval_every=0, log_every=0),
+                choice=cpu_choice,
+                eos_token_id=0,
+                adapter=None,
+            )
+
+    def test_the_factory_picks_the_sampler_from_the_format(
+        self, preference_dataset: Any, dataset: Any
+    ) -> None:
+        from bloomery.train.loop import BatchSampler, PreferenceSampler, sampler_for
+
+        assert isinstance(
+            sampler_for(preference_dataset, "train", seq=64, seed=0), PreferenceSampler
+        )
+        assert isinstance(sampler_for(dataset, "train", seq=32, seed=0), BatchSampler)
+
+
 class TestBuildModel:
     def test_is_randomly_initialised(self) -> None:
         """Two seeds must give different weights, or nothing is being trained."""

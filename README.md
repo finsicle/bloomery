@@ -60,11 +60,12 @@ libraries. There is nothing that is both.
 | LLaMA-Factory          |      ❌       |           ✅           |    ✅     |     ✅     |
 | Oumi                   |      ✅       |           ✅           |    ✅     |     ❌     |
 | nanochat               |      ✅       |           ✅           |    ✅     |     ❌     |
-| **bloomery**           |    **✅**     |        **✅**         |    ~     |  **✅**   |
+| **bloomery**           |    **✅**     |        **✅**         |  **✅**   |  **✅**   |
 
-Bloomery's `SFT / RL` is a tilde deliberately: supervised fine-tuning works,
-preference optimization does not exist yet. A checkmark there would claim half
-a column it has not earned.
+That column was a tilde until preference optimization existed. Supervised
+fine-tuning and DPO both work now; DPO is LoRA-only, which is what the hardware
+this targets can actually run, and `--method full` says so rather than failing
+at step one.
 
 The tools with the capability are CLI and YAML. The tools with the interface
 start from someone else's weights. Bloomery is from-scratch first, with
@@ -88,6 +89,14 @@ a milestone are not built yet — see [Roadmap](#roadmap).
   at f16, q8_0 or q4_0. LoRA adapters are folded in first, since GGUF has no
   notion of an adapter. The K-quants need llama.cpp's `llama-quantize`, and the
   command says so rather than pretending otherwise.
+- **Teach it which answer is better** — `prepare --preference` packs
+  `{prompt, chosen, rejected}` records and `adapt` trains DPO on them, against a
+  reference that is the same model with its adapters switched off, so no second
+  copy of the weights is needed. The prompt is stored once, because the
+  comparison only means anything if both answers follow a token-identical one.
+  Reported per side rather than as a margin alone: the usual way a DPO run goes
+  wrong is both rewards falling while the margin still rises, which a margin
+  reads as healthy.
 - **Fine-tune on conversations** — `prepare --chat` packs a corpus of chat or
   prompt/completion records and masks the prompts, so the model is scored only
   on what it was meant to produce. There is no separate command: the dataset
@@ -103,7 +112,11 @@ a milestone are not built yet — see [Roadmap](#roadmap).
   them. Per-job CPU, memory and GPU limits. It binds to localhost by default.
 
 ### Not built yet
-- **Preference optimization** — DPO and friends. Not scheduled.
+- **Preference optimization beyond DPO** — IPO, KTO, SimPO, PPO. Not scheduled.
+- **Preference training from the web UI.** `prepare --preference` and
+  `--chat` are both absent from the job queue's form, which only offers the
+  flags the runner declares. Both are reachable from the CLI. Fixing one should
+  fix both, so it is a change of its own rather than a half-measure here.
 
 ## Hardware
 
@@ -132,7 +145,8 @@ hardware, `bloomery doctor --json` in an issue is genuinely useful.
 | **M4**    | Continued pretraining on existing models, full or LoRA              | done |
 | **M4.1**  | Supervised fine-tuning on conversations                             | done |
 | **M5**    | Export — GGUF, quantization, Ollama                                | done |
-| **M6**    | AMD hardening on real hardware, Windows, evaluation                |        |
+| **M6**    | Preference optimization — DPO on chosen/rejected pairs             | done |
+| **M7**    | AMD hardening on real hardware, Windows, evaluation                |        |
 
 M2 came before the web UI because weighted replay is what makes "keep adding
 datasets" work instead of quietly degrading the model — and it is the part no

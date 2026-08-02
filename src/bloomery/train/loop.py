@@ -14,14 +14,16 @@ import math
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from bloomery.arch import suggested_lr, to_llama_config
 from bloomery.capability import ModelSpec
-from bloomery.data.shards import DatasetInfo, open_mask, open_split
+from bloomery.data.shards import DatasetInfo, open_mask, open_preference_split, open_split
 from bloomery.mixture import Mixture
 from bloomery.train import checkpoint
+from bloomery.train import objective as objective_mod
 from bloomery.train.device import DeviceChoice
 from bloomery.train.metrics import MetricsWriter, Throughput
 
@@ -33,18 +35,15 @@ from bloomery.train.mixing import (  # noqa: E402 - ordering explained above
     evaluate_components,
     weighted_mean,
 )
+from bloomery.train.objective import IGNORE_INDEX, Batch, LossParts, Objective
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
-# What torch's cross-entropy skips. Positions carrying this contribute nothing to
-# the loss, which is how a prompt is excluded from what the model is scored on.
-IGNORE_INDEX = -100
-
-# A batch is a mapping so it can be splatted straight into the model and
-# concatenated generically across a blend's components. Naming it keeps the two
-# call sites and the samplers honest about what they exchange.
-Batch = dict[str, "torch.Tensor"]
+# Re-exported from bloomery.train.objective, which owns them now that what a
+# batch contains depends on what is being optimised. Kept importable from here
+# because the samplers below build them and every caller already looks here.
+__all__ = ["IGNORE_INDEX", "Batch", "LossParts", "Objective"]
 
 
 @dataclass(slots=True)
@@ -66,6 +65,10 @@ class TrainConfig:
     log_every: int = 10
     seed: int = 1337
     gradient_checkpointing: bool = False
+    # How hard preference training is held to the reference model. Named
+    # dpo_beta and not beta because beta1 and beta2 sit right above it and mean
+    # something else entirely. Ignored unless the dataset is preference pairs.
+    dpo_beta: float = 0.1
 
     @property
     def tokens_per_step(self) -> int:
@@ -387,6 +390,125 @@ class BatchSampler:
         return np.where(barren, replacements, starts)
 
 
+class PreferenceSampler:
+    """Draws whole preference pairs and lays them out as one batch.
+
+    A batch of ``size`` pairs comes back as ``2 * size`` rows: the chosen answers
+    first, then the rejected ones in the same order. Row ``i`` and row
+    ``i + size`` are the two halves of one comparison, and the loss relies on
+    that pairing, so it is stated here rather than left to be inferred.
+
+    This is the first batch in the project carrying an ``attention_mask``. The
+    packed and SFT paths never need one because a window is dense by
+    construction; a preference pair has whatever length it has, so short ones are
+    padded and the padding has to be excluded from attention as well as from the
+    loss.
+    """
+
+    def __init__(self, info: DatasetInfo, split: str, *, seq: int, seed: int) -> None:
+        import numpy as np
+
+        self._info = info
+        self._split = split
+        self._seq = seq
+        self._rng = np.random.default_rng(seed)
+
+        _, index = open_preference_split(info, split)
+        prompt, chosen, rejected = (index[:, column, 1] for column in range(3))
+        # An answer alone longer than the window leaves no room for the prompt it
+        # answers, and truncating into the answer would change what is being
+        # compared. Such a pair is dropped rather than mangled.
+        self._usable = np.flatnonzero(np.maximum(chosen, rejected) < seq)
+        self._dropped = int(len(index) - len(self._usable))
+        if self._usable.size == 0:
+            raise ValueError(
+                f"split {split!r} has no preference pair whose answers fit in {seq} "
+                "tokens. Use a longer --seq, or check that the corpus was packed "
+                "against the right chat template."
+            )
+        self._tokens = int(prompt.sum() + chosen.sum() + rejected.sum())
+        # How much prompt has to go to make room, per usable pair. Driven by the
+        # longer of the two answers and applied to both, or the two rows would
+        # condition on different prompts and compare nothing.
+        room = seq - np.maximum(chosen, rejected)[self._usable]
+        self._keep = np.minimum(prompt[self._usable], room)
+        self._truncated = int((self._keep < prompt[self._usable]).sum())
+
+    @property
+    def tokens(self) -> int:
+        return self._tokens
+
+    @property
+    def dropped(self) -> int:
+        """Pairs whose answers do not fit the window at all."""
+        return self._dropped
+
+    @property
+    def truncated(self) -> int:
+        """Pairs whose prompt is cut to make room, identically on both sides."""
+        return self._truncated
+
+    def batch(self, size: int, device: torch.device) -> Batch:
+        """``2 * size`` rows: the chosen answers, then the rejected ones.
+
+        Right-padded, which is the opposite of what generation wants. Left
+        padding would need the position ids corrected to match, and that is a
+        second thing to get wrong for no gain here — nothing generates from these
+        rows, they only ever produce log-probabilities.
+
+        The prompt is truncated from the left when it does not fit, keeping the
+        end that the answer actually follows from. Both rows lose the same
+        number of tokens, so what they are conditioned on stays identical.
+        """
+        import numpy as np
+        import torch
+
+        streams, index = open_preference_split(self._info, self._split)
+        picks = self._rng.choice(len(self._usable), size=size)
+
+        ids = np.zeros((2 * size, self._seq), dtype=np.int64)
+        labels = np.full((2 * size, self._seq), IGNORE_INDEX, dtype=np.int64)
+        attention = np.zeros((2 * size, self._seq), dtype=np.int64)
+
+        for row, pick in enumerate(picks):
+            example = self._usable[pick]
+            keep = int(self._keep[pick])
+            start, length = index[example, 0]
+            prompt = streams["prompt"][start + length - keep : start + length]
+
+            for offset, part in ((0, "chosen"), (size, "rejected")):
+                start, length = index[example, 1 if part == "chosen" else 2]
+                answer = streams[part][start : start + length]
+                span = keep + len(answer)
+                ids[row + offset, :keep] = prompt
+                ids[row + offset, keep:span] = answer
+                # Only the answer is scored. The prompt is what both rows share,
+                # so a loss over it would be identical on each side and cancel —
+                # it would add noise to the comparison and nothing else.
+                labels[row + offset, keep:span] = answer
+                attention[row + offset, :span] = 1
+
+        return {
+            "input_ids": torch.from_numpy(ids).to(device, non_blocking=True),
+            "labels": torch.from_numpy(labels).to(device, non_blocking=True),
+            "attention_mask": torch.from_numpy(attention).to(device, non_blocking=True),
+        }
+
+
+def sampler_for(
+    info: DatasetInfo, split: str, *, seq: int, seed: int
+) -> BatchSampler | PreferenceSampler:
+    """The sampler this dataset's format calls for.
+
+    One factory rather than a branch at each construction site, so a caller that
+    does not care about the format — which is all of them — does not have to
+    learn about it.
+    """
+    if info.preference:
+        return PreferenceSampler(info, split, seq=seq, seed=seed)
+    return BatchSampler(info, split, seq=seq, seed=seed)
+
+
 def lr_at(step: int, config: TrainConfig, peak: float) -> float:
     """Linear warmup into a cosine decay, floored at a fraction of peak.
 
@@ -414,30 +536,67 @@ def autocast_for(choice: DeviceChoice) -> Any:
     return torch.autocast(device_type=choice.type, dtype=choice.dtype)
 
 
+@dataclass(frozen=True, slots=True)
+class EvalResult:
+    """A held-out score, plus whatever else the objective measured.
+
+    A bare float would be enough for language modelling. Preference training has
+    a second number worth seeing — how often the preferred answer actually scores
+    higher — and it comes from the same forward passes, so computing it in a
+    second evaluation pass would double the most expensive non-training work in
+    a run.
+    """
+
+    loss: float
+    extras: dict[str, float] = field(default_factory=dict)
+
+
 def evaluate(
     model: Any,
-    sampler: BatchSampler,
+    sampler: BatchSampler | PreferenceSampler,
     choice: DeviceChoice,
     *,
     batch: int,
     batches: int,
-) -> float:
+    objective: Objective = objective_mod.causal_loss,
+) -> EvalResult:
     """Mean loss over a fixed number of held-out batches."""
     import torch
 
     model.eval()
     total = 0.0
     counted = 0
+    extras: dict[str, float] = {}
     with torch.no_grad():
         for _ in range(batches):
             drawn = sampler.batch(batch, choice.device)
             with autocast_for(choice):
-                loss = model(**drawn).loss
-            if torch.isfinite(loss):
-                total += loss.item()
+                parts = objective(model, drawn)
+            if torch.isfinite(parts.loss):
+                total += parts.loss.item()
                 counted += 1
+                for name, value in parts.extras.items():
+                    extras[name] = extras.get(name, 0.0) + value
     model.train()
-    return total / counted if counted else float("nan")
+    if not counted:
+        return EvalResult(loss=float("nan"))
+    return EvalResult(
+        loss=total / counted,
+        extras={name: value / counted for name, value in extras.items()},
+    )
+
+
+def _perplexity(val_loss: float, objective: Objective) -> float | None:
+    """``exp(loss)``, but only where the loss is a log-likelihood.
+
+    A preference loss is not one. Publishing ``exp`` of it gives a plausible
+    number — a fresh DPO run would report a perplexity of 2.0 — into a file this
+    project calls a contract, and a plausible wrong number is worse than an
+    absent one.
+    """
+    if objective is not objective_mod.causal_loss:
+        return None
+    return round(math.exp(min(val_loss, 20)), 2) if math.isfinite(val_loss) else None
 
 
 def train(
@@ -562,6 +721,28 @@ def train(
         tracker.first.update(resume_state.component_first)
     last_per_component: dict[str, float] = {}
     last_regressed: dict[str, float] = {}
+    # Chosen from the data, not from a flag. A field on TrainConfig would be a
+    # second source of truth for one fact — and it is written into every
+    # checkpoint's run.json, so a run could record an objective its own dataset
+    # contradicts. A mixed blend is refused when the mixture is resolved, so
+    # any() and all() agree here.
+    objective: Objective = objective_mod.causal_loss
+    if any(info.preference for info in datasets.values()):
+        # The reference the objective scores against is this model with its
+        # adapters switched off, so there have to be adapters. The CLI refuses
+        # --method full on preference data, but train() is reachable without it
+        # — from a library caller, or from a test — and without this the run
+        # builds the model, the optimizer, the samplers and the metrics writer
+        # before dying on the first microbatch with an AttributeError naming a
+        # peft method, which says nothing about what was actually wrong.
+        if not hasattr(model, "disable_adapter"):
+            raise ValueError(
+                "preference training scores a model against its own untuned self, "
+                "which here means the same weights with the LoRA adapters switched "
+                "off — so it needs adapters, and this model has none.\n"
+                "Pass a LoraSettings adapter, or use `bloomery adapt --method lora`."
+            )
+        objective = partial(objective_mod.preference_loss, beta=config.dpo_beta)
     history: list[dict[str, Any]] = []
     throughput = Throughput()
     final_loss = float("nan")
@@ -608,14 +789,15 @@ def train(
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
             contributed = 0
+            step_extras: dict[str, float] = {}
 
             for _ in range(config.grad_accum):
                 drawn = train_sampler.batch(config.batch, choice.device)
                 with autocast_for(choice):
-                    loss = model(**drawn).loss
+                    parts = objective(model, drawn)
                     # Average over accumulation so the gradient matches what a
                     # single large batch would have produced.
-                    scaled = loss / config.grad_accum
+                    scaled = parts.loss / config.grad_accum
                 if not torch.isfinite(scaled):
                     # Usually a window the sampler could not place on anything
                     # supervised, where the score is a mean over an empty set.
@@ -631,8 +813,11 @@ def train(
                 contributed += 1
                 # What the loss was actually computed over. With a conversation
                 # corpus most of the window is prompt, so the window size stops
-                # describing what the model learned from.
-                trained_tokens += int((drawn["labels"] != IGNORE_INDEX).sum().item())
+                # describing what the model learned from. Only the objective can
+                # answer it, since only it knows which positions counted.
+                trained_tokens += parts.supervised_tokens
+                for name, value in parts.extras.items():
+                    step_extras[name] = step_extras.get(name, 0.0) + value
 
             if contributed:
                 if config.grad_clip > 0:
@@ -668,6 +853,15 @@ def train(
                         trained_tokens=trained_tokens,
                         skipped_microbatches=skipped_microbatches,
                         tokens_per_second=round(rate, 1),
+                        # Averaged over the microbatches that contributed, not
+                        # over grad_accum: the non-finite guard above can drop
+                        # some, and dividing by the wrong denominator would make
+                        # these shrink on exactly the steps already going wrong.
+                        **{
+                            name: round(total / contributed, 5)
+                            for name, total in step_extras.items()
+                            if contributed
+                        },
                     )
                 )
 
@@ -681,17 +875,23 @@ def train(
                 # aggregate is reported too, but it is dominated by whichever
                 # component carries the most weight, so on its own it can fall
                 # while an older corpus is being forgotten.
-                per_component = evaluate_components(
+                scored = evaluate_components(
                     model,
                     val_sampler.component_samplers(),
                     choice,
                     batch=config.batch,
                     batches=config.eval_batches,
+                    objective=objective,
                 )
+                per_component = {name: result.loss for name, result in scored.items()}
                 regressed = tracker.update(per_component)
                 last_per_component = per_component
                 last_regressed = regressed
                 val_loss = weighted_mean(per_component, val_sampler.effective_weights)
+                val_extras: dict[str, float] = {}
+                for result in scored.values():
+                    for name, value in result.extras.items():
+                        val_extras[name] = val_extras.get(name, 0.0) + value / len(scored)
 
                 if math.isfinite(val_loss) and (best_val is None or val_loss < best_val):
                     best_val = val_loss
@@ -702,11 +902,10 @@ def train(
                         step=step + 1,
                         val_loss=round(val_loss, 5),
                         best_val_loss=round(best_val, 5) if best_val is not None else None,
-                        perplexity=round(math.exp(min(val_loss, 20)), 2)
-                        if math.isfinite(val_loss)
-                        else None,
+                        perplexity=_perplexity(val_loss, objective),
                         per_component={k: round(v, 5) for k, v in per_component.items()},
                         regressed={k: round(v, 5) for k, v in regressed.items()} or None,
+                        **{f"val_{name}": round(v, 5) for name, v in val_extras.items()},
                     )
                 )
 

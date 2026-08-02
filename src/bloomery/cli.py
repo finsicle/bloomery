@@ -185,17 +185,25 @@ def _training_events(progress: Any, task: Any) -> Any:
 
     def on_event(event: dict[str, Any]) -> None:
         if event["event"] == "step":
-            progress.update(
-                task,
-                completed=event["step"],
-                description=(f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"),
-            )
+            description = f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"
+            # For preference training the loss alone says almost nothing — it
+            # starts at ln 2 and creeps down whatever the model is learning. The
+            # margin is the number that says which answer it now prefers.
+            if "reward_margin" in event:
+                description += f"  margin {event['reward_margin']:+.3f}"
+            progress.update(task, completed=event["step"], description=description)
         elif event["event"] == "eval":
             line = (
                 f"  [dim]step {event['step']}[/dim]  "
                 f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
                 f"ppl {event['perplexity']}"
             )
+            if "val_reward_accuracy" in event:
+                line = (
+                    f"  [dim]step {event['step']}[/dim]  "
+                    f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
+                    f"prefers the better answer {event['val_reward_accuracy']:.0%} of the time"
+                )
             per = event.get("per_component") or {}
             if len(per) > 1:
                 line += (
@@ -284,6 +292,11 @@ def prepare(
         "--chat",
         help="Read conversations and mask the prompts, for supervised fine-tuning.",
     ),
+    preference: bool = typer.Option(
+        False,
+        "--preference",
+        help="Read prompt/chosen/rejected records, for preference optimization.",
+    ),
     tokenizer_from: str | None = typer.Option(
         None,
         "--tokenizer",
@@ -309,25 +322,36 @@ def prepare(
     from bloomery.data import (
         adopt_tokenizer,
         build_dataset,
+        build_preference_dataset,
         build_sft_dataset,
         count_bytes,
         eot_id,
         iter_documents,
         iter_examples,
+        iter_preferences,
         looks_like_conversations,
+        looks_like_preferences,
         synthetic_documents,
         train_tokenizer,
     )
 
     if bool(source) == bool(synthetic):
         _die("give exactly one of --source or --synthetic")
-    if chat and source is None:
-        _die("--chat reads conversations from a file; give --source")
-    if chat and not tokenizer_from:
+    if chat and preference:
         _die(
-            "--chat needs the tokenizer of the model you are fine-tuning, because the "
+            "--chat and --preference read different files. A conversation teaches the "
+            "model what to say; a preference pair teaches it which of two answers is "
+            "better. Prepare them as two datasets."
+        )
+    shaped = chat or preference
+    flag = "--chat" if chat else "--preference"
+    if shaped and source is None:
+        _die(f"{flag} reads records from a file; give --source")
+    if shaped and not tokenizer_from:
+        _die(
+            f"{flag} needs the tokenizer of the model you are fine-tuning, because the "
             "conversation layout it was trained with comes from there:\n"
-            "  bloomery prepare --name ... --source ... --chat --tokenizer <that model>"
+            f"  bloomery prepare --name ... --source ... {flag} --tokenizer <that model>"
         )
 
     examples: list[Any] = []
@@ -339,7 +363,9 @@ def prepare(
         if size == 0:
             _die(f"no .txt, .md or .jsonl files found under {source}")
         console.print(f"reading [bold]{size / 1e6:.1f} MB[/bold] from {source}")
-        if chat:
+        if preference:
+            examples = list(iter_preferences(source))
+        elif chat:
             examples = list(iter_examples(source))
         else:
             documents = list(iter_documents(source))
@@ -347,15 +373,47 @@ def prepare(
         console.print(f"generating [bold]{synthetic}[/bold] synthetic documents")
         documents = synthetic_documents(synthetic)
 
+    if preference and not examples:
+        # The mirror of the check below: each flag names the other when it is
+        # handed the other's data, or the message says only that nothing was
+        # found and leaves the two shapes to be told apart by eye.
+        if source is not None and looks_like_conversations(source):
+            _die(
+                f"{source} looks like conversation data rather than preference pairs.\n"
+                "Pack it for supervised fine-tuning instead:\n"
+                f"  bloomery prepare --name {name} --source {source} --chat "
+                f"--tokenizer {tokenizer_from}"
+            )
+        _die(
+            f"no preference pairs found in {source}. Each line should be a JSON object "
+            'holding a "prompt" — a string or a messages list — plus "chosen" and '
+            '"rejected" answers that differ from each other.'
+        )
     if chat and not examples:
+        # Named specifically, because the two shapes are easy to mix up and the
+        # generic message would send you looking at the wrong flag.
+        if source is not None and looks_like_preferences(source):
+            _die(
+                f"{source} looks like preference data rather than conversations.\n"
+                f"  bloomery prepare --name {name} --source {source} --preference "
+                f"--tokenizer {tokenizer_from}"
+            )
         _die(
             f"no conversations found in {source}. Each line should be a JSON object "
             'holding either a "messages" list with an assistant turn in it, or a '
             '"prompt" and "completion" pair.'
         )
-    if not chat and not documents:
-        # Chat data read by the plain path yields nothing, and "no documents
+    if not shaped and not documents:
+        # Structured data read by the plain path yields nothing, and "no documents
         # found" names neither the cause nor the fix.
+        if source is not None and looks_like_preferences(source):
+            _die(
+                f"{source} looks like preference data, which this reads as plain text "
+                "and finds nothing in.\n"
+                "Pack it for preference training instead:\n"
+                f"  bloomery prepare --name {name} --source {source} --preference "
+                "--tokenizer <the model you are tuning>"
+            )
         if source is not None and looks_like_conversations(source):
             _die(
                 f"{source} looks like conversation data, which this reads as plain text "
@@ -391,7 +449,15 @@ def prepare(
 
     with console.status("tokenizing and packing"):
         try:
-            if chat:
+            if preference:
+                info = build_preference_dataset(
+                    examples,
+                    tokenizer,
+                    out_dir=tokens_path,
+                    eot=eot_id(tokenizer),
+                    val_fraction=val_fraction,
+                )
+            elif chat:
                 info = build_sft_dataset(
                     examples,
                     tokenizer,
@@ -416,6 +482,16 @@ def prepare(
         f"tokens     [bold]{train_split.tokens:,}[/bold] train / "
         f"{val_split.tokens:,} val  ({info.dtype}) → {tokens_path}"
     )
+    if preference:
+        console.print(
+            f"pairs      [bold]{train_split.documents:,}[/bold] train / "
+            f"{val_split.documents:,} val  [dim]one prompt, two answers each[/dim]"
+        )
+        for reason, count in info.dropped.items():
+            # Said out loud rather than left in meta.json. A corpus quietly
+            # smaller than the file it came from is the thing nobody can debug
+            # later, and the usual cause is the wrong chat template.
+            console.print(f"[yellow]           {count:,} pairs dropped — {reason}[/yellow]")
     if chat:
         # The number that says whether the data was understood. A very low share
         # means the responses were not found where the template puts them; a
@@ -529,6 +605,20 @@ def train(
         _die(str(exc))
     except FileNotFoundError as exc:
         _die(str(exc))
+
+    # Preference training measures a model against its own untuned self, and a
+    # model that has just been initialised has no such self worth measuring
+    # against — every answer is equally noise. Refused here rather than in the
+    # mixture layer, which cannot know that this is the from-scratch command.
+    preference = [name for name, info in resolved.datasets.items() if info.preference]
+    if preference:
+        _die(
+            f"{', '.join(preference)} holds preference pairs, and there is nothing to "
+            "prefer relative to in a model that starts from the initialiser.\n"
+            "Preference training refines a model that already answers; train or "
+            "fine-tune one first, then:\n"
+            f"  bloomery adapt --from <that checkpoint> --data {preference[0]} --name ..."
+        )
 
     tokenizer = resolved.tokenizer
 
@@ -663,6 +753,11 @@ def adapt(
     lora_r: int = typer.Option(16, "--lora-r", help="Adapter rank."),
     lora_alpha: int = typer.Option(32, "--lora-alpha", help="Adapter scaling."),
     lora_dropout: float = typer.Option(0.05, "--lora-dropout", help="Adapter dropout."),
+    beta: float = typer.Option(
+        0.1,
+        "--beta",
+        help="Preference data only: how tightly to hold to the untuned model.",
+    ),
     steps: int = typer.Option(200, "--steps", help="Optimizer steps."),
     batch: int = typer.Option(4, "--batch", help="Sequences per step."),
     seq: int = typer.Option(512, "--seq", help="Tokens per sequence."),
@@ -720,6 +815,7 @@ def adapt(
         LoraSettings,
         ModelLoadError,
         TrainConfig,
+        is_adapter_dir,
         load_model,
         trainable_fraction,
     )
@@ -744,6 +840,32 @@ def adapt(
         _die(str(exc))
     except FileNotFoundError as exc:
         _die(str(exc))
+
+    # Uniform across the blend: resolve() refuses a mixed one above.
+    preference = any(info.preference for info in resolved.datasets.values())
+    if preference:
+        if chosen is not Method.LORA:
+            _die(
+                "preference training needs --method lora.\n"
+                "The objective scores the model against its own untuned self, and "
+                "with LoRA that reference is the same weights with the adapters "
+                "switched off — no second copy. Training every weight would need "
+                "one, which doubles what has to fit in memory and is not supported "
+                "yet."
+            )
+        if Path(from_model).is_dir() and is_adapter_dir(Path(from_model)):
+            _die(
+                f"{from_model} holds LoRA adapters, and preference training cannot "
+                "start from one yet.\n"
+                "The reference it measures against is this model with its adapters "
+                "off — which for an adapter checkpoint is the model from before "
+                "those adapters were trained, not the model you are tuning. "
+                "Training against it would pull the model back toward undoing its "
+                "own fine-tuning.\n"
+                f"Fold them in first:  bloomery export --checkpoint {from_model} "
+                "--quantize f16\n"
+                "or point --from at a merged checkpoint."
+            )
 
     thread_limit(cores)
     choice = choose(device)
@@ -798,7 +920,14 @@ def adapt(
         save_every=save_every,
         seed=seed,
         gradient_checkpointing=grad_checkpoint,
+        dpo_beta=beta,
     )
+
+    # A preference step puts two sequences through the model for every pair — the
+    # chosen answer and the rejected one — so it costs what an ordinary step at
+    # twice the batch costs. One expression, used both to size the pre-flight and
+    # to report it, so the two cannot disagree.
+    sequences = batch * 2 if preference else batch
 
     train_tokens = sum(i.split("train").tokens for i in resolved.datasets.values())
     console.print(f"base       [bold]{from_model}[/bold]  {format_params(total)} params")
@@ -807,6 +936,11 @@ def adapt(
         f"{spec.vocab:,} vocab  [dim]{spec.key}[/dim]"
     )
     console.print(f"method     [bold]{chosen.label}[/bold]  [dim]lr {config.lr:g}[/dim]")
+    if preference:
+        console.print(
+            f"objective  [bold]preference[/bold]  [dim]beta {config.dpo_beta:g} · "
+            f"{sequences} sequences per step[/dim]"
+        )
     console.print(f"device     {choice.label()}  [dim]{choice.reason}[/dim]")
     console.print(
         f"data       {train_tokens:,} train tokens  "
@@ -825,7 +959,9 @@ def adapt(
         report,
         spec,
         method=chosen,
-        batch=batch,
+        # Sizing this at the nominal batch would approve a preference run that
+        # runs out of memory on step one.
+        batch=sequences,
         seq=seq,
         gradient_checkpointing=grad_checkpoint,
         device_type=choice.type,

@@ -53,13 +53,20 @@ train = [
     "safetensors>=0.4",
     "numpy>=1.26",
 ]
-# Adapting an existing model: LoRA, QLoRA, preference optimization. Heavier, and
-# not needed to train your first model, so it is a separate opt-in.
+# Adapting an existing model: LoRA and preference optimization. Heavier, and not
+# needed to train your first model, so it is a separate opt-in.
+#
+# No trl. Its DPOTrainer brings its own training loop, checkpoint layout and
+# metrics, which would go around run.jsonl, resume, the job queue, the live
+# event stream, the memory pre-flight and the forgetting tracker — the same
+# reasons this project does not use Trainer for anything else. The loss itself
+# is forty lines and lives in train/objective.py.
+#
+# No datasets either: preference and conversation corpora are read from JSONL by
+# bloomery.data.corpus, so it was never imported.
 adapt = [
     "accelerate>=0.34",
     "peft>=0.13",
-    "trl>=0.11",
-    "datasets>=3.0",
 ]
 serve = [
     "fastapi>=0.115",

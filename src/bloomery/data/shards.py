@@ -14,8 +14,8 @@ throughput we do not need and cost debuggability we do.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Iterator, Sized
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping, Sized
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,8 +32,17 @@ SPLITS = ("train", "val")
 
 # How a dataset is laid out. "packed" is a plain token stream, every token
 # trained on. "sft" carries a parallel byte per token saying whether it does.
+# "dpo" is not a stream at all: preference pairs have to stay whole, so they are
+# stored as three streams plus an index of where each example sits in them.
 FORMAT_PACKED = "packed"
 FORMAT_SFT = "sft"
+FORMAT_DPO = "dpo"
+
+# The parts of a preference example, in the order the index records their
+# lengths. The prompt is stored once rather than inside each answer: DPO only
+# means anything if both answers condition on a token-identical prompt, and one
+# copy makes that structural instead of a rule someone has to keep.
+PREFERENCE_PARTS = ("prompt", "chosen", "rejected")
 
 # The mask is one byte per token. uint8 rather than a bitfield because it is
 # read as a window alongside the tokens and the arithmetic stays obvious; at one
@@ -71,6 +80,11 @@ class DatasetInfo:
     # "packed" for a plain corpus, "sft" when a completion mask sits beside the
     # tokens. Defaulted so a dataset written before masking existed still loads.
     format: str = FORMAT_PACKED
+    # Why records did not make it in, by reason. Provenance rather than layout,
+    # and it belongs here because it is the question asked months later when a
+    # model underperforms and the corpus looks smaller than the file it came
+    # from. Empty for a format that drops nothing.
+    dropped: Mapping[str, int] = field(default_factory=dict)
 
     def split(self, name: str) -> SplitInfo:
         for info in self.splits:
@@ -86,14 +100,25 @@ class DatasetInfo:
     def masked(self) -> bool:
         return self.format == FORMAT_SFT
 
+    @property
+    def preference(self) -> bool:
+        return self.format == FORMAT_DPO
+
     def bin_path(self, name: str) -> Path:
         return self.root / f"{name}.bin"
 
     def mask_path(self, name: str) -> Path:
         return self.root / f"{name}.mask.bin"
 
+    def part_path(self, name: str, part: str) -> Path:
+        """Where one side of a preference split lives."""
+        return self.root / f"{name}.{part}.bin"
+
+    def index_path(self, name: str) -> Path:
+        return self.root / f"{name}.index.bin"
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "dtype": self.dtype,
             "vocab_size": self.vocab_size,
             "format": self.format,
@@ -101,6 +126,9 @@ class DatasetInfo:
                 {"name": s.name, "tokens": s.tokens, "documents": s.documents} for s in self.splits
             ],
         }
+        if self.dropped:
+            payload["dropped"] = dict(self.dropped)
+        return payload
 
 
 def _val_stride(
@@ -398,6 +426,201 @@ def build_sft_dataset(
     return info
 
 
+# Why a preference pair did not make it into the dataset. Recorded per reason
+# and not as one total, so that a corpus which came out smaller than its file
+# says which problem to go and look at.
+#
+# In practice this is the one that fires. A template that cannot be split at all
+# is caught by _response_spans, which raises for the whole corpus rather than
+# dropping pairs one at a time — that is a property of the tokenizer, not of any
+# single record.
+DROP_PROMPT_DIVERGED = "the prompt differed between the two answers"
+DROP_NO_ANSWER_TOKENS = "no answer tokens after the prompt"
+
+
+def encode_preference(
+    example: Any,
+    tokenizer: Tokenizer,
+    *,
+    eot: int,
+) -> tuple[tuple[list[int], list[int], list[int]] | None, str]:
+    """Encode one preference pair into prompt, chosen and rejected ids.
+
+    Returns the triple and an empty reason, or ``None`` and why not.
+
+    Each answer is rendered as a whole conversation and tokenized once, and the
+    prompt/answer boundary is then located in **character** space through
+    :func:`_response_spans` — the same reasoning as :func:`encode_conversations`,
+    and for the same reason: BPE merges across a join, so tokenizing the prompt
+    on its own gives a length that is not where that prompt ends inside the
+    whole. Splitting by that length would put the boundary a token or two off.
+
+    Then the invariant DPO actually rests on is checked rather than assumed: the
+    two renderings must produce identical prompt tokens. If they do not, the two
+    answers are being compared under different conditions and the pair is
+    dropped. The one stored prompt makes the invariant structural afterwards;
+    this is what establishes it in the first place.
+    """
+    chosen = _encode_side(tokenizer, example, example.chosen)
+    rejected = _encode_side(tokenizer, example, example.rejected)
+    if chosen is None or rejected is None:
+        # Defensive rather than expected: a template whose assistant turn cannot
+        # be located makes _response_spans raise for the corpus before it gets
+        # here. Without this, an empty span list would be an IndexError.
+        return None, DROP_NO_ANSWER_TOKENS
+
+    chosen_ids, chosen_prompt = chosen
+    rejected_ids, rejected_prompt = rejected
+    if chosen_ids[:chosen_prompt] != rejected_ids[:rejected_prompt]:
+        return None, DROP_PROMPT_DIVERGED
+
+    # The separator is part of the packing, not of the answer — but unlike the
+    # SFT path it is trained on here, because stopping where a good answer stops
+    # is part of what is being preferred.
+    chosen_answer = [*chosen_ids[chosen_prompt:], eot]
+    rejected_answer = [*rejected_ids[rejected_prompt:], eot]
+    return (chosen_ids[:chosen_prompt], chosen_answer, rejected_answer), ""
+
+
+def _encode_side(
+    tokenizer: Tokenizer,
+    example: Any,
+    content: str,
+) -> tuple[list[int], int] | None:
+    """One answer rendered in place, as ids plus how many of them are prompt."""
+    messages = [dict(turn) for turn in example.with_response(content)]
+    text = tokenizer.apply_chat_template(messages, tokenize=False)
+    spans = _response_spans(tokenizer, messages, text)
+    if not spans:
+        return None
+
+    # The last span is the answer just appended; earlier ones are assistant turns
+    # that were already part of the prompt.
+    start = spans[-1][0]
+    encoded = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    ids = list(encoded["input_ids"])
+    # A token straddling the boundary belongs to neither side cleanly. Counting
+    # it as prompt is what makes the divergence check above catch it, since the
+    # two answers would then differ inside that shared token.
+    prompt_length = sum(1 for _, b in encoded["offset_mapping"] if b <= start)
+    if prompt_length >= len(ids):
+        return None
+    return ids, prompt_length
+
+
+def build_preference_dataset(
+    examples: Iterable[Any],
+    tokenizer: Tokenizer,
+    *,
+    out_dir: Path,
+    eot: int,
+    val_fraction: float = 0.01,
+    min_val_documents: int = 1,
+) -> DatasetInfo:
+    """Pack preference pairs as three token streams and an index.
+
+    Not a single stream like the other two formats. A window sampled at random
+    out of a concatenation would cut across examples, and half of one pair
+    against half of another compares nothing. Each example has to stay whole, so
+    the index records the three lengths and the streams hold the tokens
+    back to back.
+    """
+    import numpy as np
+
+    if not 0.0 <= val_fraction < 1.0:
+        raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vocab = id_space(tokenizer)
+    dtype = dtype_for_vocab(vocab)
+    np_dtype = np.dtype(dtype)
+
+    stride = _val_stride(examples, val_fraction=val_fraction, min_val_documents=min_val_documents)
+
+    handles = {
+        (name, part): (out_dir / f"{name}.{part}.bin").open("wb")
+        for name in SPLITS
+        for part in PREFERENCE_PARTS
+    }
+    indexes = {name: (out_dir / f"{name}.index.bin").open("wb") for name in SPLITS}
+    counts = dict.fromkeys(SPLITS, 0)
+    seen = dict.fromkeys(SPLITS, 0)
+    dropped: dict[str, int] = {}
+
+    try:
+        position = 0
+        for example in examples:
+            encoded, reason = encode_preference(example, tokenizer, eot=eot)
+            if encoded is None:
+                dropped[reason] = dropped.get(reason, 0) + 1
+                continue
+            target = "val" if stride and (position + 1) % stride == 0 else "train"
+            position += 1
+            for part, ids in zip(PREFERENCE_PARTS, encoded, strict=True):
+                np.asarray(ids, dtype=np_dtype).tofile(handles[(target, part)])
+                counts[target] += len(ids)
+            np.asarray([len(ids) for ids in encoded], dtype=np.int64).tofile(indexes[target])
+            seen[target] += 1
+    finally:
+        for handle in (*handles.values(), *indexes.values()):
+            handle.close()
+
+    if seen["train"] == 0:
+        raise SftError(
+            "no preference pairs could be packed. Records need a prompt and two "
+            "different answers to it:\n"
+            '  {"prompt": ..., "chosen": ..., "rejected": ...}\n'
+            + (f"dropped: {dropped}" if dropped else "")
+        )
+    if val_fraction > 0 and seen["val"] < min_val_documents:
+        raise ValueError(
+            "corpus too small to hold out a validation split; add more pairs or pass val_fraction=0"
+        )
+
+    info = DatasetInfo(
+        root=out_dir,
+        dtype=dtype,
+        vocab_size=vocab,
+        format=FORMAT_DPO,
+        dropped=dropped,
+        splits=tuple(
+            SplitInfo(name=name, tokens=counts[name], documents=seen[name]) for name in SPLITS
+        ),
+    )
+    (out_dir / META_NAME).write_text(json.dumps(info.to_dict(), indent=2) + "\n")
+    return info
+
+
+def open_preference_split(info: DatasetInfo, name: str) -> tuple[dict[str, np.memmap], np.ndarray]:
+    """The three token streams of a preference split, and where each example sits.
+
+    The index is read whole rather than memory-mapped: it is three int64 per
+    example, so a corpus of a million pairs is 24 MB, and every draw needs
+    arbitrary rows of it. Returned as start offsets rather than lengths, since
+    that is what every caller wants and the cumulative sum should happen once.
+    """
+    import numpy as np
+
+    if not info.preference:
+        raise ValueError(f"{info.root} is a {info.format!r} dataset, not preference pairs")
+
+    index_path = info.index_path(name)
+    if not index_path.is_file():
+        raise FileNotFoundError(f"missing {index_path}")
+    lengths = np.fromfile(index_path, dtype=np.int64).reshape(-1, len(PREFERENCE_PARTS))
+
+    streams = {}
+    for part in PREFERENCE_PARTS:
+        path = info.part_path(name, part)
+        if not path.is_file():
+            raise FileNotFoundError(f"missing {path}")
+        streams[part] = np.memmap(path, dtype=np.dtype(info.dtype), mode="r")
+
+    starts = np.zeros_like(lengths)
+    starts[1:] = np.cumsum(lengths, axis=0)[:-1]
+    return streams, np.stack([starts, lengths], axis=-1)
+
+
 def load_dataset(root: Path) -> DatasetInfo:
     """Read the sidecar written by :func:`build_dataset`."""
     meta_path = root / META_NAME
@@ -411,6 +634,7 @@ def load_dataset(root: Path) -> DatasetInfo:
         # Defaulted, not indexed: every dataset prepared before masking existed
         # has no such key, and demanding one would break all of them at once.
         format=str(payload.get("format", FORMAT_PACKED)),
+        dropped={str(k): int(v) for k, v in (payload.get("dropped") or {}).items()},
         splits=tuple(
             SplitInfo(name=s["name"], tokens=int(s["tokens"]), documents=int(s["documents"]))
             for s in payload["splits"]

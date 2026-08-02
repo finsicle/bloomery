@@ -1270,6 +1270,238 @@ class TestSupervisedFineTuning:
         )
         assert result.exit_code == 0, plain(result.stdout)
 
+    def _pairs(self, path: Path, count: int = 60) -> Path:
+        path.write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "prompt": f"ask about {i}",
+                        "chosen": f"the careful reply concerning {i}",
+                        "rejected": f"nope {i}",
+                    }
+                )
+                for i in range(count)
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def _prepare_pairs(self, instruct: Path, tmp_path: Path, name: str = "pref") -> Any:
+        return _invoke(
+            "prepare",
+            "--name",
+            name,
+            "--source",
+            str(self._pairs(tmp_path / f"{name}.jsonl")),
+            "--preference",
+            "--tokenizer",
+            str(instruct),
+        )
+
+    def test_preference_pairs_pack_and_report_their_count(
+        self, instruct: Path, isolated_home: Path, tmp_path: Path
+    ) -> None:
+        result = self._prepare_pairs(instruct, tmp_path)
+        assert result.exit_code == 0, plain(result.stdout)
+        for part in ("prompt", "chosen", "rejected", "index"):
+            assert (isolated_home / f"datasets/pref/tokens/train.{part}.bin").is_file()
+        assert "pairs" in plain(result.stdout)
+
+    def test_adapt_trains_dpo_on_them_with_no_new_command(
+        self, instruct: Path, isolated_home: Path, tmp_path: Path
+    ) -> None:
+        """The same promise SFT keeps: the dataset carries the objective."""
+        assert self._prepare_pairs(instruct, tmp_path).exit_code == 0
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(instruct),
+            "--data",
+            "pref",
+            "--name",
+            "dpo",
+            # Enough steps to reach the default logging interval, and evaluation
+            # often enough that an eval event is actually emitted — otherwise the
+            # assertions below pass over an empty list.
+            "--steps",
+            "10",
+            "--eval-every",
+            "5",
+            "--batch",
+            "2",
+            "--seq",
+            "64",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        assert (isolated_home / "runs/dpo/latest/adapter_config.json").is_file()
+        output = plain(result.stdout)
+        assert "preference" in output, "the objective in play should be stated"
+        # Two sequences go through the model per pair, so the memory pre-flight
+        # is sized at twice the batch. Nominal sizing approves a run that dies on
+        # step one, and the same expression is what is reported here.
+        assert "4 sequences per step" in output
+
+        events = [
+            json.loads(line)
+            for line in (isolated_home / "runs/dpo/run.jsonl").read_text().splitlines()
+            if line.strip()
+        ]
+        steps = [e for e in events if e["event"] == "step"]
+        assert steps, "no step was logged"
+        for event in steps:
+            # The two keys the progress display indexes unconditionally.
+            assert "loss" in event and "tokens_per_second" in event
+            for key in ("reward_margin", "reward_accuracy", "reward_chosen", "reward_rejected"):
+                assert key in event, f"{key} missing from the step event"
+        evals = [e for e in events if e["event"] == "eval"]
+        assert evals, "no evaluation ran, so the assertion below proves nothing"
+        for event in evals:
+            # A preference loss is not a log-likelihood, so exp() of it is not a
+            # perplexity — and 2.0 is exactly what a fresh run would report.
+            assert event["perplexity"] is None
+            assert "val_reward_accuracy" in event
+
+    def test_full_weight_preference_training_is_refused_by_name(
+        self, instruct: Path, tmp_path: Path
+    ) -> None:
+        assert self._prepare_pairs(instruct, tmp_path).exit_code == 0
+        result = _invoke(
+            "adapt", "--from", str(instruct), "--data", "pref", "--name", "x", "--method", "full"
+        )
+        assert result.exit_code == 1
+        output = plain(result.stdout)
+        assert "--method lora" in output
+        assert "second copy" in output
+
+    def test_preference_training_from_an_adapter_checkpoint_is_refused(
+        self, instruct: Path, isolated_home: Path, tmp_path: Path
+    ) -> None:
+        """Its reference would be the model from before that adapter was trained.
+
+        Not a subtle degradation: the objective would pull the model back toward
+        undoing its own fine-tuning, while reporting a perfectly ordinary loss.
+        """
+        corpus = self._corpus(tmp_path / "chat.jsonl")
+        assert (
+            _invoke(
+                "prepare",
+                "--name",
+                "conv",
+                "--source",
+                str(corpus),
+                "--chat",
+                "--tokenizer",
+                str(instruct),
+            ).exit_code
+            == 0
+        )
+        assert (
+            _invoke(
+                "adapt",
+                "--from",
+                str(instruct),
+                "--data",
+                "conv",
+                "--name",
+                "sft",
+                "--steps",
+                "2",
+                "--batch",
+                "2",
+                "--seq",
+                "64",
+                "--device",
+                "cpu",
+            ).exit_code
+            == 0
+        )
+        assert self._prepare_pairs(instruct, tmp_path).exit_code == 0
+
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(isolated_home / "runs/sft/latest"),
+            "--data",
+            "pref",
+            "--name",
+            "y",
+        )
+        assert result.exit_code == 1
+        output = plain(result.stdout)
+        assert "adapters" in output
+        assert "export" in output, "the message should name the way out"
+
+    def test_blending_preference_pairs_with_prose_is_refused(
+        self, instruct: Path, tmp_path: Path
+    ) -> None:
+        """There is no row shape that is both, so a blend cannot be approximated."""
+        assert self._prepare_pairs(instruct, tmp_path).exit_code == 0
+        assert (
+            _invoke(
+                "prepare", "--name", "prose", "--synthetic", "400", "--tokenizer", str(instruct)
+            ).exit_code
+            == 0
+        )
+        assert (
+            _invoke(
+                "mix", "create", "--name", "mixed", "--add", "pref:0.5", "--add", "prose:0.5"
+            ).exit_code
+            == 0
+        )
+        result = _invoke("adapt", "--from", str(instruct), "--mix", "mixed", "--name", "z")
+        assert result.exit_code == 1
+        assert "preference pairs with ordinary text" in plain(result.stdout)
+
+    def test_training_from_scratch_on_preference_pairs_is_refused(
+        self, instruct: Path, tmp_path: Path
+    ) -> None:
+        """There is nothing to be preferred relative to yet."""
+        assert self._prepare_pairs(instruct, tmp_path).exit_code == 0
+        result = _invoke("train", "--data", "pref", "--name", "scratch", "--depth", "1")
+        assert result.exit_code == 1
+        assert "preference" in plain(result.stdout)
+
+    def test_preference_data_sent_to_the_plain_path_says_what_it_is(self, tmp_path: Path) -> None:
+        result = _invoke(
+            "prepare", "--name", "oops", "--source", str(self._pairs(tmp_path / "p.jsonl", 5))
+        )
+        assert result.exit_code == 1
+        output = plain(result.stdout)
+        assert "preference data" in output
+        assert "--preference" in output
+
+    def test_each_flag_names_the_other_when_handed_the_other_s_data(
+        self, instruct: Path, tmp_path: Path
+    ) -> None:
+        """Both directions, or one shape is left to be told from the other by eye."""
+        as_chat = _invoke(
+            "prepare",
+            "--name",
+            "a",
+            "--source",
+            str(self._pairs(tmp_path / "p.jsonl", 5)),
+            "--chat",
+            "--tokenizer",
+            str(instruct),
+        )
+        assert as_chat.exit_code == 1
+        assert "--preference" in plain(as_chat.stdout)
+
+        as_preference = _invoke(
+            "prepare",
+            "--name",
+            "b",
+            "--source",
+            str(self._corpus(tmp_path / "c.jsonl", 5)),
+            "--preference",
+            "--tokenizer",
+            str(instruct),
+        )
+        assert as_preference.exit_code == 1
+        assert "--chat" in plain(as_preference.stdout)
+
     def test_chat_prompts_through_the_template_it_was_trained_with(
         self, instruct: Path, tmp_path: Path
     ) -> None:
