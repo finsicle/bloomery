@@ -121,19 +121,22 @@ class TestBatchSampler:
     def test_shapes_and_dtype(self, dataset: Any, cpu_choice: DeviceChoice) -> None:
         sampler = BatchSampler(dataset, "train", seq=32, seed=0)
         batch = sampler.batch(4, cpu_choice.device)
-        assert tuple(batch.shape) == (4, 32)
-        assert batch.dtype.is_signed  # int64, as the embedding layer requires
+        assert tuple(batch["input_ids"].shape) == (4, 32)
+        assert batch["input_ids"].dtype.is_signed  # int64, as the embedding layer requires
+        # A plain corpus has nothing masked, so the labels are the inputs. This
+        # is what keeps pretraining bit-identical now that labels are carried.
+        assert batch["labels"].equal(batch["input_ids"])
 
     def test_ids_are_in_vocab_range(self, dataset: Any, cpu_choice: DeviceChoice) -> None:
         sampler = BatchSampler(dataset, "train", seq=32, seed=0)
-        batch = sampler.batch(8, cpu_choice.device)
+        batch = sampler.batch(8, cpu_choice.device)["input_ids"]
         assert int(batch.max()) < dataset.vocab_size
         assert int(batch.min()) >= 0
 
     def test_seeded_sampling_is_reproducible(self, dataset: Any, cpu_choice: DeviceChoice) -> None:
         first = BatchSampler(dataset, "train", seq=16, seed=42).batch(4, cpu_choice.device)
         second = BatchSampler(dataset, "train", seq=16, seed=42).batch(4, cpu_choice.device)
-        assert first.equal(second)
+        assert first["input_ids"].equal(second["input_ids"])
 
     def test_rejects_seq_longer_than_the_split(self, dataset: Any) -> None:
         with pytest.raises(ValueError, match="not enough"):
@@ -724,3 +727,215 @@ class TestAdapterTraining:
 
         with pytest.raises(ModelLoadError, match="could not load a model"):
             load_model(tmp_path / "nothing")
+
+
+class TestTrainedTokensSurviveResume:
+    """The counter that says what the loss was computed over.
+
+    Its sibling tokens_seen is cumulative across a resume; if this one restarts
+    at zero, a resumed run reports a fraction of what it trained on, and the two
+    numbers contradict each other in the same file.
+    """
+
+    def test_the_checkpoint_carries_it(self, tmp_path: Path, tokenizer: Any) -> None:
+        import torch
+
+        from bloomery.train import checkpoint as ckpt
+
+        spec = spec_from_depth(1, vocab=64, seq=16)
+        model = build_model(spec, eos_token_id=0, seed=0)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        directory = ckpt.save(
+            tmp_path / "ckpt",
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            step=10,
+            tokens_seen=5000,
+            trained_tokens=1234,
+            best_val_loss=None,
+        )
+        assert ckpt.load_resume_state(directory).trained_tokens == 1234
+        assert json.loads((directory / "run.json").read_text())["trained_tokens"] == 1234
+
+    def test_a_checkpoint_from_before_masking_falls_back_to_the_window(
+        self, tmp_path: Path
+    ) -> None:
+        """Every token was trained on then, so the window count is the honest total.
+
+        Restarting at zero would make a resumed old run look like it had learned
+        from almost nothing.
+        """
+        import torch
+
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "old"
+        directory.mkdir()
+        torch.save(
+            {"step": 7, "tokens_seen": 4096, "best_val_loss": None},
+            directory / ckpt.TRAINER_STATE,
+        )
+        assert ckpt.load_resume_state(directory).trained_tokens == 4096
+
+
+class TestWindowsAlwaysCarryLoss:
+    """A window holding nothing but ignored positions scores a mean over an
+    empty set, which is NaN. It does not corrupt the gradient — that arrives as
+    zeros — but it does reach the reported loss, run.jsonl and the final result,
+    where it reads as a diverged model rather than an unlucky draw.
+
+    One prompt longer than the sequence length is enough to produce one.
+    """
+
+    def _dataset(self, tmp_path: Path, *, prompt_tokens: int, seq: int) -> Any:
+        """A corpus whose prompts are far longer than the window."""
+        import numpy as np
+
+        from bloomery.data.shards import FORMAT_SFT, META_NAME, DatasetInfo, SplitInfo
+
+        root = tmp_path / "sparse"
+        root.mkdir()
+        reply = 4
+        ids, mask = [], []
+        # Ids stay inside the vocabulary the test model is built with.
+        for _ in range(40):
+            ids.extend((i % 60) + 1 for i in range(prompt_tokens))
+            mask.extend([0] * prompt_tokens)
+            ids.extend((i % 60) + 1 for i in range(reply))
+            mask.extend([1] * reply)
+
+        np.asarray(ids, dtype=np.uint16).tofile(root / "train.bin")
+        np.asarray(mask, dtype=np.uint8).tofile(root / "train.mask.bin")
+        info = DatasetInfo(
+            root=root,
+            dtype="uint16",
+            vocab_size=64,
+            format=FORMAT_SFT,
+            splits=(SplitInfo(name="train", tokens=len(ids), documents=40),),
+        )
+        (root / META_NAME).write_text(json.dumps(info.to_dict()), encoding="utf-8")
+        return info
+
+    def test_every_window_has_something_to_learn_from(
+        self, tmp_path: Path, cpu_choice: DeviceChoice
+    ) -> None:
+        """Prompts eight times the window length: a naive draw lands in one often."""
+        from bloomery.train.loop import IGNORE_INDEX, BatchSampler
+
+        info = self._dataset(tmp_path, prompt_tokens=128, seq=16)
+        sampler = BatchSampler(info, "train", seq=16, seed=0)
+
+        for _ in range(40):
+            labels = sampler.batch(4, cpu_choice.device)["labels"]
+            per_row = (labels != IGNORE_INDEX).sum(dim=1)
+            assert int(per_row.min()) > 0, "a window came back with nothing supervised"
+
+    def test_the_loss_of_such_a_batch_is_finite(
+        self, tmp_path: Path, cpu_choice: DeviceChoice
+    ) -> None:
+        """The property that actually matters: the number reaching the user."""
+        import torch
+
+        from bloomery.train.loop import BatchSampler
+
+        info = self._dataset(tmp_path, prompt_tokens=128, seq=16)
+        model = build_model(spec_from_depth(1, vocab=64, seq=16), eos_token_id=0, seed=0)
+        sampler = BatchSampler(info, "train", seq=16, seed=1)
+
+        for _ in range(20):
+            with torch.no_grad():
+                loss = model(**sampler.batch(1, cpu_choice.device)).loss
+            assert torch.isfinite(loss), "an all-masked window produced a NaN loss"
+
+    def test_an_all_masked_window_would_have_been_nan(
+        self, tmp_path: Path, cpu_choice: DeviceChoice
+    ) -> None:
+        """Pins why the resampling is there, rather than trusting the comment."""
+        import torch
+
+        from bloomery.train.loop import IGNORE_INDEX
+
+        model = build_model(spec_from_depth(1, vocab=64, seq=16), eos_token_id=0, seed=0)
+        ids = torch.randint(0, 64, (1, 16))
+        with torch.no_grad():
+            loss = model(input_ids=ids, labels=torch.full_like(ids, IGNORE_INDEX)).loss
+        assert torch.isnan(loss)
+
+
+class TestSkippedMicrobatchesAreVisible:
+    """Dropping a non-finite microbatch protects the reported loss from an
+    unplaceable window. It must not also hide a diverging run.
+
+    Before the guard existed, divergence — fp16 overflow, a learning rate far
+    too high — left a NaN in the reported loss where a person would see it.
+    Skipping silently would make a run that diverges every step look like a
+    healthy one with a slightly smaller batch.
+    """
+
+    def _run(
+        self,
+        dataset: Any,
+        tmp_path: Path,
+        cpu_choice: DeviceChoice,
+        tokenizer: Any,
+        **overrides: Any,
+    ) -> Any:
+        from bloomery.mixture import single
+        from bloomery.train.loop import TrainConfig
+        from bloomery.train.loop import train as run_training
+
+        spec = spec_from_depth(1, vocab=dataset.vocab_size, seq=32)
+        config = TrainConfig(steps=2, batch=2, seq=32, eval_every=0, log_every=1, **overrides)
+        return run_training(
+            spec=spec,
+            datasets={"d": dataset},
+            mixture=single("d"),
+            tokenizer=tokenizer,
+            run_dir=tmp_path / "run",
+            config=config,
+            choice=cpu_choice,
+            eos_token_id=0,
+        )
+
+    def test_a_healthy_run_skips_nothing(
+        self, dataset: Any, tmp_path: Path, cpu_choice: DeviceChoice, tokenizer: Any
+    ) -> None:
+        result = self._run(dataset, tmp_path, cpu_choice, tokenizer)
+        assert result.skipped_microbatches == 0
+        assert math.isfinite(result.final_loss)
+
+    def test_the_count_reaches_run_jsonl(
+        self, dataset: Any, tmp_path: Path, cpu_choice: DeviceChoice, tokenizer: Any
+    ) -> None:
+        """A number nobody can read is not a signal."""
+        self._run(dataset, tmp_path, cpu_choice, tokenizer)
+        events = [
+            json.loads(line) for line in (tmp_path / "run" / "run.jsonl").read_text().splitlines()
+        ]
+        steps = [e for e in events if e["event"] == "step"]
+        done = [e for e in events if e["event"] == "done"]
+        assert steps and "skipped_microbatches" in steps[0]
+        assert done and "skipped_microbatches" in done[0]
+
+    def test_a_step_that_scored_nothing_does_not_report_a_perfect_loss(self) -> None:
+        """The accumulator starts at 0.0, and 0.0 reads as a flawless model.
+
+        Reporting that would be worse than the NaN the guard replaced: a NaN
+        says something broke, a zero says the run went perfectly.
+        """
+        import torch
+
+        step_loss = 0.0
+        contributed = 0
+        for scaled in (torch.tensor(float("nan")), torch.tensor(float("nan"))):
+            if not torch.isfinite(scaled):
+                continue
+            step_loss += float(scaled)
+            contributed += 1
+
+        # What the loop does with that state.
+        reported = step_loss if contributed else float("nan")
+        assert contributed == 0
+        assert math.isnan(reported), "an unscored step must not look like a perfect one"

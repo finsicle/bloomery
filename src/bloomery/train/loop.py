@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from bloomery.arch import suggested_lr, to_llama_config
 from bloomery.capability import ModelSpec
-from bloomery.data.shards import DatasetInfo, open_split
+from bloomery.data.shards import DatasetInfo, open_mask, open_split
 from bloomery.mixture import Mixture
 from bloomery.train import checkpoint
 from bloomery.train.device import DeviceChoice
@@ -36,6 +36,15 @@ from bloomery.train.mixing import (  # noqa: E402 - ordering explained above
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
+
+# What torch's cross-entropy skips. Positions carrying this contribute nothing to
+# the loss, which is how a prompt is excluded from what the model is scored on.
+IGNORE_INDEX = -100
+
+# A batch is a mapping so it can be splatted straight into the model and
+# concatenated generically across a blend's components. Naming it keeps the two
+# call sites and the samplers honest about what they exchange.
+Batch = dict[str, "torch.Tensor"]
 
 
 @dataclass(slots=True)
@@ -75,6 +84,12 @@ class TrainResult:
     best_val_loss: float | None
     tokens_seen: int
     tokens_per_second: float
+    # Tokens the loss was actually computed over. Equal to tokens_seen for a
+    # plain corpus; a fraction of it once a completion mask is in play.
+    trained_tokens: int = 0
+    # Microbatches dropped for a non-finite loss, whether an unplaceable
+    # window or a diverging run.
+    skipped_microbatches: int = 0
     history: list[dict[str, Any]] = field(default_factory=list)
     # Last measured validation loss per blend component, and any component that
     # ended worse than its own best. Empty for a single-dataset run with no
@@ -242,20 +257,116 @@ class BatchSampler:
                 f"sequence length of {seq}. Use a shorter --seq or a larger corpus."
             )
         self._length = length
+        self._supervised_blocks = self._index_supervision(info, split, seq)
+
+    @staticmethod
+    def _index_supervision(info: DatasetInfo, split: str, seq: int) -> Any | None:
+        """Where in a masked corpus a window is guaranteed to find something.
+
+        Which windows carry a loss cannot be answered by redrawing and hoping:
+        with prompts several times the sequence length, most draws land in one,
+        and a bounded number of retries leaves a real chance of returning a
+        window with nothing supervised in it at all.
+
+        So the offsets that do work are recorded once. One entry per window-sized
+        block rather than per token — for a corpus of a billion tokens at a
+        sequence length of 512, two million entries instead of a billion — and
+        the mask is walked in chunks so indexing it never holds the whole thing.
+        """
+        import numpy as np
+
+        mask = open_mask(info, split)
+        if mask is None:
+            return None
+
+        blocks = len(mask) // seq
+        if blocks == 0:
+            return None
+
+        # Chunked so a large corpus is not materialised to build its own index.
+        per_chunk = max(1, (1 << 22) // seq)
+        flags: list[Any] = []
+        for start in range(0, blocks, per_chunk):
+            stop = min(start + per_chunk, blocks)
+            window = np.asarray(mask[start * seq : stop * seq]).reshape(stop - start, seq)
+            flags.append(window.any(axis=1))
+        usable = np.flatnonzero(np.concatenate(flags)) * seq
+
+        if usable.size == 0:
+            raise ValueError(
+                f"split {split!r} has no window of {seq} tokens containing anything to "
+                "learn from — every response is shorter than the gap between them. "
+                "Use a shorter --seq, or check that the corpus was packed against the "
+                "right chat template."
+            )
+        return usable
 
     @property
     def tokens(self) -> int:
         return self._length
 
-    def batch(self, size: int, device: torch.device) -> torch.Tensor:
+    def batch(self, size: int, device: torch.device) -> Batch:
+        """One batch of windows, with the labels to score them against.
+
+        For a plain corpus the labels *are* the inputs, which is what next-token
+        prediction means and what this returned before there was anything else.
+        For a conversation corpus the prompt positions carry ``IGNORE_INDEX``, so
+        the loss counts only what the model was meant to produce.
+
+        The labels are deliberately not shifted. The model does that internally,
+        so a shifted label tensor here would move the mask a position away from
+        the token it belongs to.
+
+        A window holding no supervised token at all is redrawn. One prompt longer
+        than the sequence length is enough to produce one — and cross-entropy
+        over nothing but ignored positions is a mean of an empty set, which comes
+        back NaN. That NaN is not caught by the gradient (it arrives as zeros) but
+        it does reach the reported loss, run.jsonl and the final result, where it
+        looks like a diverged model rather than an unlucky draw.
+        """
         import numpy as np
         import torch
 
         data = open_split(self._info, self._split)
+        mask = open_mask(self._info, self._split)
+
         starts = self._rng.integers(0, self._length - self._seq - 1, size=size)
+        if mask is not None:
+            starts = self._with_supervision(mask, starts)
+
         window = np.stack([data[i : i + self._seq] for i in starts]).astype(np.int64)
-        tensor = torch.from_numpy(window)
-        return tensor.to(device, non_blocking=True)
+        inputs = torch.from_numpy(window).to(device, non_blocking=True)
+
+        if mask is None:
+            return {"input_ids": inputs, "labels": inputs}
+
+        keep = np.stack([mask[i : i + self._seq] for i in starts]).astype(bool)
+        labels = np.where(keep, window, IGNORE_INDEX)
+        return {
+            "input_ids": inputs,
+            "labels": torch.from_numpy(labels).to(device, non_blocking=True),
+        }
+
+    def _with_supervision(self, mask: Any, starts: Any) -> Any:
+        """Replace any window that would carry no loss at all.
+
+        The uniform draw stays the normal path, so ordinary sampling is unchanged
+        and windows are not biased toward responses. Only a barren row is moved,
+        and it is moved onto a recorded offset rather than redrawn — a redraw
+        might land in another prompt, and with prompts several times the sequence
+        length it usually would.
+        """
+        import numpy as np
+
+        if self._supervised_blocks is None:  # pragma: no cover - masked implies an index
+            return starts
+
+        barren = np.array([not mask[i : i + self._seq].any() for i in starts], dtype=bool)
+        if not barren.any():
+            return starts
+
+        replacements = self._rng.choice(self._supervised_blocks, size=len(starts))
+        return np.where(barren, replacements, starts)
 
 
 def lr_at(step: int, config: TrainConfig, peak: float) -> float:
@@ -301,9 +412,9 @@ def evaluate(
     counted = 0
     with torch.no_grad():
         for _ in range(batches):
-            inputs = sampler.batch(batch, choice.device)
+            drawn = sampler.batch(batch, choice.device)
             with autocast_for(choice):
-                loss = model(input_ids=inputs, labels=inputs).loss
+                loss = model(**drawn).loss
             if torch.isfinite(loss):
                 total += loss.item()
                 counted += 1
@@ -391,12 +502,23 @@ def train(
 
     start_step = 0
     tokens_seen = 0
+    # Distinct from tokens_seen, which counts the window. Under a completion
+    # mask most of the window is prompt, and reporting that as tokens learned
+    # from would overstate the run several-fold. run.jsonl is a published
+    # contract, so this is a new number rather than a quiet redefinition.
+    trained_tokens = 0
+    # Microbatches dropped for a non-finite loss. Published because the two
+    # causes look identical from inside the loop and very different from
+    # outside: an occasional drop is an unlucky window, a persistent one is a
+    # diverging run that would otherwise be invisible.
+    skipped_microbatches = 0
     best_val: float | None = None
     resume_state: checkpoint.ResumeState | None = None
     if resume_from is not None:
         resume_state = checkpoint.load_resume_state(resume_from, optimizer)
         start_step = resume_state.step
         tokens_seen = resume_state.tokens_seen
+        trained_tokens = resume_state.trained_tokens
         best_val = resume_state.best_val_loss
 
     # fp16 needs loss scaling to keep small gradients from flushing to zero.
@@ -467,28 +589,54 @@ def train(
             began = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
+            contributed = 0
 
             for _ in range(config.grad_accum):
-                inputs = train_sampler.batch(config.batch, choice.device)
+                drawn = train_sampler.batch(config.batch, choice.device)
                 with autocast_for(choice):
-                    loss = model(input_ids=inputs, labels=inputs).loss
+                    loss = model(**drawn).loss
                     # Average over accumulation so the gradient matches what a
                     # single large batch would have produced.
                     scaled = loss / config.grad_accum
+                if not torch.isfinite(scaled):
+                    # Usually a window the sampler could not place on anything
+                    # supervised, where the score is a mean over an empty set.
+                    # But a diverging run reaches here too — fp16 overflow, a
+                    # learning rate far too high — and that used to be visible as
+                    # a NaN in the reported loss. Skipping without counting would
+                    # make a run that diverges every step look like a healthy one
+                    # with a slightly smaller batch, so the count is published.
+                    skipped_microbatches += 1
+                    continue
                 scaler.scale(scaled).backward()
                 step_loss += scaled.item()
+                contributed += 1
+                # What the loss was actually computed over. With a conversation
+                # corpus most of the window is prompt, so the window size stops
+                # describing what the model learned from.
+                trained_tokens += int((drawn["labels"] != IGNORE_INDEX).sum().item())
 
-            if config.grad_clip > 0:
-                # Unscale first, or the clip threshold is applied to inflated
-                # fp16 gradients and does nothing.
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            if contributed:
+                if config.grad_clip > 0:
+                    # Unscale first, or the clip threshold is applied to inflated
+                    # fp16 gradients and does nothing.
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
 
-            scaler.step(optimizer)
-            scaler.update()
+                scaler.step(optimizer)
+                scaler.update()
+                final_loss = step_loss
+            else:
+                # Nothing was scored, so there is nothing to step on: the
+                # gradients are the zeros from zero_grad, and stepping them
+                # applies weight decay for no reason. Reporting a loss of 0.0
+                # here — which is what an untouched accumulator holds — would be
+                # worse than the NaN this guard replaced, because it reads as a
+                # perfect model rather than a broken step.
+                step_loss = float("nan")
+                final_loss = step_loss
 
             tokens_seen += config.tokens_per_step
-            final_loss = step_loss
             rate = throughput.update(config.tokens_per_step, time.perf_counter() - began)
 
             if config.log_every and (step + 1) % config.log_every == 0:
@@ -499,6 +647,8 @@ def train(
                         loss=round(step_loss, 5),
                         lr=round(lr, 8),
                         tokens=tokens_seen,
+                        trained_tokens=trained_tokens,
+                        skipped_microbatches=skipped_microbatches,
                         tokens_per_second=round(rate, 1),
                     )
                 )
@@ -550,6 +700,7 @@ def train(
                     optimizer=optimizer,
                     step=step + 1,
                     tokens_seen=tokens_seen,
+                    trained_tokens=trained_tokens,
                     best_val_loss=best_val,
                     component_best=dict(tracker.best),
                     component_first=dict(tracker.first),
@@ -568,6 +719,7 @@ def train(
             optimizer=optimizer,
             step=config.steps,
             tokens_seen=tokens_seen,
+            trained_tokens=trained_tokens,
             best_val_loss=best_val,
             component_best=dict(tracker.best),
             component_first=dict(tracker.first),
@@ -585,6 +737,12 @@ def train(
                 final_loss=round(final_loss, 5),
                 best_val_loss=round(best_val, 5) if best_val is not None else None,
                 tokens=tokens_seen,
+                # Distinct from `tokens`, which counts the window. Under a
+                # completion mask most of that window is prompt, so publishing
+                # only the window overstates the run several-fold — which is the
+                # whole reason this counter exists.
+                trained_tokens=trained_tokens,
+                skipped_microbatches=skipped_microbatches,
                 tokens_per_second=round(throughput.value or 0.0, 1),
                 checkpoint=str(final_path),
                 per_component={k: round(v, 5) for k, v in tracker.best.items()} or None,
@@ -603,6 +761,8 @@ def train(
         final_loss=final_loss,
         best_val_loss=best_val,
         tokens_seen=tokens_seen,
+        trained_tokens=trained_tokens,
+        skipped_microbatches=skipped_microbatches,
         tokens_per_second=throughput.value or 0.0,
         history=history,
         per_component_loss=last_per_component,

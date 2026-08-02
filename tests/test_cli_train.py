@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from _helpers import plain
@@ -1034,3 +1035,259 @@ class TestAdapt:
         ]
         finished = [e["step"] for e in events if e["event"] == "done"]
         assert finished == [4, 8], finished
+
+
+class TestSupervisedFineTuning:
+    """SFT has no command of its own: the dataset carries the objective.
+
+    `prepare --chat` writes a completion mask, and `adapt` trains on it exactly
+    as it trains on anything else.
+    """
+
+    TEMPLATE = (
+        "{% for m in messages %}<|{{ m['role'] }}|>\n{{ m['content'] }}<|end|>\n{% endfor %}"
+        "{% if add_generation_prompt %}<|assistant|>\n{% endif %}"
+    )
+
+    @pytest.fixture
+    def instruct(self, isolated_home: Path) -> Path:
+        """A checkpoint whose tokenizer knows how a conversation is laid out."""
+        from transformers import AutoTokenizer
+
+        assert (
+            _invoke("prepare", "--name", "c", "--synthetic", "500", "--vocab", "400").exit_code == 0
+        )
+        assert (
+            _invoke(
+                "train",
+                "--data",
+                "c",
+                "--name",
+                "b",
+                "--depth",
+                "1",
+                "--steps",
+                "2",
+                "--batch",
+                "4",
+                "--seq",
+                "32",
+                "--device",
+                "cpu",
+            ).exit_code
+            == 0
+        )
+        checkpoint = isolated_home / "runs/b/latest"
+        tokenizer = AutoTokenizer.from_pretrained(str(checkpoint))
+        tokenizer.chat_template = self.TEMPLATE
+        tokenizer.save_pretrained(str(checkpoint))
+        return checkpoint
+
+    def _corpus(self, path: Path, count: int = 60) -> Path:
+        path.write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": f"ask about {i}"},
+                            {"role": "assistant", "content": f"the reply concerning {i} is here"},
+                        ]
+                    }
+                )
+                for i in range(count)
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_packs_a_masked_dataset_and_says_how_much(
+        self, instruct: Path, isolated_home: Path, tmp_path: Path
+    ) -> None:
+        corpus = self._corpus(tmp_path / "chat.jsonl")
+        result = _invoke(
+            "prepare",
+            "--name",
+            "conv",
+            "--source",
+            str(corpus),
+            "--chat",
+            "--tokenizer",
+            str(instruct),
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        assert (isolated_home / "datasets/conv/tokens/train.mask.bin").is_file()
+        # The share is the number that tells a user their data was understood.
+        assert "responses" in plain(result.stdout)
+
+    def test_adapt_trains_on_it_with_no_new_command(
+        self, instruct: Path, isolated_home: Path, tmp_path: Path
+    ) -> None:
+        corpus = self._corpus(tmp_path / "chat.jsonl")
+        assert (
+            _invoke(
+                "prepare",
+                "--name",
+                "conv",
+                "--source",
+                str(corpus),
+                "--chat",
+                "--tokenizer",
+                str(instruct),
+            ).exit_code
+            == 0
+        )
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(instruct),
+            "--data",
+            "conv",
+            "--name",
+            "sft",
+            "--steps",
+            "4",
+            "--batch",
+            "2",
+            "--seq",
+            "64",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        assert (isolated_home / "runs/sft/latest/adapter_config.json").is_file()
+
+    def test_chat_data_sent_to_the_plain_path_says_what_it_is(
+        self, isolated_home: Path, tmp_path: Path
+    ) -> None:
+        """It used to read as zero documents and die naming neither cause nor fix."""
+        corpus = self._corpus(tmp_path / "chat.jsonl", count=5)
+        result = _invoke("prepare", "--name", "oops", "--source", str(corpus))
+        assert result.exit_code == 1
+        output = plain(result.stdout)
+        assert "conversation data" in output
+        assert "--chat" in output
+
+    def test_chat_needs_the_model_it_is_for(self, tmp_path: Path) -> None:
+        corpus = self._corpus(tmp_path / "chat.jsonl", count=5)
+        result = _invoke("prepare", "--name", "x", "--source", str(corpus), "--chat")
+        assert result.exit_code == 1
+        assert "--tokenizer" in plain(result.stdout)
+
+    def test_a_blend_of_conversations_and_prose_trains(
+        self, instruct: Path, isolated_home: Path, tmp_path: Path
+    ) -> None:
+        """Replay against forgetting: the prose half is trained on in full.
+
+        This is why the mask lives in the dataset rather than in a command — a
+        component with no mask simply has none.
+        """
+        corpus = self._corpus(tmp_path / "chat.jsonl")
+        assert (
+            _invoke(
+                "prepare",
+                "--name",
+                "conv",
+                "--source",
+                str(corpus),
+                "--chat",
+                "--tokenizer",
+                str(instruct),
+            ).exit_code
+            == 0
+        )
+        assert (
+            _invoke(
+                "prepare",
+                "--name",
+                "prose",
+                "--synthetic",
+                "400",
+                "--tokenizer",
+                str(instruct),
+            ).exit_code
+            == 0
+        )
+        assert (
+            _invoke(
+                "mix", "create", "--name", "both", "--add", "conv:0.7", "--replay", "prose:0.3"
+            ).exit_code
+            == 0
+        )
+        result = _invoke(
+            "adapt",
+            "--from",
+            str(instruct),
+            "--mix",
+            "both",
+            "--name",
+            "blended",
+            "--steps",
+            "4",
+            "--batch",
+            "2",
+            "--seq",
+            "64",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+
+    def test_chat_prompts_through_the_template_it_was_trained_with(
+        self, instruct: Path, tmp_path: Path
+    ) -> None:
+        """Asked as plain text, a fine-tuned model is asked in a shape it never saw."""
+        from bloomery.generate import as_prompted, load
+
+        loaded = load(instruct, device="cpu")
+        templated = as_prompted(loaded.tokenizer, "hello")
+        assert "<|user|>" in templated and "<|assistant|>" in templated
+        assert as_prompted(loaded.tokenizer, "hello", raw=True) == "hello"
+
+    def test_the_raw_flag_reaches_generation(self, instruct: Path) -> None:
+        """Exercised through the command, not through as_prompted alone.
+
+        The unit test above proves the templating function is right; it says
+        nothing about whether `chat` still passes the flag to it. Both call
+        sites can be dropped in a refactor with every other test still green.
+        """
+        import bloomery.generate as generate_module
+
+        seen: list[bool] = []
+        real = generate_module.complete
+
+        def record(loaded, prompt, config=None, *, raw=False):  # noqa: ANN001, ANN202
+            seen.append(raw)
+            return real(loaded, prompt, config, raw=raw)
+
+        with mock.patch.object(generate_module, "complete", record):
+            assert (
+                _invoke(
+                    "chat",
+                    "--checkpoint",
+                    str(instruct),
+                    "--prompt",
+                    "hello",
+                    "--max-new-tokens",
+                    "2",
+                    "--device",
+                    "cpu",
+                    "--raw",
+                ).exit_code
+                == 0
+            )
+            assert (
+                _invoke(
+                    "chat",
+                    "--checkpoint",
+                    str(instruct),
+                    "--prompt",
+                    "hello",
+                    "--max-new-tokens",
+                    "2",
+                    "--device",
+                    "cpu",
+                ).exit_code
+                == 0
+            )
+
+        assert seen == [True, False], seen

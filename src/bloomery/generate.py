@@ -79,7 +79,36 @@ def load(checkpoint: Path, *, device: str | None = None) -> LoadedModel:
     return LoadedModel(model=model, tokenizer=tokenizer, device=resolved)
 
 
-def complete(loaded: LoadedModel, prompt: str, config: SamplingConfig | None = None) -> str:
+def as_prompted(tokenizer: Any, prompt: str, *, raw: bool = False) -> str:
+    """The text to actually feed the model for this prompt.
+
+    A model fine-tuned on conversations was shown its tokenizer's chat template:
+    role markers, turn separators, and a cue that the assistant speaks next.
+    Handing it a bare string asks it in a shape it never saw during training,
+    and the reply degrades in a way that reads as a bad model rather than a
+    formatting mistake.
+
+    So the template is applied whenever the checkpoint carries one. ``raw``
+    bypasses it, for looking at what the underlying model does with plain text.
+    """
+    if raw or getattr(tokenizer, "chat_template", None) is None:
+        return prompt
+    return str(
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    )
+
+
+def complete(
+    loaded: LoadedModel,
+    prompt: str,
+    config: SamplingConfig | None = None,
+    *,
+    raw: bool = False,
+) -> str:
     """Continue a prompt, returning only the newly generated text."""
     import torch
 
@@ -88,6 +117,7 @@ def complete(loaded: LoadedModel, prompt: str, config: SamplingConfig | None = N
         torch.manual_seed(config.seed)
 
     tokenizer = loaded.tokenizer
+    prompt = as_prompted(tokenizer, prompt, raw=raw)
     encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     encoded = {k: v.to(loaded.device) for k, v in encoded.items()}
     prompt_length = encoded["input_ids"].shape[1]

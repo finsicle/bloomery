@@ -60,7 +60,11 @@ libraries. There is nothing that is both.
 | LLaMA-Factory          |      ❌       |           ✅           |    ✅     |     ✅     |
 | Oumi                   |      ✅       |           ✅           |    ✅     |     ❌     |
 | nanochat               |      ✅       |           ✅           |    ✅     |     ❌     |
-| **bloomery**           |    **✅**     |        **✅**         |   M4.1   |  **✅**   |
+| **bloomery**           |    **✅**     |        **✅**         |    ~     |  **✅**   |
+
+Bloomery's `SFT / RL` is a tilde deliberately: supervised fine-tuning works,
+preference optimization does not exist yet. A checkmark there would claim half
+a column it has not earned.
 
 The tools with the capability are CLI and YAML. The tools with the interface
 start from someone else's weights. Bloomery is from-scratch first, with
@@ -80,6 +84,11 @@ a milestone are not built yet — see [Roadmap](#roadmap).
 - **CPU thread caps** — `--cores` works identically on every platform.
 - **Replay mixtures** — weighted, versioned dataset blends with per-component
   forgetting detection.
+- **Fine-tune on conversations** — `prepare --chat` packs a corpus of chat or
+  prompt/completion records and masks the prompts, so the model is scored only
+  on what it was meant to produce. There is no separate command: the dataset
+  carries the objective, so `adapt` trains it. Blend it with a plain corpus and
+  the plain half is trained on in full, which is replay against forgetting.
 - **Continue an existing model** — `adapt` carries on training a checkpoint of
   yours or anyone else's, every weight or LoRA adapters against a frozen base.
   It refuses a corpus packed with a tokenizer the model cannot read, which is
@@ -90,7 +99,7 @@ a milestone are not built yet — see [Roadmap](#roadmap).
   them. Per-job CPU, memory and GPU limits. It binds to localhost by default.
 
 ### Not built yet
-- **SFT and preference optimization** (M4.1).
+- **Preference optimization** — DPO and friends (M5+).
 - **Export to GGUF, Ollama, MLX** (M5).
 
 ## Hardware
@@ -118,7 +127,7 @@ hardware, `bloomery doctor --json` in an issue is genuinely useful.
 | **M2**    | Replay mixtures — weighted, versioned dataset blends               | done |
 | **M3**    | Web UI, job queue, cancel/resume, resource limits                  | done |
 | **M4**    | Continued pretraining on existing models, full or LoRA              | done |
-| **M4.1**  | SFT and preference optimization                                    | next |
+| **M4.1**  | Supervised fine-tuning on conversations                             | done |
 | **M5**    | Export — GGUF, quantization, Ollama                                |        |
 | **M6**    | AMD hardening on real hardware, Windows, evaluation                |        |
 

@@ -238,6 +238,18 @@ def _report_result(result: Any, blend: Any, name: str) -> None:
     console.print(f"\nnext:  [bold]bloomery chat --run {name}[/bold]")
 
 
+def _masked_share(info: Any) -> float:
+    """Fraction of a conversation corpus's tokens that carry a loss."""
+    import numpy as np
+
+    from bloomery.data import open_mask
+
+    mask = open_mask(info, "train")
+    if mask is None or len(mask) == 0:
+        return 0.0
+    return float(np.asarray(mask).mean())
+
+
 def _spec_summary(capability: Any, method: Method) -> dict[str, Any] | None:
     row = capability.largest_fitting(method)
     if row is None:
@@ -265,6 +277,11 @@ def prepare(
         0, "--synthetic", help="Instead of a source, generate N synthetic documents."
     ),
     vocab: int = typer.Option(8192, "--vocab", help="Tokenizer vocabulary size."),
+    chat: bool = typer.Option(
+        False,
+        "--chat",
+        help="Read conversations and mask the prompts, for supervised fine-tuning.",
+    ),
     tokenizer_from: str | None = typer.Option(
         None,
         "--tokenizer",
@@ -290,16 +307,29 @@ def prepare(
     from bloomery.data import (
         adopt_tokenizer,
         build_dataset,
+        build_sft_dataset,
         count_bytes,
         eot_id,
         iter_documents,
+        iter_examples,
+        looks_like_conversations,
         synthetic_documents,
         train_tokenizer,
     )
 
     if bool(source) == bool(synthetic):
         _die("give exactly one of --source or --synthetic")
+    if chat and source is None:
+        _die("--chat reads conversations from a file; give --source")
+    if chat and not tokenizer_from:
+        _die(
+            "--chat needs the tokenizer of the model you are fine-tuning, because the "
+            "conversation layout it was trained with comes from there:\n"
+            "  bloomery prepare --name ... --source ... --chat --tokenizer <that model>"
+        )
 
+    examples: list[Any] = []
+    documents: list[str] = []
     if source is not None:
         if not source.exists():
             _die(f"{source} does not exist")
@@ -307,12 +337,31 @@ def prepare(
         if size == 0:
             _die(f"no .txt, .md or .jsonl files found under {source}")
         console.print(f"reading [bold]{size / 1e6:.1f} MB[/bold] from {source}")
-        documents = list(iter_documents(source))
+        if chat:
+            examples = list(iter_examples(source))
+        else:
+            documents = list(iter_documents(source))
     else:
         console.print(f"generating [bold]{synthetic}[/bold] synthetic documents")
         documents = synthetic_documents(synthetic)
 
-    if not documents:
+    if chat and not examples:
+        _die(
+            f"no conversations found in {source}. Each line should be a JSON object "
+            'holding either a "messages" list with an assistant turn in it, or a '
+            '"prompt" and "completion" pair.'
+        )
+    if not chat and not documents:
+        # Chat data read by the plain path yields nothing, and "no documents
+        # found" names neither the cause nor the fix.
+        if source is not None and looks_like_conversations(source):
+            _die(
+                f"{source} looks like conversation data, which this reads as plain text "
+                "and finds nothing in.\n"
+                "Pack it for fine-tuning instead:\n"
+                f"  bloomery prepare --name {name} --source {source} --chat "
+                "--tokenizer <the model you are fine-tuning>"
+            )
         _die("no documents found")
 
     tok_path = paths.tokenizer_dir(name)
@@ -340,13 +389,22 @@ def prepare(
 
     with console.status("tokenizing and packing"):
         try:
-            info = build_dataset(
-                documents,
-                tokenizer,
-                out_dir=tokens_path,
-                eot=eot_id(tokenizer),
-                val_fraction=val_fraction,
-            )
+            if chat:
+                info = build_sft_dataset(
+                    examples,
+                    tokenizer,
+                    out_dir=tokens_path,
+                    eot=eot_id(tokenizer),
+                    val_fraction=val_fraction,
+                )
+            else:
+                info = build_dataset(
+                    documents,
+                    tokenizer,
+                    out_dir=tokens_path,
+                    eot=eot_id(tokenizer),
+                    val_fraction=val_fraction,
+                )
         except ValueError as exc:
             _die(str(exc))
 
@@ -356,6 +414,29 @@ def prepare(
         f"tokens     [bold]{train_split.tokens:,}[/bold] train / "
         f"{val_split.tokens:,} val  ({info.dtype}) → {tokens_path}"
     )
+    if chat:
+        # The number that says whether the data was understood. A very low share
+        # means the responses were not found where the template puts them; a
+        # share near 100% means the prompts are not being masked at all.
+        share = _masked_share(info)
+        console.print(
+            f"responses  [bold]{share:.0%}[/bold] of tokens are trained on  "
+            f"[dim]{train_split.documents:,} conversations; prompts are masked out[/dim]"
+        )
+        # Warned at both ends, because both mean the boundaries were not found —
+        # and a corpus that trains on almost nothing packs and reports success
+        # exactly like one that worked.
+        if share > 0.9:
+            console.print(
+                "[yellow]           nearly everything is being trained on, which usually "
+                "means the prompts were not recognised[/yellow]"
+            )
+        elif share < 0.05:
+            console.print(
+                f"[yellow]           only {share:.1%} of tokens carry a loss, which usually "
+                "means the replies were not found where this model's chat template "
+                "puts them[/yellow]"
+            )
     if tokenizer_from:
         # This corpus was packed for a specific model, so `train` is the wrong
         # next step: it would build a fresh random model around that model's
@@ -981,11 +1062,18 @@ def chat(
     top_k: int = typer.Option(40, "--top-k"),
     seed: int | None = typer.Option(None, "--seed"),
     device: str | None = typer.Option(None, "--device"),
+    raw: bool = typer.Option(
+        False, "--raw", help="Send the prompt verbatim, without the chat template."
+    ),
 ) -> None:
     """Generate text from a checkpoint.
 
     A loss curve tells you the optimiser worked. This tells you whether the model
     learned anything you wanted.
+
+    A checkpoint carrying a chat template is prompted through it, because that is
+    the shape it was fine-tuned in. Pass --raw to see what it does with plain
+    text instead.
     """
     _quiet_transformers()
     from bloomery.generate import SamplingConfig, complete, load
@@ -1015,7 +1103,7 @@ def chat(
 
     if prompt is not None:
         console.print(f"[bold]{prompt}[/bold]", end="")
-        console.print(complete(loaded, prompt, config))
+        console.print(complete(loaded, prompt, config, raw=raw))
         return
 
     console.print("[dim]Type a prompt. Ctrl-C or an empty line to quit.[/dim]\n")
@@ -1027,7 +1115,7 @@ def chat(
             return
         if not line:
             return
-        console.print(complete(loaded, line, config).strip() or "[dim](nothing)[/dim]")
+        console.print(complete(loaded, line, config, raw=raw).strip() or "[dim](nothing)[/dim]")
         console.print()
 
 
