@@ -10,7 +10,7 @@ does not learn to run one document into the next.
 from __future__ import annotations
 
 import random
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +40,26 @@ class Example:
     def has_response(self) -> bool:
         """Whether anything here is worth computing a loss on."""
         return any(turn["role"] == "assistant" for turn in self.messages)
+
+
+@dataclass(frozen=True, slots=True)
+class PreferenceExample:
+    """One prompt and two answers to it, one preferred over the other.
+
+    The prompt is turns rather than a string so it renders through the same chat
+    template as everything else. ``chosen`` and ``rejected`` are the assistant
+    reply that would follow — held as text rather than as a completed
+    conversation, because both have to be rendered against an identical prompt
+    and keeping the prompt in one place is what makes that so.
+    """
+
+    messages: tuple[dict[str, str], ...]
+    chosen: str
+    rejected: str
+
+    def with_response(self, content: str) -> tuple[dict[str, str], ...]:
+        """The prompt continued by one of the two answers."""
+        return (*self.messages, {"role": "assistant", "content": content})
 
 
 def iter_documents(source: Path, *, jsonl_field: str = "text") -> Iterator[str]:
@@ -120,6 +140,18 @@ def looks_like_conversations(source: Path) -> bool:
     Used to turn "no documents found" — which names nothing — into a message
     that says what the file actually is and which flag reads it.
     """
+    return _first_record_has(
+        source,
+        lambda record: "messages" in record or ("prompt" in record and "completion" in record),
+    )
+
+
+def _first_record_has(source: Path, predicate: Callable[[dict[str, object]], bool]) -> bool:
+    """Whether the first readable JSON record under ``source`` satisfies ``predicate``.
+
+    The first record only. This exists to explain an empty read, so it must not
+    cost a second pass over a corpus that may be enormous.
+    """
     import json
 
     for path in _jsonl_files(source):
@@ -136,10 +168,40 @@ def looks_like_conversations(source: Path) -> bool:
                     record = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
                     return False
-                return isinstance(record, dict) and (
-                    "messages" in record or ("prompt" in record and "completion" in record)
-                )
+                return isinstance(record, dict) and predicate(record)
     return False
+
+
+def iter_preferences(source: Path) -> Iterator[PreferenceExample]:
+    """Yield preference pairs from JSONL, for direct preference optimization.
+
+    One shape, deliberately::
+
+        {"prompt": ..., "chosen": ..., "rejected": ...}
+
+    where ``prompt`` is either a string or a ``messages`` list, and the two
+    answers are text. The other published shape — ``chosen`` and ``rejected``
+    each holding a whole transcript, prompt included — is not read here: finding
+    where the two diverge means a longest-common-prefix over two renderings and a
+    decision about what a mid-prompt divergence means, which is its own problem
+    rather than a variant of this one.
+
+    A pair whose two answers are identical is skipped. It carries no preference
+    to learn from — the loss on it is a constant and its gradient is exactly
+    zero — so packing it only dilutes the corpus.
+    """
+    for path in _jsonl_files(source):
+        yield from _iter_preferences(path)
+
+
+def looks_like_preferences(source: Path) -> bool:
+    """Whether this source is preference data handed to a path that cannot read it.
+
+    The counterpart of :func:`looks_like_conversations`, and for the same reason:
+    "no records found" names nothing, while "this is preference data, use
+    --preference" names the flag.
+    """
+    return _first_record_has(source, lambda record: "chosen" in record and "rejected" in record)
 
 
 def _jsonl_files(source: Path) -> Iterator[Path]:
@@ -174,22 +236,29 @@ def _iter_conversations(path: Path) -> Iterator[Example]:
                 yield example
 
 
+def _as_turns(raw: object) -> tuple[dict[str, str], ...] | None:
+    """Validate a ``messages`` list, or return None if it is not one."""
+    if not isinstance(raw, list):
+        return None
+    turns: list[dict[str, str]] = []
+    for turn in raw:
+        if not isinstance(turn, dict):
+            return None
+        role, content = turn.get("role"), turn.get("content")
+        # An unknown role is refused rather than coerced: masking is decided
+        # by role, so guessing means training on the wrong half.
+        if not isinstance(role, str) or role not in _ROLES:
+            return None
+        if not isinstance(content, str) or not content.strip():
+            return None
+        turns.append({"role": role, "content": content})
+    return tuple(turns) or None
+
+
 def _as_example(record: dict[str, object]) -> Example | None:
-    raw = record.get("messages")
-    if isinstance(raw, list):
-        turns: list[dict[str, str]] = []
-        for turn in raw:
-            if not isinstance(turn, dict):
-                return None
-            role, content = turn.get("role"), turn.get("content")
-            # An unknown role is refused rather than coerced: masking is decided
-            # by role, so guessing means training on the wrong half.
-            if not isinstance(role, str) or role not in _ROLES:
-                return None
-            if not isinstance(content, str) or not content.strip():
-                return None
-            turns.append({"role": role, "content": content})
-        return Example(tuple(turns)) if turns else None
+    if isinstance(record.get("messages"), list):
+        turns = _as_turns(record["messages"])
+        return Example(turns) if turns else None
 
     prompt, completion = record.get("prompt"), record.get("completion")
     if isinstance(prompt, str) and isinstance(completion, str) and completion.strip():
@@ -200,6 +269,56 @@ def _as_example(record: dict[str, object]) -> Example | None:
             )
         )
     return None
+
+
+def _iter_preferences(path: Path) -> Iterator[PreferenceExample]:
+    import json
+
+    try:
+        handle = path.open(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            example = _as_preference(record)
+            if example is not None:
+                yield example
+
+
+def _as_preference(record: dict[str, object]) -> PreferenceExample | None:
+    chosen, rejected = record.get("chosen"), record.get("rejected")
+    if not isinstance(chosen, str) or not chosen.strip():
+        return None
+    if not isinstance(rejected, str) or not rejected.strip():
+        return None
+    if chosen == rejected:
+        return None
+
+    raw = record.get("prompt")
+    if isinstance(raw, str):
+        turns: tuple[dict[str, str], ...] | None = (
+            ({"role": "user", "content": raw},) if raw.strip() else None
+        )
+    else:
+        turns = _as_turns(raw)
+    if turns is None:
+        return None
+    # The two answers are the assistant's turn, so the prompt must stop before
+    # one. A prompt already ending in an assistant turn would render two in a
+    # row, which no chat template describes and which would put the mask
+    # somewhere neither answer is.
+    if turns[-1]["role"] == "assistant":
+        return None
+    return PreferenceExample(turns, chosen=chosen, rejected=rejected)
 
 
 def count_bytes(source: Path) -> int:
