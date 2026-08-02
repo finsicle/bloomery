@@ -14,6 +14,7 @@ import math
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -64,6 +65,10 @@ class TrainConfig:
     log_every: int = 10
     seed: int = 1337
     gradient_checkpointing: bool = False
+    # How hard preference training is held to the reference model. Named
+    # dpo_beta and not beta because beta1 and beta2 sit right above it and mean
+    # something else entirely. Ignored unless the dataset is preference pairs.
+    dpo_beta: float = 0.1
 
     @property
     def tokens_per_step(self) -> int:
@@ -719,8 +724,11 @@ def train(
     # Chosen from the data, not from a flag. A field on TrainConfig would be a
     # second source of truth for one fact — and it is written into every
     # checkpoint's run.json, so a run could record an objective its own dataset
-    # contradicts.
+    # contradicts. A mixed blend is refused when the mixture is resolved, so
+    # any() and all() agree here.
     objective: Objective = objective_mod.causal_loss
+    if any(info.preference for info in datasets.values()):
+        objective = partial(objective_mod.preference_loss, beta=config.dpo_beta)
     history: list[dict[str, Any]] = []
     throughput = Throughput()
     final_loss = float("nan")

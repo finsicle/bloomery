@@ -70,3 +70,114 @@ def causal_loss(model: Any, drawn: Batch) -> LossParts:
         loss=model(**drawn).loss,
         supervised_tokens=int((labels != IGNORE_INDEX).sum().item()),
     )
+
+
+def sequence_logprobs(model: Any, drawn: Batch) -> Any:
+    """Total log-probability the model assigns to each row's scored tokens.
+
+    Shifted by hand here, which is the opposite of every other batch in this
+    project: the samplers deliberately leave labels unshifted because the model
+    does it internally when computing its own loss (see
+    :meth:`BatchSampler.batch`). Nothing computes the loss for us here, so the
+    alignment is ours to get right — position ``t`` of the logits predicts token
+    ``t + 1``.
+
+    ``F.cross_entropy`` rather than ``log_softmax(...).gather(...)``, and that is
+    a measurement rather than a preference. Logits arrive from a bf16 matmul
+    under autocast; cross-entropy is on torch's fp32 autocast list and
+    log_softmax is not, so the obvious formulation silently stays in bf16.
+    Summed over 512 positions at a 128k vocabulary, against an fp64 reference:
+
+        F.cross_entropy (fp32)            +0.114 nats
+        log_softmax, fp32 accumulation    -0.853 nats
+        log_softmax, bf16 accumulation    -4.353 nats
+
+    A DPO logit is O(1) and these enter it scaled by beta, so the last is error
+    of the same size as the signal. It also avoids materialising a separate fp32
+    log-softmax over the whole vocabulary, which at a realistic batch is a
+    gigabyte that cross-entropy never allocates.
+    """
+    import torch.nn.functional as functional
+
+    logits = model(
+        input_ids=drawn["input_ids"],
+        attention_mask=drawn.get("attention_mask"),
+        # Nothing generates from these rows, so the cache is allocated for every
+        # forward and read by none of them. Four sequence-forwards per
+        # microbatch makes that worth turning off rather than tolerating.
+        use_cache=False,
+    ).logits
+
+    predicted = logits[:, :-1]
+    targets = drawn["labels"][:, 1:]
+    token_logprobs = -functional.cross_entropy(
+        predicted.reshape(-1, predicted.shape[-1]),
+        targets.reshape(-1),
+        reduction="none",
+        ignore_index=IGNORE_INDEX,
+    ).view(targets.shape)
+    # Deliberately not cast to float32 here. It already is one — autocast
+    # promotes cross-entropy — and casting at the end would hide it if this were
+    # ever rewritten in a way that did not, which is the whole failure above.
+    # The dtype is asserted in the tests for that reason.
+    # cross_entropy returns 0 at ignored positions, so summing needs no mask.
+    return token_logprobs.sum(dim=-1)
+
+
+def preference_loss(model: Any, drawn: Batch, *, beta: float) -> LossParts:
+    """Direct preference optimization against the model's own untuned self.
+
+    The batch is two stacked halves — chosen answers, then rejected ones — and
+    row ``i`` pairs with row ``i + half``. The objective raises the model's
+    log-probability of the preferred answer relative to the other, measured
+    against a reference that does not move, so that it cannot win by simply
+    becoming more confident about everything.
+
+    The reference is this same model with its adapters switched off, which costs
+    no second copy of the weights. It is computed under ``eval()`` as well as
+    ``no_grad()``: a base model with dropout of its own — GPT-2 has three kinds —
+    would otherwise give a reference that is different every time it is asked,
+    and that noise lands directly in the only training signal there is.
+    """
+    import torch
+    import torch.nn.functional as functional
+
+    half = drawn["input_ids"].shape[0] // 2
+    policy = sequence_logprobs(model, drawn)
+
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad(), model.disable_adapter():
+            reference = sequence_logprobs(model, drawn)
+    finally:
+        if was_training:
+            model.train()
+
+    # The reward is how far the model has moved from its reference on this
+    # answer. Reported per side, not only as the margin: the best-known way for
+    # a DPO run to go wrong is for both to fall while the margin still grows,
+    # which a margin-only view reports as a healthy run.
+    chosen_reward = beta * (policy[:half] - reference[:half])
+    rejected_reward = beta * (policy[half:] - reference[half:])
+    loss = -functional.logsigmoid(chosen_reward - rejected_reward).mean()
+
+    with torch.no_grad():
+        return LossParts(
+            loss=loss,
+            supervised_tokens=int((drawn["labels"] != IGNORE_INDEX).sum().item()),
+            extras={
+                "reward_margin": float((chosen_reward - rejected_reward).mean()),
+                # Ties count as half. At step zero a fresh adapter makes both
+                # rewards exactly zero, and a strict comparison would report 0%
+                # accuracy for a model that is simply undecided.
+                "reward_accuracy": float(
+                    (
+                        (chosen_reward > rejected_reward).float()
+                        + 0.5 * (chosen_reward == rejected_reward).float()
+                    ).mean()
+                ),
+                "reward_chosen": float(chosen_reward.mean()),
+                "reward_rejected": float(rejected_reward.mean()),
+            },
+        )
