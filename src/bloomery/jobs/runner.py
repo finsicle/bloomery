@@ -158,6 +158,12 @@ _FLAGS: dict[JobKind, dict[str, str]] = {
         "device": "--device",
         "seed": "--seed",
     },
+    JobKind.EXPORT: {
+        "run": "--run",
+        "checkpoint": "--checkpoint",
+        "name": "--name",
+        "quantize": "--quantize",
+    },
     JobKind.BENCH: {
         "size": "--size",
         "depth": "--depth",
@@ -183,6 +189,10 @@ _SWITCHES: dict[JobKind, dict[str, str]] = {
         "resume": "--resume",
         "force": "--force",
     },
+    # Required even though it is empty: _SWITCHES is subscripted directly
+    # below, so a missing kind raises KeyError inside the supervisor rather
+    # than a clean launch error.
+    JobKind.EXPORT: {},
     JobKind.BENCH: {"grad_checkpoint": "--grad-checkpoint"},
 }
 

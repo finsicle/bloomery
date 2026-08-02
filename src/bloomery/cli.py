@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -15,6 +16,7 @@ from rich.console import Console
 
 from bloomery import __version__, paths
 from bloomery.capability import LADDER_BY_KEY, Method, assess, format_params
+from bloomery.export import QUANTIZATIONS
 from bloomery.probe import probe_host_report
 from bloomery.probe.types import GIB
 from bloomery.render import render_report
@@ -1117,6 +1119,147 @@ def chat(
             return
         console.print(complete(loaded, line, config, raw=raw).strip() or "[dim](nothing)[/dim]")
         console.print()
+
+
+# --------------------------------------------------------------------------- #
+# export
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def export(
+    run: str | None = typer.Option(None, "--run", "-r", help="Run name to export."),
+    checkpoint: Path | None = typer.Option(
+        None, "--checkpoint", "-c", help="Path to a checkpoint directory."
+    ),
+    name: str | None = typer.Option(
+        None, "--name", "-n", help="Name for the export. Defaults to the run's."
+    ),
+    quantize: str = typer.Option(
+        "f16", "--quantize", "-q", help=f"One of: {', '.join(QUANTIZATIONS)}."
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Write a checkpoint as GGUF, for llama.cpp and Ollama.
+
+    Written here rather than by llama.cpp's converter, which cannot read the
+    models this project exists to produce: it identifies a tokenizer by hashing
+    its output against a table of known models, and a tokenizer bloomery trained
+    is a new hash by construction.
+
+    LoRA adapters are folded into the weights first, since GGUF has no notion of
+    an adapter and a runtime would otherwise read the untouched base.
+    """
+    _quiet_transformers()
+    import shutil
+
+    from bloomery.export import GGUF_NAME as gguf_name
+    from bloomery.export import ExportError, to_gguf, write_modelfile
+    from bloomery.train import checkpoint as ckpt
+    from bloomery.train.loop import ModelLoadError, load_model, merge_adapters
+
+    if bool(run) == bool(checkpoint):
+        _die("give exactly one of --run or --checkpoint")
+    if quantize not in QUANTIZATIONS:
+        _die(f"unknown quantization {quantize!r}; choose one of: {', '.join(QUANTIZATIONS)}")
+
+    target = checkpoint if checkpoint else ckpt.checkpoint_dir(paths.run_dir(run or ""))
+    # A run saving right now may have been killed mid-promotion, leaving the
+    # checkpoint beside this path rather than at it. Export runs concurrently
+    # with training by design, so it is the command most likely to arrive then —
+    # and for the same reason it must only read the aside copy, never move it:
+    # a save in mid-promotion looks exactly like an interrupted one.
+    target = ckpt.resolve(target)
+    if not target.is_dir():
+        _die(f"{target} does not exist")
+
+    out_name = name or run or target.parent.name
+    destination = paths.export_dir(out_name)
+
+    with console.status(f"loading {target}"):
+        try:
+            from bloomery.data import load_tokenizer
+
+            model = merge_adapters(load_model(target))
+            tokenizer = load_tokenizer(target)
+        except ModelLoadError as exc:
+            _die(str(exc))
+        except Exception as exc:  # noqa: BLE001 - tokenizer loading raises many types
+            _die(f"could not read {target}: {exc}")
+
+    # Staged then renamed, the same way a checkpoint is written. A half-written
+    # GGUF looks loadable and is not, and export can run while the checkpoint it
+    # is reading is being replaced by a training step.
+    staging = destination.with_name(destination.name + ".tmp")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+
+    # Cleared on every exit, not only on ExportError. A full disk raises OSError
+    # and a long quantization pass can take a KeyboardInterrupt, and either would
+    # otherwise leave a partial GGUF sitting in exports/<name>.tmp.
+    placed = False
+    try:
+        with console.status(f"writing {quantize} gguf"):
+            result = to_gguf(model, tokenizer, staging / gguf_name, quantization=quantize)
+        write_modelfile(staging, tokenizer)
+
+        # The old export is moved aside rather than deleted, so there is never a
+        # moment with no export at all — a kill between the two, or a rename that
+        # fails across filesystems, would otherwise take the previous good GGUF
+        # and put nothing in its place.
+        previous = destination.with_name(destination.name + ".previous")
+        if previous.exists():
+            shutil.rmtree(previous)
+        if destination.exists():
+            destination.rename(previous)
+        try:
+            staging.rename(destination)
+        except OSError:
+            if previous.exists() and not destination.exists():
+                previous.rename(destination)
+            raise
+        placed = True
+        shutil.rmtree(previous, ignore_errors=True)
+    except ExportError as exc:
+        _die(str(exc))
+    except OSError as exc:
+        _die(f"could not write the export: {exc}")
+    finally:
+        if not placed:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    result = replace(result, path=destination / gguf_name)
+
+    if as_json:
+        console.print_json(json.dumps(result.to_dict()))
+        return
+
+    console.print(
+        f"model      [bold]{result.architecture}[/bold]  {format_params(result.parameters)} params"
+    )
+    console.print(f"format     [bold]{result.quantization}[/bold]  {result.tensors} tensors")
+    console.print(f"size       [bold]{result.bytes_written / 1e6:,.1f} MB[/bold] → {result.path}")
+    console.print(f"vocab      {result.vocab_size:,} tokens")
+    # The number most likely to surprise: it is the sequence length the model was
+    # trained at, and a runtime will treat it as a hard limit.
+    console.print(
+        f"context    {result.context_length:,} tokens  [dim]the length it was trained at[/dim]"
+    )
+    if result.unquantized:
+        console.print(
+            f"[yellow]           {len(result.unquantized)} tensor(s) kept at f16; their shape "
+            "cannot be blocked for this format[/yellow]"
+        )
+    console.print()
+    console.print(
+        f"next:  [bold]ollama create {paths.slug(out_name)} -f {destination / 'Modelfile'}[/bold]"
+    )
+    if quantize != "q4_0":
+        console.print(
+            "[dim]       smaller still with llama.cpp's llama-quantize, which has the "
+            "K-quants this cannot write[/dim]"
+        )
 
 
 # --------------------------------------------------------------------------- #

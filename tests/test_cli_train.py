@@ -9,7 +9,9 @@ touches a real user's datasets or checkpoints.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -26,6 +28,34 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
     monkeypatch.setenv("BLOOMERY_HOME", str(home))
     return home
+
+
+@pytest.fixture(autouse=True)
+def _stable_memory_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop ambient RAM from deciding whether these tests pass.
+
+    The pre-flight budget is derived from *available* system memory, and even a
+    depth-1 model estimates around 0.8 GiB once the fixed context overhead is
+    counted. On a machine with little free memory — or simply partway through a
+    long suite run — the budget dips under that and `train` and `adapt` refuse,
+    so a test about tokenizers or exports fails for reasons of its own host.
+
+    Observed as exactly that: this file passes alone and fails inside the full
+    suite, with a different test each time.
+
+    The budget is pinned generously rather than the check disabled, so a run that
+    genuinely cannot fit is still refused — TestMemoryGuard asks for shapes that
+    need terabytes and is unaffected.
+    """
+    from bloomery import capability
+
+    real = capability.derive_budget
+
+    def generous(report: Any, *, device_type: str | None = None) -> Any:
+        budget = real(report, device_type=device_type)
+        return replace(budget, total=max(budget.total, 64 * 1024**3))
+
+    monkeypatch.setattr(capability, "derive_budget", generous)
 
 
 def _invoke(*args: str):  # noqa: ANN202 - typer's Result type is internal
@@ -651,6 +681,14 @@ class TestTrainOnMixture:
 
 class TestMemoryGuard:
     """The pre-flight check that stops a run before it OOMs partway through."""
+
+    @pytest.fixture(autouse=True)
+    def _stable_memory_budget(self) -> None:
+        """Opt out of the module-wide pin: this class is what tests the budget.
+
+        Everywhere else a pinned budget stops ambient RAM deciding unrelated
+        outcomes. Here the real one is the subject.
+        """
 
     @pytest.fixture(autouse=True)
     def prepared(self, isolated_home: Path) -> None:
@@ -1291,3 +1329,144 @@ class TestSupervisedFineTuning:
             )
 
         assert seen == [True, False], seen
+
+
+class TestExport:
+    """Writing a checkpoint out for llama.cpp and Ollama."""
+
+    @pytest.fixture
+    def trained(self, isolated_home: Path) -> Path:
+        assert (
+            _invoke("prepare", "--name", "c", "--synthetic", "400", "--vocab", "300").exit_code == 0
+        )
+        assert (
+            _invoke(
+                "train",
+                "--data",
+                "c",
+                "--name",
+                "r",
+                "--depth",
+                "1",
+                "--steps",
+                "2",
+                "--batch",
+                "4",
+                "--seq",
+                "32",
+                "--device",
+                "cpu",
+            ).exit_code
+            == 0
+        )
+        return isolated_home / "runs/r/latest"
+
+    def test_writes_a_gguf_and_a_modelfile(self, trained: Path, isolated_home: Path) -> None:
+        result = _invoke("export", "--run", "r")
+        assert result.exit_code == 0, plain(result.stdout)
+        out = isolated_home / "exports/r"
+        assert (out / "model.gguf").is_file()
+        assert (out / "Modelfile").is_file()
+
+    @pytest.mark.parametrize("quantize", ["f16", "q8_0", "q4_0"])
+    def test_each_format_writes(self, trained: Path, isolated_home: Path, quantize: str) -> None:
+        result = _invoke("export", "--run", "r", "--quantize", quantize, "--name", quantize)
+        assert result.exit_code == 0, plain(result.stdout)
+        assert (isolated_home / f"exports/{quantize}/model.gguf").is_file()
+
+    def test_it_reports_the_context_it_was_trained_at(self, trained: Path) -> None:
+        """The number most likely to surprise: a runtime treats it as a hard limit."""
+        result = _invoke("export", "--run", "r", "--json")
+        assert result.exit_code == 0, plain(result.stdout)
+        payload = json.loads(plain(result.stdout))
+        assert payload["context_length"] == 32
+        assert payload["architecture"] == "llama"
+
+    def test_an_unknown_format_is_refused(self, trained: Path) -> None:
+        result = _invoke("export", "--run", "r", "--quantize", "q4_k_m")
+        assert result.exit_code == 1
+        assert "unknown quantization" in plain(result.stdout)
+
+    def test_a_missing_run_is_reported(self) -> None:
+        result = _invoke("export", "--run", "nope")
+        assert result.exit_code == 1
+
+    def test_exactly_one_target(self, trained: Path) -> None:
+        assert _invoke("export").exit_code == 1
+        assert _invoke("export", "--run", "r", "--checkpoint", str(trained)).exit_code == 1
+
+    def test_a_lora_checkpoint_is_merged_before_export(self, isolated_home: Path) -> None:
+        """GGUF has no notion of an adapter.
+
+        Without the merge the export would silently be of the untouched base:
+        it writes, it loads, and none of the fine-tuning is in it.
+        """
+        pytest.importorskip("peft", reason="adapters need the adapt extra")
+        from transformers import AutoTokenizer
+
+        assert (
+            _invoke("prepare", "--name", "c", "--synthetic", "400", "--vocab", "300").exit_code == 0
+        )
+        assert (
+            _invoke(
+                "train",
+                "--data",
+                "c",
+                "--name",
+                "b",
+                "--depth",
+                "1",
+                "--steps",
+                "2",
+                "--batch",
+                "4",
+                "--seq",
+                "32",
+                "--device",
+                "cpu",
+            ).exit_code
+            == 0
+        )
+        base = isolated_home / "runs/b/latest"
+        AutoTokenizer.from_pretrained(str(base)).save_pretrained(str(base))
+        assert (
+            _invoke(
+                "adapt",
+                "--from",
+                str(base),
+                "--data",
+                "c",
+                "--name",
+                "a",
+                "--steps",
+                "4",
+                "--batch",
+                "2",
+                "--seq",
+                "32",
+                "--device",
+                "cpu",
+            ).exit_code
+            == 0
+        )
+
+        assert _invoke("export", "--run", "a", "--name", "adapted").exit_code == 0
+        assert _invoke("export", "--checkpoint", str(base), "--name", "plain").exit_code == 0
+
+        from gguf import GGUFReader
+
+        def tensor(name: str, export: str):  # noqa: ANN202
+            reader = GGUFReader(str(isolated_home / f"exports/{export}/model.gguf"))
+            return next(t.data for t in reader.tensors if t.name == name)
+
+        merged = tensor("blk.0.attn_q.weight", "adapted")
+        plain_base = tensor("blk.0.attn_q.weight", "plain")
+        assert not (merged == plain_base).all(), "the adapters were not folded in"
+
+    def test_a_half_written_export_is_not_left_behind(
+        self, trained: Path, isolated_home: Path
+    ) -> None:
+        """A staging directory must not survive a failure looking like an export."""
+        result = _invoke("export", "--run", "r", "--name", "ok")
+        assert result.exit_code == 0, plain(result.stdout)
+        assert not (isolated_home / "exports/ok.tmp").exists()

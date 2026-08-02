@@ -101,11 +101,86 @@ def save(
         + "\n"
     )
 
-    # Replace only once everything is on disk.
+    # Replace only once everything is on disk — and never leave a moment with no
+    # checkpoint at all. Deleting the old one first opens a window where a kill,
+    # or a rename that fails, loses the good checkpoint and puts nothing in its
+    # place. The old one is moved aside instead, and only discarded once the new
+    # one is where it belongs.
+    #
+    # Not academic: `export` reads runs/<name>/latest while a run may be saving,
+    # and that window is exactly when it finds nothing there.
+    previous = directory.with_name(directory.name + ".previous")
+
+    # Recover before clearing. A save killed between the two renames below
+    # leaves the checkpoint under `previous` and nothing at `directory`; going
+    # straight to rmtree here would then delete the only copy that exists, which
+    # is a worse outcome than the window this whole dance is closing.
+    restore_interrupted(directory)
+    # ignore_errors rather than exists-then-remove: the check and the call
+    # are two operations, and anything that clears the path between them
+    # would otherwise raise FileNotFoundError out of a successful save.
+    shutil.rmtree(previous, ignore_errors=True)
+
     if directory.exists():
-        shutil.rmtree(directory)
-    staging.rename(directory)
+        directory.rename(previous)
+    try:
+        staging.rename(directory)
+    except OSError:
+        # Put the old one back rather than leaving the caller with neither.
+        if previous.exists() and not directory.exists():
+            previous.rename(directory)
+        raise
+    shutil.rmtree(previous, ignore_errors=True)
     return directory
+
+
+def restore_interrupted(directory: Path) -> bool:
+    """Put back a checkpoint left aside by a save that did not finish.
+
+    The promotion above is two renames, and a process killed between them leaves
+    the good checkpoint at ``<name>.previous`` with nothing at ``<name>``. An
+    atomic directory exchange would remove even that gap, but the syscall for it
+    is Linux-only and this project runs on three platforms, so the gap is made
+    recoverable rather than impossible.
+
+    **Only :func:`save` may call this.** It moves a directory, and a save in
+    mid-promotion is in exactly the state this looks for — so a concurrent
+    caller doing the restore would take ``.previous`` out from under the save,
+    whose own rename then fails onto a path that is suddenly occupied and whose
+    recovery finds nothing to put back. That turns a harmless window into a
+    failed training run.
+
+    A reader wanting the same robustness uses :func:`resolve`, which reads the
+    aside copy where it lies and moves nothing.
+
+    Returns whether anything was restored.
+    """
+    previous = directory.with_name(directory.name + ".previous")
+    if directory.exists() or not previous.is_dir():
+        return False
+    try:
+        previous.rename(directory)
+    except OSError:
+        # Something else got there first. Nothing to do and nothing broken.
+        return False
+    return True
+
+
+def resolve(directory: Path) -> Path:
+    """Where this checkpoint can actually be read from, without moving anything.
+
+    Normally the path given. After a save that was killed mid-promotion, the
+    complete checkpoint is at ``<name>.previous`` instead, and a reader that
+    only looked at the canonical path would report nothing while a usable
+    checkpoint sat beside it.
+
+    Deliberately read-only. Putting it back is the writer's job — see
+    :func:`restore_interrupted` for what happens when a reader tries.
+    """
+    if directory.exists():
+        return directory
+    previous = directory.with_name(directory.name + ".previous")
+    return previous if (previous / TRAINER_STATE).is_file() else directory
 
 
 def load_resume_state(
@@ -114,7 +189,7 @@ def load_resume_state(
     """Restore step counters, and optimizer state if an optimizer is given."""
     import torch
 
-    state_path = directory / TRAINER_STATE
+    state_path = resolve(directory) / TRAINER_STATE
     if not state_path.is_file():
         raise FileNotFoundError(f"no {TRAINER_STATE} in {directory}")
 
@@ -140,11 +215,18 @@ def load_resume_state(
 def is_resumable(directory: Path) -> bool:
     """Whether a run can be picked up from this directory.
 
+    Resolved first: a save killed mid-promotion leaves the checkpoint beside
+    this path rather than at it, and reporting "nothing to resume" then would
+    overlook a complete checkpoint sitting right there. Read where it lies —
+    moving it is the writer's job, and a reader that moved it would break a
+    save that is running.
+
     Needs the optimizer state, plus weights in one of the two shapes a run
     writes: a whole model, or the adapters a LoRA run produced. Checking only for
     ``config.json`` would report every adapter checkpoint as unresumable, which
     is the shape a long adaptation run leaves behind.
     """
+    directory = resolve(directory)
     if not (directory / TRAINER_STATE).is_file():
         return False
     return (directory / "config.json").is_file() or (directory / "adapter_config.json").is_file()

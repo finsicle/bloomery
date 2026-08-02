@@ -204,6 +204,24 @@ def _load_adapted(path: Path) -> Any:
         ) from exc
 
 
+def merge_adapters(model: Any) -> Any:
+    """Fold any LoRA adapters into the weights they modify.
+
+    Export needs one set of weights, not a base plus a diff: GGUF has no notion
+    of an adapter, and a runtime reading the file would get the untouched base.
+
+    A model with no adapters is returned unchanged, so a caller does not have to
+    know which shape it was handed.
+    """
+    merge = getattr(model, "merge_and_unload", None)
+    if merge is None:
+        return model
+    # eval() first: dropout is active on a freshly loaded adapter, and merging
+    # while it is would fold a randomly masked version of the update.
+    model.eval()
+    return merge()
+
+
 def attach_adapter(model: Any, settings: LoraSettings) -> Any:
     """Freeze the model and train low-rank adapters against it instead.
 

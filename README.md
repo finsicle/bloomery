@@ -84,6 +84,10 @@ a milestone are not built yet — see [Roadmap](#roadmap).
 - **CPU thread caps** — `--cores` works identically on every platform.
 - **Replay mixtures** — weighted, versioned dataset blends with per-component
   forgetting detection.
+- **Export for llama.cpp and Ollama** — `export` writes a GGUF and a Modelfile,
+  at f16, q8_0 or q4_0. LoRA adapters are folded in first, since GGUF has no
+  notion of an adapter. The K-quants need llama.cpp's `llama-quantize`, and the
+  command says so rather than pretending otherwise.
 - **Fine-tune on conversations** — `prepare --chat` packs a corpus of chat or
   prompt/completion records and masks the prompts, so the model is scored only
   on what it was meant to produce. There is no separate command: the dataset
@@ -99,8 +103,7 @@ a milestone are not built yet — see [Roadmap](#roadmap).
   them. Per-job CPU, memory and GPU limits. It binds to localhost by default.
 
 ### Not built yet
-- **Preference optimization** — DPO and friends (M5+).
-- **Export to GGUF, Ollama, MLX** (M5).
+- **Preference optimization** — DPO and friends. Not scheduled.
 
 ## Hardware
 
@@ -128,7 +131,7 @@ hardware, `bloomery doctor --json` in an issue is genuinely useful.
 | **M3**    | Web UI, job queue, cancel/resume, resource limits                  | done |
 | **M4**    | Continued pretraining on existing models, full or LoRA              | done |
 | **M4.1**  | Supervised fine-tuning on conversations                             | done |
-| **M5**    | Export — GGUF, quantization, Ollama                                |        |
+| **M5**    | Export — GGUF, quantization, Ollama                                | done |
 | **M6**    | AMD hardening on real hardware, Windows, evaluation                |        |
 
 M2 came before the web UI because weighted replay is what makes "keep adding
@@ -179,8 +182,17 @@ instead.
 
 Checkpoints are ordinary Hugging Face directories. `AutoModelForCausalLM.from_pretrained`
 loads them, which is the whole reason bloomery emits a Llama-architecture model
-rather than inventing one — GGUF conversion, vLLM and Ollama all work without a
-bespoke converter.
+rather than inventing one — vLLM and other runtimes that read Llama-architecture
+Hugging Face checkpoints load them directly. (A LoRA run writes adapters rather
+than a whole model; `export` folds those in.)
+
+GGUF is the exception, and `export` writes it here rather than shelling out.
+llama.cpp's converter identifies a tokenizer by hashing its output against a
+table of known models, and a tokenizer bloomery trained is a new hash by
+construction — so the stock path refuses precisely the models this project
+exists to produce. Refusing is right for a general tool, since the hash picks
+the pre-tokenizer and the wrong one yields a model that loads and talks
+nonsense. Bloomery already knows the answer, so it fills the field in itself.
 
 `train` estimates memory before it starts and refuses a configuration that
 cannot fit, because an out-of-memory error arrives whenever the allocator

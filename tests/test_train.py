@@ -939,3 +939,165 @@ class TestSkippedMicrobatchesAreVisible:
         reported = step_loss if contributed else float("nan")
         assert contributed == 0
         assert math.isnan(reported), "an unscored step must not look like a perfect one"
+
+
+class TestReplacingACheckpointLeavesNoGap:
+    """There must never be a moment with no checkpoint at all.
+
+    Deleting the old one before renaming the new one into place opens a window
+    where a kill, or a rename that fails, takes the good checkpoint and puts
+    nothing back. `export` reads runs/<name>/latest while a run may be saving,
+    and that window is exactly when it finds nothing there.
+    """
+
+    def _save(self, directory: Path, tokenizer: Any, *, step: int) -> Path:
+        import torch
+
+        from bloomery.train import checkpoint as ckpt
+
+        model = build_model(spec_from_depth(1, vocab=64, seq=16), eos_token_id=0, seed=0)
+        return ckpt.save(
+            directory,
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+            step=step,
+            tokens_seen=step * 10,
+            best_val_loss=None,
+        )
+
+    def test_a_second_save_replaces_the_first(self, tmp_path: Path, tokenizer: Any) -> None:
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+        self._save(directory, tokenizer, step=2)
+
+        assert ckpt.load_resume_state(directory).step == 2
+        # And nothing is left lying about that a reader could mistake for one.
+        assert not directory.with_name("latest.previous").exists()
+        assert not directory.with_name("latest.tmp").exists()
+
+    def test_the_old_checkpoint_survives_a_failed_rename(
+        self, tmp_path: Path, tokenizer: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The case the window existed for: something goes wrong mid-swap.
+
+        A cross-filesystem rename raises, and the caller must still have the
+        checkpoint it had before rather than neither.
+        """
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+
+        real = Path.rename
+
+        def refuse(self: Path, target: Any) -> None:
+            if self.name.endswith(".tmp"):
+                raise OSError("cross-device link")
+            real(self, target)
+
+        monkeypatch.setattr(Path, "rename", refuse)
+        with pytest.raises(OSError):
+            self._save(directory, tokenizer, step=2)
+        monkeypatch.undo()
+
+        assert directory.is_dir(), "the previous checkpoint was lost"
+        assert ckpt.load_resume_state(directory).step == 1
+
+    def test_a_save_killed_mid_promotion_is_recovered(self, tmp_path: Path, tokenizer: Any) -> None:
+        """The window that cannot be closed on three platforms, made harmless.
+
+        An atomic directory exchange would remove it, but that syscall is
+        Linux-only. So the state a kill leaves is unambiguous — a complete
+        checkpoint under a known name — and it gets put back.
+        """
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+        # Exactly what a kill between the two renames leaves behind.
+        directory.rename(directory.with_name("latest.previous"))
+        assert not directory.exists()
+
+        # A reader finds it where it lies, without moving anything.
+        assert ckpt.resolve(directory).name == "latest.previous"
+        assert ckpt.load_resume_state(directory).step == 1
+        assert directory.with_name("latest.previous").is_dir()
+
+        # The writer is what puts it back.
+        assert ckpt.restore_interrupted(directory) is True
+        assert directory.is_dir()
+        assert not directory.with_name("latest.previous").exists()
+
+    def test_the_next_save_does_not_destroy_an_interrupted_one(
+        self, tmp_path: Path, tokenizer: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The hole the first version of this fix opened.
+
+        After an interrupted promotion the only checkpoint is under `.previous`.
+        Clearing the way for the next save by deleting it destroys that copy —
+        and if the new save then fails, nothing is left at all. A save that
+        merely succeeds hides this, because its own result replaces what was
+        lost; the failure is what exposes it.
+        """
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+        # Exactly what a kill between the two renames leaves.
+        directory.rename(directory.with_name("latest.previous"))
+
+        real = Path.rename
+
+        def refuse(self: Path, target: Any) -> None:
+            if self.name.endswith(".tmp"):
+                raise OSError("cross-device link")
+            real(self, target)
+
+        monkeypatch.setattr(Path, "rename", refuse)
+        with pytest.raises(OSError):
+            self._save(directory, tokenizer, step=2)
+        monkeypatch.undo()
+
+        assert directory.is_dir(), "the interrupted checkpoint was destroyed"
+        assert ckpt.load_resume_state(directory).step == 1
+
+    def test_a_reader_finds_an_interrupted_checkpoint(self, tmp_path: Path, tokenizer: Any) -> None:
+        """Otherwise `--resume` reports nothing to resume, beside a complete one."""
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=3)
+        directory.rename(directory.with_name("latest.previous"))
+
+        assert ckpt.is_resumable(directory)
+        assert ckpt.load_resume_state(directory).step == 3
+
+    def test_a_reader_does_not_move_a_checkpoint_out_from_under_a_save(
+        self, tmp_path: Path, tokenizer: Any
+    ) -> None:
+        """Why readers resolve rather than restore.
+
+        A save mid-promotion looks exactly like an interrupted one: the canonical
+        directory is absent and `.previous` holds a checkpoint. A reader that
+        restored would take it, the save's own rename would then land on an
+        occupied path, and its recovery would find nothing to put back — turning
+        a microsecond window into a failed run.
+        """
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+        # The exact state a save is in between its two renames.
+        directory.rename(directory.with_name("latest.previous"))
+
+        before = sorted(path.name for path in tmp_path.iterdir())
+        assert ckpt.resolve(directory).is_dir()
+        assert ckpt.is_resumable(directory)
+        assert ckpt.load_resume_state(directory).step == 1
+
+        assert sorted(path.name for path in tmp_path.iterdir()) == before, (
+            "a read moved something on disk"
+        )
