@@ -110,8 +110,15 @@ def save(
     # Not academic: `export` reads runs/<name>/latest while a run may be saving,
     # and that window is exactly when it finds nothing there.
     previous = directory.with_name(directory.name + ".previous")
+
+    # Recover before clearing. A save killed between the two renames below
+    # leaves the checkpoint under `previous` and nothing at `directory`; going
+    # straight to rmtree here would then delete the only copy that exists, which
+    # is a worse outcome than the window this whole dance is closing.
+    restore_interrupted(directory)
     if previous.exists():
         shutil.rmtree(previous)
+
     if directory.exists():
         directory.rename(previous)
     try:
@@ -123,6 +130,28 @@ def save(
         raise
     shutil.rmtree(previous, ignore_errors=True)
     return directory
+
+
+def restore_interrupted(directory: Path) -> bool:
+    """Put back a checkpoint left aside by a save that did not finish.
+
+    The promotion above is two renames, and a process killed between them leaves
+    the good checkpoint at ``<name>.previous`` with nothing at ``<name>``. An
+    atomic directory exchange would remove even that gap, but the syscall for it
+    is Linux-only, and this project runs on three platforms.
+
+    So the gap is made recoverable instead of impossible: the state it leaves is
+    unambiguous — a complete checkpoint under a known name — and this puts it
+    back. Called before any save clears the way, and available to a reader that
+    finds nothing where it expected a checkpoint.
+
+    Returns whether anything was restored.
+    """
+    previous = directory.with_name(directory.name + ".previous")
+    if directory.exists() or not previous.is_dir():
+        return False
+    previous.rename(directory)
+    return True
 
 
 def load_resume_state(
@@ -157,11 +186,16 @@ def load_resume_state(
 def is_resumable(directory: Path) -> bool:
     """Whether a run can be picked up from this directory.
 
+    Recovers first: a save killed mid-promotion leaves the checkpoint beside
+    this path rather than at it, and reporting "nothing to resume" then would
+    discard a complete checkpoint that is sitting right there.
+
     Needs the optimizer state, plus weights in one of the two shapes a run
     writes: a whole model, or the adapters a LoRA run produced. Checking only for
     ``config.json`` would report every adapter checkpoint as unresumable, which
     is the shape a long adaptation run leaves behind.
     """
+    restore_interrupted(directory)
     if not (directory / TRAINER_STATE).is_file():
         return False
     return (directory / "config.json").is_file() or (directory / "adapter_config.json").is_file()

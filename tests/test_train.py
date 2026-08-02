@@ -1005,3 +1005,66 @@ class TestReplacingACheckpointLeavesNoGap:
 
         assert directory.is_dir(), "the previous checkpoint was lost"
         assert ckpt.load_resume_state(directory).step == 1
+
+    def test_a_save_killed_mid_promotion_is_recovered(self, tmp_path: Path, tokenizer: Any) -> None:
+        """The window that cannot be closed on three platforms, made harmless.
+
+        An atomic directory exchange would remove it, but that syscall is
+        Linux-only. So the state a kill leaves is unambiguous — a complete
+        checkpoint under a known name — and it gets put back.
+        """
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+        # Exactly what a kill between the two renames leaves behind.
+        directory.rename(directory.with_name("latest.previous"))
+        assert not directory.exists()
+
+        assert ckpt.restore_interrupted(directory) is True
+        assert ckpt.load_resume_state(directory).step == 1
+        assert not directory.with_name("latest.previous").exists()
+
+    def test_the_next_save_does_not_destroy_an_interrupted_one(
+        self, tmp_path: Path, tokenizer: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The hole the first version of this fix opened.
+
+        After an interrupted promotion the only checkpoint is under `.previous`.
+        Clearing the way for the next save by deleting it destroys that copy —
+        and if the new save then fails, nothing is left at all. A save that
+        merely succeeds hides this, because its own result replaces what was
+        lost; the failure is what exposes it.
+        """
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=1)
+        # Exactly what a kill between the two renames leaves.
+        directory.rename(directory.with_name("latest.previous"))
+
+        real = Path.rename
+
+        def refuse(self: Path, target: Any) -> None:
+            if self.name.endswith(".tmp"):
+                raise OSError("cross-device link")
+            real(self, target)
+
+        monkeypatch.setattr(Path, "rename", refuse)
+        with pytest.raises(OSError):
+            self._save(directory, tokenizer, step=2)
+        monkeypatch.undo()
+
+        assert directory.is_dir(), "the interrupted checkpoint was destroyed"
+        assert ckpt.load_resume_state(directory).step == 1
+
+    def test_a_reader_finds_an_interrupted_checkpoint(self, tmp_path: Path, tokenizer: Any) -> None:
+        """Otherwise `--resume` reports nothing to resume, beside a complete one."""
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "latest"
+        self._save(directory, tokenizer, step=3)
+        directory.rename(directory.with_name("latest.previous"))
+
+        assert ckpt.is_resumable(directory)
+        assert ckpt.load_resume_state(directory).step == 3

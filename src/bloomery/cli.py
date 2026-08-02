@@ -1164,6 +1164,10 @@ def export(
         _die(f"unknown quantization {quantize!r}; choose one of: {', '.join(QUANTIZATIONS)}")
 
     target = checkpoint if checkpoint else ckpt.checkpoint_dir(paths.run_dir(run or ""))
+    # A run saving right now may have been killed mid-promotion, leaving the
+    # checkpoint beside this path rather than at it. Export runs concurrently
+    # with training by design, so it is the command most likely to arrive then.
+    ckpt.restore_interrupted(target)
     if not target.is_dir():
         _die(f"{target} does not exist")
 
