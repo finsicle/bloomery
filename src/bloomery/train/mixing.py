@@ -107,6 +107,20 @@ def resolve(mixture: Mixture) -> ResolvedMixture:
             "Re-prepare the components against one tokenizer before blending them."
         )
 
+    # Conversations blend with plain text on purpose — that is replay, and the
+    # plain component is simply trained on in full. Preference pairs do not: a
+    # preference batch is two answers to one prompt scored against each other,
+    # and a text batch is a window scored against itself. There is no row shape
+    # that is both, so a blend of the two is refused rather than approximated.
+    preference = {name for name, info in datasets.items() if info.preference}
+    if preference and len(preference) != len(datasets):
+        detail = "\n".join(f"  {name}: {info.format}" for name, info in datasets.items())
+        raise MixtureError(
+            f"mixture {mixture.name!r} blends preference pairs with ordinary text, and "
+            f"the two are not the same kind of training:\n{detail}\n"
+            "Train the preference data as its own run, after the rest."
+        )
+
     # Safe to take the tokenizer from any component now that they are identical.
     source = mixture.datasets[0]
     tokenizer = load_tokenizer(paths.tokenizer_dir(source))
