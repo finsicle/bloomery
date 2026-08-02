@@ -19,7 +19,10 @@ from bloomery.data.shards import (
 )
 from bloomery.data.tokenizer import (
     END_OF_TEXT,
+    adopt_tokenizer,
     eot_id,
+    fingerprint,
+    id_space,
     load_tokenizer,
     train_tokenizer,
 )
@@ -28,10 +31,13 @@ __all__ = [
     "END_OF_TEXT",
     "DatasetInfo",
     "SplitInfo",
+    "adopt_tokenizer",
     "build_dataset",
     "count_bytes",
     "dtype_for_vocab",
     "eot_id",
+    "fingerprint",
+    "id_space",
     "iter_documents",
     "load_dataset",
     "load_tokenizer",

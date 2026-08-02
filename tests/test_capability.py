@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from bloomery.arch import spec_from_depth
 from bloomery.capability import (
     LADDER,
     LADDER_BY_KEY,
@@ -259,6 +260,82 @@ class TestAssess:
         capability = assess(make_report([nvidia(24)]))
         row = capability.for_method(Method.FULL)[0]
         assert row.tokens == row.spec.params * TOKENS_PER_PARAM
+
+
+class TestFixedShapeAdvice:
+    """A refusal has to suggest something the user can actually do.
+
+    For a model this project builds, picking a smaller one is the obvious lever.
+    For someone else's checkpoint the shape is a fact, and the lever is how it
+    gets trained instead.
+    """
+
+    def _spec(self) -> ModelSpec:
+        return ModelSpec("base", "a downloaded model", 22, 2048, 32, 32_000, 512, 1)
+
+    def test_a_fixed_shape_is_not_told_to_pick_a_smaller_model(self) -> None:
+        check = check_fit(
+            make_report([nvidia(8)]),
+            self._spec(),
+            batch=1,
+            seq=512,
+            device_type="cuda",
+            fixed_shape=True,
+        )
+        assert not check.fits
+        assert not any("--depth" in option for option in check.suggestions())
+
+    def test_a_fixed_shape_is_offered_the_method_that_would_fit(self) -> None:
+        check = check_fit(
+            make_report([nvidia(8)]),
+            self._spec(),
+            batch=1,
+            seq=512,
+            device_type="cuda",
+            fixed_shape=True,
+        )
+        lora = [option for option in check.suggestions() if "--method lora" in option]
+        assert lora, check.suggestions()
+        assert "fits" in lora[0]
+
+    def test_a_shape_we_chose_is_still_told_about_depth(self) -> None:
+        """The existing advice must survive for from-scratch runs."""
+        check = check_fit(
+            make_report([nvidia(8)]),
+            spec_from_depth(24, vocab=32_000, seq=512, batch=1),
+            batch=1,
+            seq=512,
+            device_type="cuda",
+        )
+        assert not check.fits
+        assert any("--depth" in option for option in check.suggestions())
+
+    def test_lora_is_not_offered_when_it_is_already_in_use(self) -> None:
+        check = check_fit(
+            make_report([nvidia(2)]),
+            self._spec(),
+            method=Method.LORA,
+            batch=1,
+            seq=512,
+            device_type="cuda",
+            fixed_shape=True,
+        )
+        assert not check.fits
+        assert not any("--method lora" in option for option in check.suggestions())
+
+
+class TestParamsOverride:
+    def test_a_known_count_replaces_the_closed_form(self) -> None:
+        """The closed form assumes our conventions; a checkpoint need not share them."""
+        guessed = ModelSpec("m", "m", 22, 2048, 32, 32_000, 512, 1)
+        known = ModelSpec("m", "m", 22, 2048, 32, 32_000, 512, 1, params_override=1_100_048_384)
+
+        assert known.params == 1_100_048_384
+        assert guessed.params != known.params
+
+    def test_the_ladder_is_unaffected(self) -> None:
+        """No preset sets an override, so every published number is unchanged."""
+        assert all(spec.params_override is None for spec in LADDER)
 
 
 class TestFormatting:

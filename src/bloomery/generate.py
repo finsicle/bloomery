@@ -43,21 +43,33 @@ class LoadedModel:
 def load(checkpoint: Path, *, device: str | None = None) -> LoadedModel:
     """Load a checkpoint for inference.
 
-    Plain ``from_pretrained``, because bloomery checkpoints are ordinary Hugging
-    Face directories. Anything else in the ecosystem can load them the same way.
+    Plain ``from_pretrained`` for a whole model, because bloomery checkpoints are
+    ordinary Hugging Face directories and anything else in the ecosystem can load
+    them the same way.
+
+    A LoRA run writes adapters instead — a few megabytes of diff rather than a
+    copy of a model that already exists on disk. Those are loaded by applying
+    them to the base they name.
     """
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
-    if not (checkpoint / "config.json").is_file():
-        raise FileNotFoundError(f"{checkpoint} is not a model directory (no config.json)")
+    from bloomery.train.loop import ModelLoadError, is_adapter_dir, load_model
+
+    if not (checkpoint / "config.json").is_file() and not is_adapter_dir(checkpoint):
+        raise FileNotFoundError(
+            f"{checkpoint} is not a model directory (no config.json or adapter_config.json)"
+        )
 
     from bloomery.train.device import select_device
 
     resolved = torch.device(device) if device else select_device()
 
-    model = AutoModelForCausalLM.from_pretrained(str(checkpoint))
-    model.to(resolved)  # type: ignore[arg-type]
+    try:
+        model = load_model(checkpoint)
+    except ModelLoadError as exc:
+        raise FileNotFoundError(str(exc)) from exc
+    model.to(resolved)
     model.eval()
     # Re-enabled explicitly: training turns the cache off when gradient
     # checkpointing is on, and that setting is persisted in config.json.

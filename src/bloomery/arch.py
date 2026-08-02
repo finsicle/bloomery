@@ -16,7 +16,7 @@ number a beginner can reason about beats twelve they will get wrong.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from bloomery.capability import LADDER_BY_KEY, ModelSpec
 
@@ -77,6 +77,53 @@ def spec_from_depth(
         vocab=vocab,
         seq=seq,
         batch=batch,
+    )
+
+
+def spec_from_model_config(
+    config: Any,
+    *,
+    seq: int,
+    batch: int,
+    params: int | None = None,
+    label: str | None = None,
+) -> ModelSpec:
+    """Describe a model that already exists, rather than one to be built.
+
+    Deliberately not routed through :func:`resolve_spec`, which exists to turn
+    ``--size``/``--depth`` into a shape and falls back to depth 4 when given
+    neither. Here the shape is not a choice — it is a fact about a checkpoint,
+    and inventing one would silently misreport what is about to be trained.
+
+    ``params`` should be the real parameter count from the loaded model. Without
+    it :attr:`ModelSpec.params` falls back to a closed form that assumes this
+    project's own conventions, which a foreign checkpoint need not follow.
+
+    ``seq`` is what the run will actually use, not the model's maximum: memory
+    scales with the sequence length trained on, and the two are rarely equal.
+    """
+    missing = [
+        name
+        for name in ("num_hidden_layers", "hidden_size", "num_attention_heads", "vocab_size")
+        if getattr(config, name, None) is None
+    ]
+    if missing:
+        raise ValueError(
+            f"this model's config does not describe its shape: missing {', '.join(missing)}. "
+            "Only decoder-style causal language models are supported."
+        )
+
+    model_type = getattr(config, "model_type", None) or "model"
+    return ModelSpec(
+        key=model_type,
+        label=label or model_type,
+        layers=config.num_hidden_layers,
+        hidden=config.hidden_size,
+        heads=config.num_attention_heads,
+        vocab=config.vocab_size,
+        seq=seq,
+        batch=batch,
+        params_override=params,
     )
 
 

@@ -11,6 +11,7 @@ from bloomery.arch import (
     intermediate_size,
     resolve_spec,
     spec_from_depth,
+    spec_from_model_config,
     suggested_lr,
 )
 from bloomery.capability import LADDER, LADDER_BY_KEY
@@ -125,6 +126,68 @@ class TestParamAgreement:
         # reports it once.
         built = sum(p.numel() for p in model.parameters())
         assert actual_param_count(spec) == built
+
+
+class TestSpecFromModelConfig:
+    """Describing a model that already exists, rather than choosing one."""
+
+    def _config(self, **overrides):  # noqa: ANN002, ANN202 - transformers types are internal
+        from transformers import LlamaConfig
+
+        defaults = dict(
+            vocab_size=32_000,
+            hidden_size=2048,
+            intermediate_size=5632,
+            num_hidden_layers=22,
+            num_attention_heads=32,
+            num_key_value_heads=4,
+            tie_word_embeddings=False,
+        )
+        return LlamaConfig(**{**defaults, **overrides})
+
+    def test_reads_the_shape_off_the_config(self) -> None:
+        spec = spec_from_model_config(self._config(), seq=512, batch=2)
+        assert (spec.layers, spec.hidden, spec.heads, spec.vocab) == (22, 2048, 32, 32_000)
+        assert spec.key == "llama"
+
+    def test_the_run_sequence_wins_over_the_model_maximum(self) -> None:
+        """Memory scales with what is trained on, not with what the model permits."""
+        config = self._config(max_position_embeddings=8192)
+        assert spec_from_model_config(config, seq=256, batch=1).seq == 256
+
+    def test_the_real_parameter_count_is_used_when_given(self) -> None:
+        """The closed form describes our models, and a foreign one need not match.
+
+        This spec is grouped-query with untied embeddings, so the estimate is
+        several percent out — and it is multiplied by the per-parameter state
+        cost to decide whether a run is refused.
+        """
+        config = self._config()
+        guessed = spec_from_model_config(config, seq=512, batch=1)
+        real = spec_from_model_config(config, seq=512, batch=1, params=1_100_048_384)
+
+        assert real.params == 1_100_048_384
+        assert guessed.params != real.params
+        assert abs(guessed.params - real.params) / real.params > 0.05
+
+    def test_a_config_that_does_not_describe_a_decoder_is_refused(self) -> None:
+        """Better than reporting a shape invented from missing fields."""
+
+        class NotALanguageModel:
+            model_type = "resnet"
+
+        with pytest.raises(ValueError, match="does not describe its shape"):
+            spec_from_model_config(NotALanguageModel(), seq=512, batch=1)
+
+    def test_it_does_not_fall_back_to_a_default_depth(self) -> None:
+        """resolve_spec answers depth 4 when told nothing; this must not.
+
+        A shape quietly invented for a checkpoint would misreport what is about
+        to be trained, and drive a memory estimate for a different model.
+        """
+        spec = spec_from_model_config(self._config(num_hidden_layers=22), seq=512, batch=1)
+        assert spec.layers == 22
+        assert resolve_spec().layers == 4  # the behaviour being avoided
 
 
 class TestSuggestedLr:

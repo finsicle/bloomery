@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from bloomery.data.tokenizer import id_space
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
 
@@ -161,7 +163,11 @@ def build_dataset(
         raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    dtype = dtype_for_vocab(tokenizer.vocab_size)
+    # The full id space, not the base vocabulary. A tokenizer that came with
+    # someone else's model can have added tokens whose ids sit above
+    # ``vocab_size``, and sizing the array from the smaller number wraps them.
+    vocab = id_space(tokenizer)
+    dtype = dtype_for_vocab(vocab)
     np_dtype = np.dtype(dtype)
 
     stride = _val_stride(
@@ -196,7 +202,9 @@ def build_dataset(
     info = DatasetInfo(
         root=out_dir,
         dtype=dtype,
-        vocab_size=int(tokenizer.vocab_size),
+        # Recorded as the id space too, so the number that describes the packed
+        # array is the same one that sized it.
+        vocab_size=vocab,
         splits=tuple(
             SplitInfo(name=name, tokens=counts[name], documents=documents_seen[name])
             for name in SPLITS

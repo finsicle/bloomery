@@ -83,6 +83,10 @@ class TrainResult:
     regressed: dict[str, float] = field(default_factory=dict)
 
 
+class ModelLoadError(RuntimeError):
+    """A model could not be opened, or adapters could not be attached."""
+
+
 def build_model(spec: ModelSpec, *, eos_token_id: int, seed: int) -> Any:
     """Create a randomly initialised Llama model.
 
@@ -95,6 +99,117 @@ def build_model(spec: ModelSpec, *, eos_token_id: int, seed: int) -> Any:
     torch.manual_seed(seed)
     config = to_llama_config(spec, eos_token_id=eos_token_id)
     return LlamaForCausalLM(config)
+
+
+@dataclass(frozen=True, slots=True)
+class LoraSettings:
+    """How to size the adapters trained against a frozen base."""
+
+    r: int = 16
+    alpha: int = 32
+    dropout: float = 0.05
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"r": self.r, "alpha": self.alpha, "dropout": self.dropout}
+
+
+ADAPTER_CONFIG = "adapter_config.json"
+
+
+def is_adapter_dir(path: Path) -> bool:
+    """Whether this checkpoint holds adapters rather than a whole model."""
+    return (path / ADAPTER_CONFIG).is_file()
+
+
+def load_model(source: str | Path) -> Any:
+    """Load a causal language model from a checkpoint or a repository id.
+
+    ``AutoModelForCausalLM`` rather than a named class: this is asked to open
+    models this project did not build, and Qwen, Mistral and Phi are not Llama
+    classes. Naming one would work on our own checkpoints and fail on everything
+    the feature exists for.
+
+    An adapter checkpoint is not a model — it is a small diff against one — so it
+    is loaded by first loading the base it names and then applying the adapters
+    on top. Doing that here rather than at each call site means inference,
+    resuming, and adapting an already-adapted model all handle it the same way.
+    """
+    from transformers import AutoModelForCausalLM
+
+    path = Path(source)
+    if path.is_dir() and is_adapter_dir(path):
+        return _load_adapted(path)
+
+    try:
+        return AutoModelForCausalLM.from_pretrained(str(source))
+    except Exception as exc:  # noqa: BLE001 - transformers raises many types here
+        raise ModelLoadError(
+            f"could not load a model from {source!r}: {exc}\n"
+            "Give a local checkpoint directory or a Hugging Face repository id."
+        ) from exc
+
+
+def _load_adapted(path: Path) -> Any:
+    """Load the base a set of adapters was trained against, then apply them."""
+    import json
+
+    from transformers import AutoModelForCausalLM
+
+    try:
+        from peft import PeftModel
+    except ImportError as exc:  # pragma: no cover - depends on install extras
+        raise ModelLoadError(
+            f"{path} holds LoRA adapters, which need the adapt extra: "
+            'install it with  uv pip install -e ".[adapt]"'
+        ) from exc
+
+    config = json.loads((path / ADAPTER_CONFIG).read_text(encoding="utf-8"))
+    base = config.get("base_model_name_or_path")
+    if not base:
+        raise ModelLoadError(
+            f"{path} does not record which model its adapters were trained against, "
+            "so there is nothing to apply them to."
+        )
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(str(base))
+    except Exception as exc:  # noqa: BLE001 - transformers raises many types here
+        raise ModelLoadError(
+            f"{path} holds adapters for {base!r}, which could not be loaded: {exc}\n"
+            "Adapters are a diff against a base model; the base has to be available too."
+        ) from exc
+
+    return PeftModel.from_pretrained(model, str(path), is_trainable=True)
+
+
+def attach_adapter(model: Any, settings: LoraSettings) -> Any:
+    """Freeze the model and train low-rank adapters against it instead.
+
+    The optimizer built later skips parameters that do not require a gradient, so
+    freezing here is all that is needed for the rest of the loop to follow.
+    """
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:  # pragma: no cover - depends on install extras
+        raise ModelLoadError(
+            'training adapters needs the adapt extra: install it with  uv pip install -e ".[adapt]"'
+        ) from exc
+
+    config = LoraConfig(
+        r=settings.r,
+        lora_alpha=settings.alpha,
+        lora_dropout=settings.dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    return get_peft_model(model, config)
+
+
+def trainable_fraction(model: Any) -> tuple[int, int]:
+    """(trainable, total) parameters, for reporting what is actually being trained."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return trainable, total
 
 
 class BatchSampler:
@@ -200,14 +315,25 @@ def train(
     choice: DeviceChoice,
     eos_token_id: int,
     resume_from: Path | None = None,
+    base_model: str | Path | None = None,
+    adapter: LoraSettings | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> TrainResult:
-    """Train a model from random initialisation, or resume one.
+    """Train a model from random initialisation, resume one, or continue someone else's.
 
     Always trains against a :class:`~bloomery.mixture.Mixture`. A plain single
     dataset is a one-component blend — see :func:`bloomery.mixture.single` — so
     there is one sampling path, one evaluation path and one metrics shape rather
     than two that drift apart.
+
+    ``base_model`` continues training a model that already exists, from a local
+    directory or a Hugging Face repository id. ``adapter`` trains LoRA adapters
+    against it with the base frozen, instead of every weight.
+
+    The three ways of getting a model differ only in how it is constructed.
+    Sampling, the schedule, evaluation, forgetting detection, metrics and
+    checkpointing are the same afterwards, deliberately: a second training path
+    would be a second set of behaviours to keep in step.
 
     Emits every event to ``run.jsonl`` and, if given, to ``on_event`` for live
     display.
@@ -215,16 +341,21 @@ def train(
     import time
 
     import torch
-    from transformers import LlamaForCausalLM
 
     run_dir.mkdir(parents=True, exist_ok=True)
     peak_lr = config.lr if config.lr is not None else suggested_lr(spec)
 
     if resume_from is not None:
-        model = LlamaForCausalLM.from_pretrained(str(resume_from))
+        model = load_model(resume_from)
+    elif base_model is not None:
+        model = load_model(base_model)
     else:
         model = build_model(spec, eos_token_id=eos_token_id, seed=config.seed)
-    model.to(choice.device)  # type: ignore[arg-type]
+
+    if adapter is not None:
+        model = attach_adapter(model, adapter)
+
+    model.to(choice.device)
     model.train()
 
     if config.gradient_checkpointing:

@@ -102,6 +102,78 @@ def load_tokenizer(path: Path) -> Tokenizer:
     return AutoTokenizer.from_pretrained(str(path))
 
 
+def adopt_tokenizer(source: str | Path, out_dir: Path) -> Tokenizer:
+    """Take an existing model's tokenizer instead of training a new one.
+
+    ``source`` is a local directory or a Hugging Face repository id.
+
+    Continuing to train a model means writing into an embedding table indexed by
+    *its* tokenizer's ids, so a corpus for that model has to be packed with that
+    tokenizer. This is what makes such a corpus possible; without it every
+    dataset carries a tokenizer bloomery invented, and no existing model can
+    read it.
+
+    The tokenizer is saved into the dataset alongside the tokens so the dataset
+    stays self-describing — the same shape ``prepare`` already produces, and the
+    same shape the mixture loader expects.
+    """
+    from transformers import AutoTokenizer
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(str(source))
+    except Exception as exc:  # noqa: BLE001 - transformers raises many types here
+        raise ValueError(
+            f"could not load a tokenizer from {source!r}: {exc}\n"
+            "Give a local model directory or a Hugging Face repository id."
+        ) from exc
+
+    if tokenizer.eos_token_id is None and tokenizer.bos_token_id is None:
+        raise ValueError(
+            f"the tokenizer at {source!r} declares neither an end-of-text nor a "
+            "beginning-of-text token, so documents cannot be separated in the "
+            "packed stream."
+        )
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tokenizer.save_pretrained(str(out_dir))
+    return tokenizer
+
+
+def id_space(tokenizer: Tokenizer) -> int:
+    """How many distinct ids this tokenizer can emit.
+
+    ``vocab_size`` is the base vocabulary and excludes added tokens, while
+    ``len()`` includes them. Sizing the packed array from the smaller of the two
+    is how a base vocabulary just under 65,536 plus a handful of added special
+    tokens silently wraps in ``uint16``: the added ids come back as whatever they
+    collide with, and nothing reports it.
+    """
+    return max(int(tokenizer.vocab_size), len(tokenizer))
+
+
+def fingerprint(tokenizer: Tokenizer) -> str:
+    """Identify a tokenizer by what it does, not by the file it came from.
+
+    The mixture loader compares datasets by hashing ``tokenizer.json`` directly,
+    which is right there: both sides were written by this project, so identical
+    tokenizers give identical bytes.
+
+    That does not hold when one side is someone else's model. Saving a tokenizer
+    re-serialises it, and a re-serialised file need not be byte-identical to the
+    original even though the tokenizer is the same. Hashing the backend's own
+    canonical form compares the vocabulary and merges instead, which is what
+    actually has to match.
+    """
+    import hashlib
+
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is not None:
+        canonical = backend.to_str()
+    else:  # pragma: no cover - only for slow tokenizers, which prepare never writes
+        canonical = repr(sorted(tokenizer.get_vocab().items()))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def eot_id(tokenizer: Tokenizer) -> int:
     """The end-of-text id, which is also the document separator.
 

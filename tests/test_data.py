@@ -12,10 +12,13 @@ import pytest
 
 from bloomery.data import (
     END_OF_TEXT,
+    adopt_tokenizer,
     build_dataset,
     count_bytes,
     dtype_for_vocab,
     eot_id,
+    fingerprint,
+    id_space,
     iter_documents,
     load_dataset,
     open_split,
@@ -230,3 +233,76 @@ class TestBuildDataset:
     def test_unknown_split(self, dataset: Any) -> None:
         with pytest.raises(KeyError):
             dataset.split("test")
+
+
+class TestIdSpace:
+    """Sizing the packed array from the wrong number wraps ids in silence."""
+
+    def test_counts_added_tokens(self, tokenizer: Any) -> None:
+        base = tokenizer.vocab_size
+        tokenizer.add_tokens(["<|extra_one|>", "<|extra_two|>"])
+        assert len(tokenizer) > base
+        assert id_space(tokenizer) == len(tokenizer)
+
+    def test_a_vocabulary_just_under_the_limit_is_not_packed_as_uint16(self) -> None:
+        """The concrete failure: base vocab below 65,536, added tokens above it.
+
+        Sizing from ``vocab_size`` alone gives uint16, and every added token's id
+        comes back as whatever it collides with, with nothing reporting it.
+        """
+
+        class Tokenizer:
+            vocab_size = 65_530
+
+            def __len__(self) -> int:
+                return 65_540
+
+        assert dtype_for_vocab(Tokenizer.vocab_size) == "uint16"
+        assert dtype_for_vocab(id_space(Tokenizer())) == "uint32"
+
+
+class TestAdoptTokenizer:
+    """Packing a corpus for a model that already exists."""
+
+    def test_adopting_reproduces_the_source_tokenizer(self, tmp_path: Path, tokenizer: Any) -> None:
+        """What makes a corpus for an existing model possible at all."""
+        source = tmp_path / "source"
+        tokenizer.save_pretrained(str(source))
+        original = tokenizer
+
+        adopted = adopt_tokenizer(source, tmp_path / "adopted")
+        adopted_dir = tmp_path / "adopted"
+
+        assert (adopted_dir / "tokenizer.json").is_file()
+        assert fingerprint(adopted) == fingerprint(original)
+        assert adopted("hello world")["input_ids"] == original("hello world")["input_ids"]
+
+    def test_a_source_that_is_not_a_tokenizer_is_refused(self, tmp_path: Path) -> None:
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with pytest.raises(ValueError, match="could not load a tokenizer"):
+            adopt_tokenizer(empty, tmp_path / "out")
+
+
+class TestFingerprint:
+    """Identity by behaviour, not by the bytes a file happens to have.
+
+    The mixture guard hashes ``tokenizer.json`` directly, which is right when
+    both sides were written by this project. It is not right when one side is
+    someone else's model: saving re-serialises, and a re-serialised file need
+    not be byte-identical to the original.
+    """
+
+    def test_survives_a_save_and_reload(self, tmp_path: Path, tokenizer: Any) -> None:
+        from bloomery.data import load_tokenizer
+
+        before = fingerprint(tokenizer)
+        tokenizer.save_pretrained(str(tmp_path / "saved"))
+        assert fingerprint(load_tokenizer(tmp_path / "saved")) == before
+
+    def test_differs_for_a_different_vocabulary(self, tmp_path: Path, documents: Any) -> None:
+        from bloomery.data import train_tokenizer
+
+        small = train_tokenizer(documents, vocab_size=300, out_dir=tmp_path / "a")
+        large = train_tokenizer(documents, vocab_size=500, out_dir=tmp_path / "b")
+        assert fingerprint(small) != fingerprint(large)

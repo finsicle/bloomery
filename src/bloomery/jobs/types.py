@@ -21,8 +21,11 @@ from typing import Any
 
 
 class JobKind(StrEnum):
+    # The value is the CLI subcommand: build_command runs
+    # `python -m bloomery.cli <value>`, so these must not drift apart.
     PREPARE = "prepare"
     TRAIN = "train"
+    ADAPT = "adapt"
     BENCH = "bench"
 
 
@@ -50,7 +53,7 @@ class JobStatus(StrEnum):
 # other because VRAM cannot be partitioned on consumer hardware: two training
 # processes sharing one card do not each get half, they contend for all of it
 # and the second one dies.
-EXCLUSIVE_KINDS = frozenset({JobKind.TRAIN, JobKind.BENCH})
+EXCLUSIVE_KINDS = frozenset({JobKind.TRAIN, JobKind.ADAPT, JobKind.BENCH})
 
 
 def utc_now() -> str:

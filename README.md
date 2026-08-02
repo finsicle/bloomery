@@ -60,7 +60,7 @@ libraries. There is nothing that is both.
 | LLaMA-Factory          |      ❌       |           ✅           |    ✅     |     ✅     |
 | Oumi                   |      ✅       |           ✅           |    ✅     |     ❌     |
 | nanochat               |      ✅       |           ✅           |    ✅     |     ❌     |
-| **bloomery**           |    **✅**     |          M4           |    M4    |  **✅**   |
+| **bloomery**           |    **✅**     |        **✅**         |   M4.1   |  **✅**   |
 
 The tools with the capability are CLI and YAML. The tools with the interface
 start from someone else's weights. Bloomery is from-scratch first, with
@@ -80,12 +80,17 @@ a milestone are not built yet — see [Roadmap](#roadmap).
 - **CPU thread caps** — `--cores` works identically on every platform.
 - **Replay mixtures** — weighted, versioned dataset blends with per-component
   forgetting detection.
+- **Continue an existing model** — `adapt` carries on training a checkpoint of
+  yours or anyone else's, every weight or LoRA adapters against a frozen base.
+  It refuses a corpus packed with a tokenizer the model cannot read, which is
+  otherwise a silent failure. Pair it with a replay mixture and the
+  per-component evaluation names whatever starts getting worse.
 - **Web UI and job queue** — `bloomery serve` opens a page that queues prepare,
   train and bench jobs, streams their state live, tails their logs and cancels
   them. Per-job CPU, memory and GPU limits. It binds to localhost by default.
 
 ### Not built yet
-- **Continued pretraining, SFT and preference optimization** (M4).
+- **SFT and preference optimization** (M4.1).
 - **Export to GGUF, Ollama, MLX** (M5).
 
 ## Hardware
@@ -112,7 +117,8 @@ hardware, `bloomery doctor --json` in an issue is genuinely useful.
 | **M1**    | Pretrain from scratch end to end, then generate from it            | done |
 | **M2**    | Replay mixtures — weighted, versioned dataset blends               | done |
 | **M3**    | Web UI, job queue, cancel/resume, resource limits                  | done |
-| **M4**    | Continued pretraining and SFT on existing models                   | next |
+| **M4**    | Continued pretraining on existing models, full or LoRA              | done |
+| **M4.1**  | SFT and preference optimization                                    | next |
 | **M5**    | Export — GGUF, quantization, Ollama                                |        |
 | **M6**    | AMD hardening on real hardware, Windows, evaluation                |        |
 
