@@ -1116,6 +1116,26 @@ class TestLogCompaction:
             child.kill()
             child.wait(timeout=10)
 
+    def test_no_running_job_falls_off_the_end_of_the_query(
+        self, store: JobStore, tmp_path: Path
+    ) -> None:
+        """running() used to cap at 1000, and results come back newest first.
+
+        So past the cap it dropped the *oldest* running rows — the long-lived
+        jobs, which are both the ones with the largest logs and the ones
+        reconcile() most needs to see.
+        """
+        first = store.create(JobKind.PREPARE, {})
+        store.mark_started(first.id, pid=1, pid_created_at=1.0)
+        for _ in range(1200):
+            job = store.create(JobKind.PREPARE, {})
+            store.mark_started(job.id, pid=2, pid_created_at=1.0)
+
+        running = store.running()
+
+        assert len(running) == 1201
+        assert first.id in {job.id for job in running}, "the oldest running job was dropped"
+
     def test_the_supervisor_bounds_a_log_when_the_job_exits(
         self, store: JobStore, tmp_path: Path, stub_command, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1139,7 +1159,11 @@ class TestLogCompaction:
         sup = Supervisor(store=store, home=tmp_path, poll_seconds=0.05)
         job = sup.submit(JobKind.PREPARE, {})
 
-        for _ in range(400):
+        # A wall-clock deadline rather than a fixed iteration count: a loaded CI
+        # runner takes far longer per pass than this machine does, and a count
+        # tuned here fails there for no reason to do with the code.
+        deadline = time.time() + 120
+        while time.time() < deadline:
             sup.tick()
             if store.get(job.id).status.terminal:
                 break
@@ -1166,7 +1190,7 @@ class TestLogCompaction:
                 "-u",
                 "-c",
                 "import sys, time\n"
-                "for i in range(4000):\n"
+                "for i in range(2000):\n"
                 "    print('x' * 80)\n"
                 "    sys.stdout.flush()\n"
                 "    time.sleep(0.001)\n",
@@ -1177,7 +1201,10 @@ class TestLogCompaction:
 
         path = log_path_for(tmp_path, job.id)
         peak = 0
-        for _ in range(400):
+        # A wall-clock deadline rather than a fixed iteration count, which was
+        # tuned on a fast machine and timed out on a loaded CI runner.
+        deadline = time.time() + 120
+        while time.time() < deadline:
             sup.tick()
             if path.exists():
                 peak = max(peak, path.stat().st_size)
@@ -1186,10 +1213,10 @@ class TestLogCompaction:
             time.sleep(0.02)
 
         assert store.get(job.id).status.terminal, "job never finished"
-        # Without compaction this run writes ~320 KiB. The bound is the cap plus
-        # whatever one poll interval adds, not the cap exactly.
-        assert peak < 200_000, f"log reached {peak} bytes despite a 4 KiB cap"
-        assert path.stat().st_size < 200_000
+        # Uncompacted this run writes ~160 KiB. The bound is the cap plus
+        # whatever accumulates between passes, not the cap exactly.
+        assert peak < 100_000, f"log reached {peak} bytes despite a 4 KiB cap"
+        assert path.stat().st_size < 100_000
 
 
 class TestOutputEncoding:
