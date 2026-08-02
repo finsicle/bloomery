@@ -257,6 +257,30 @@ class TestMetadataLlamaCppWillAccept:
         assert len(tokens.data) == model.config.vocab_size
         assert len(tokens.data) == int(embedding.shape[1])
 
+    def test_a_stale_vocab_size_does_not_shrink_the_token_list(
+        self, model: Any, tokenizer: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The embedding's rows are the truth; the config is what goes stale.
+
+        llama.cpp sizes `token_embd.weight` as {n_embd, n_vocab} from the token
+        list it read, so a list sized from a config that no longer matches the
+        embedding writes a file whose own two halves disagree — it does not load.
+        A padded embedding or a resize on an older transformers leaves exactly
+        this gap, and both arrive through `adapt` on someone else's checkpoint.
+        """
+        rows = int(model.get_input_embeddings().weight.shape[0])
+        monkeypatch.setattr(model.config, "vocab_size", rows - 3)
+
+        out = tmp_path / "stale.gguf"
+        result = to_gguf(model, tokenizer, out)
+
+        reader = GGUFReader(str(out))
+        embedding = next(t for t in reader.tensors if t.name == "token_embd.weight")
+        assert len(reader.fields["tokenizer.ggml.tokens"].data) == rows
+        assert int(embedding.shape[1]) == rows
+        # Reported as what was written, not as what the config claimed.
+        assert result.vocab_size == rows
+
     def test_a_sparse_vocabulary_keeps_every_token_at_its_own_id(
         self, model: Any, tokenizer: Any, tmp_path: Path
     ) -> None:
@@ -278,16 +302,9 @@ class TestMetadataLlamaCppWillAccept:
             def get_vocab(self) -> dict[str, int]:
                 return {"a": 0, "b": 1, "z": 9}
 
-        model.config.vocab_size = 10
-        original = model.get_input_embeddings().weight.shape[0]
-        try:
-            out = tmp_path / "sparse.gguf"
-            to_gguf(model, tokenizer, out)  # a sanity export, real tokenizer
-            from bloomery.export import _vocabulary
+        from bloomery.export import _vocabulary
 
-            tokens, _ = _vocabulary(Sparse(), Sparse)
-        finally:
-            model.config.vocab_size = original
+        tokens, _ = _vocabulary(Sparse(), Sparse, 10)
 
         assert len(tokens) == 10
         assert tokens[0] == "a"
@@ -318,6 +335,29 @@ class TestRefusals:
         with pytest.raises(ExportError, match="nothing to write"):
             to_gguf(Hollow(), tokenizer, tmp_path / "hollow.gguf")
 
+    def test_a_token_the_model_cannot_embed_is_refused(
+        self, model: Any, tokenizer: Any, tmp_path: Path
+    ) -> None:
+        """`add_tokens` without a resize leaves ids the embedding cannot index.
+
+        Dropping them quietly would export cleanly and crash the first time the
+        tokenizer produced one.
+        """
+        rows = int(model.get_input_embeddings().weight.shape[0])
+
+        class Overflowing:
+            """The real tokenizer, plus one token nothing has a row for."""
+
+            chat_template = None
+            all_special_tokens: list[str] = []
+            backend_tokenizer = tokenizer.backend_tokenizer
+
+            def get_vocab(self) -> dict[str, int]:
+                return {**tokenizer.get_vocab(), "<|extra|>": rows}
+
+        with pytest.raises(ExportError, match="cannot embed"):
+            to_gguf(model, Overflowing(), tmp_path / "overflow.gguf")
+
     def test_an_unknown_quantization_is_refused(
         self, model: Any, tokenizer: Any, tmp_path: Path
     ) -> None:
@@ -335,3 +375,21 @@ class TestModelfile:
         """Without one a runtime generates past the end of the reply."""
         text = write_modelfile(tmp_path, tokenizer).read_text(encoding="utf-8")
         assert "PARAMETER stop" in text
+
+    def test_an_eos_token_that_cannot_be_quoted_is_left_out(
+        self, tokenizer: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A quote inside the value ends it early and strands the rest as arguments.
+
+        Left out rather than escaped: whether this grammar reads a backslash as an
+        escape is not something this project verifies, and a stop parameter that is
+        quietly the wrong string is worse than an absent one. The eos id travels in
+        the GGUF metadata, which is what a runtime actually stops on.
+
+        monkeypatch, not assignment: the tokenizer fixture is shared across tests.
+        """
+        monkeypatch.setattr(tokenizer, "eos_token", '<|end"of"text|>', raising=False)
+        text = write_modelfile(tmp_path, tokenizer).read_text(encoding="utf-8")
+
+        assert "PARAMETER stop" not in text
+        assert "not quotable" in text

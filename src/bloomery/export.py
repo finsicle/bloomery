@@ -157,6 +157,11 @@ def to_gguf(
         state = dict(state)
         state["lm_head.weight"] = embedding
 
+    # The token list is sized from this rather than from config.vocab_size. See
+    # _vocabulary: llama.cpp checks the two against each other and refuses a file
+    # where they disagree.
+    rows = _embedding_rows(state)
+
     # The official mapping rather than a hand-written table, so a rename upstream
     # is not something this has to notice.
     names = get_tensor_name_map(MODEL_ARCH.LLAMA, config.num_hidden_layers)
@@ -178,7 +183,7 @@ def to_gguf(
         writer.add_layer_norm_rms_eps(config.rms_norm_eps)
         writer.add_file_type(_file_type(quantization))
         _add_rope(writer, config)
-        _add_tokenizer(writer, tokenizer, config)
+        vocabulary = _add_tokenizer(writer, tokenizer, config, rows)
 
         parameters = 0
         written = 0
@@ -221,7 +226,8 @@ def to_gguf(
         parameters=parameters,
         bytes_written=out_path.stat().st_size,
         context_length=config.max_position_embeddings,
-        vocab_size=config.vocab_size,
+        # What was written, which is not always what the config claims.
+        vocab_size=vocabulary,
         unquantized=tuple(unquantized),
     )
 
@@ -259,7 +265,17 @@ def write_modelfile(directory: Path, tokenizer: Any, *, gguf_name: str = GGUF_NA
 
     eos = getattr(tokenizer, "eos_token", None)
     if eos:
-        lines.append(f'PARAMETER stop "{eos}"')
+        # Quoted, so a token carrying a quote or a newline would end the value
+        # early and leave the rest as stray arguments. No escape sequence is
+        # written instead: the Modelfile grammar's handling of one is not
+        # something this can verify, and a stop parameter that is silently the
+        # wrong string is worse than none. It is belt-and-braces anyway — the eos
+        # id travels in the GGUF metadata, which is what Ollama stops on.
+        if any(character in str(eos) for character in '"\r\n'):
+            lines.append(f"# The eos token is not quotable here, so no stop parameter: {eos!r}")
+            lines.append("# Ollama stops on the eos id in the GGUF metadata regardless.")
+        else:
+            lines.append(f'PARAMETER stop "{eos}"')
     lines.append("")
 
     path = directory / MODELFILE
@@ -293,21 +309,50 @@ def _add_rope(writer: Any, config: Any) -> None:
         writer.add_rope_freq_base(float(theta))
 
 
-def _vocabulary(tokenizer: Any, config: Any) -> tuple[list[str], set[str]]:
+def _embedding_rows(state: Any) -> int:
+    """How many tokens the model can actually embed, or 0 if that is unknowable."""
+    for name in ("model.embed_tokens.weight", "lm_head.weight"):
+        tensor = state.get(name)
+        if tensor is not None and getattr(tensor, "ndim", 0) == 2:
+            return int(tensor.shape[0])
+    return 0
+
+
+def _vocabulary(tokenizer: Any, config: Any, rows: int = 0) -> tuple[list[str], set[str]]:
     """The token list, indexed by id, sized to the embedding table.
 
     Built by position rather than by sorting the vocabulary, because sorting only
     reproduces the ids when they happen to be contiguous. Tokenizers this project
     trains are; ones that arrive with a published checkpoint need not be. They
-    reserve blocks of ids, and they are routinely shorter than ``vocab_size`` —
-    the embedding has rows nothing is named for.
+    reserve blocks of ids, and they are routinely shorter than the embedding —
+    it has rows nothing is named for.
 
     Sorting a sparse vocabulary silently shifts every token after the first gap
     by one, so the model tokenizes to ids that mean something else. Nothing
     errors; the output is simply wrong.
+
+    Sized from the embedding's own row count, not ``config.vocab_size``, because
+    the row count is the number llama.cpp checks: it builds ``token_embd.weight``
+    as ``{n_embd, n_vocab}`` from the token list it read and rejects a file whose
+    tensor disagrees. The two are the same number in a checkpoint nobody resized,
+    and ``config.vocab_size`` is stale in one that was — a padded embedding leaves
+    it low, and `resize_token_embeddings` on an older transformers leaves it
+    behind entirely. Trusting the config there writes a file no runtime loads.
     """
     vocab = tokenizer.get_vocab()
-    size = int(getattr(config, "vocab_size", 0)) or (max(vocab.values(), default=-1) + 1)
+    size = rows or int(getattr(config, "vocab_size", 0)) or (max(vocab.values(), default=-1) + 1)
+
+    # Tokens the model has no row for. Dropping them quietly would leave a
+    # tokenizer that emits ids the embedding cannot index — a crash at generation
+    # time, from a file that exported cleanly.
+    overflow = sorted(int(index) for index in vocab.values() if int(index) >= size)
+    if overflow:
+        raise ExportError(
+            f"this tokenizer has {len(overflow)} token(s) the model cannot embed: ids "
+            f"{overflow[:5]}{'…' if len(overflow) > 5 else ''} against {size} embedding rows.\n"
+            "Tokens were probably added without resizing the embedding. Export is "
+            "refused because the resulting model would fail the moment one was produced."
+        )
 
     by_id: dict[int, str] = {}
     for token, index in vocab.items():
@@ -355,14 +400,16 @@ def _merges(tokenizer: Any) -> list[str]:
     return merges
 
 
-def _add_tokenizer(writer: Any, tokenizer: Any, config: Any) -> None:
+def _add_tokenizer(writer: Any, tokenizer: Any, config: Any, rows: int = 0) -> int:
     """Write the vocabulary, and say which pre-tokenizer produced it.
 
     ``gpt2`` and ``default`` are the byte-level BPE settings, which is what every
     tokenizer this project trains is — see the module docstring for why naming it
     outright is safe here and is not for a general converter.
+
+    Returns how many tokens were written.
     """
-    tokens, added = _vocabulary(tokenizer, config)
+    tokens, added = _vocabulary(tokenizer, config, rows)
 
     writer.add_tokenizer_model("gpt2")
     writer.add_tokenizer_pre("default")
@@ -387,3 +434,5 @@ def _add_tokenizer(writer: Any, tokenizer: Any, config: Any) -> None:
     template = getattr(tokenizer, "chat_template", None)
     if template:
         writer.add_chat_template(template)
+
+    return len(tokens)
