@@ -778,3 +778,87 @@ class TestTrainedTokensSurviveResume:
             directory / ckpt.TRAINER_STATE,
         )
         assert ckpt.load_resume_state(directory).trained_tokens == 4096
+
+
+class TestWindowsAlwaysCarryLoss:
+    """A window holding nothing but ignored positions scores a mean over an
+    empty set, which is NaN. It does not corrupt the gradient — that arrives as
+    zeros — but it does reach the reported loss, run.jsonl and the final result,
+    where it reads as a diverged model rather than an unlucky draw.
+
+    One prompt longer than the sequence length is enough to produce one.
+    """
+
+    def _dataset(self, tmp_path: Path, *, prompt_tokens: int, seq: int) -> Any:
+        """A corpus whose prompts are far longer than the window."""
+        import numpy as np
+
+        from bloomery.data.shards import FORMAT_SFT, META_NAME, DatasetInfo, SplitInfo
+
+        root = tmp_path / "sparse"
+        root.mkdir()
+        reply = 4
+        ids, mask = [], []
+        # Ids stay inside the vocabulary the test model is built with.
+        for _ in range(40):
+            ids.extend((i % 60) + 1 for i in range(prompt_tokens))
+            mask.extend([0] * prompt_tokens)
+            ids.extend((i % 60) + 1 for i in range(reply))
+            mask.extend([1] * reply)
+
+        np.asarray(ids, dtype=np.uint16).tofile(root / "train.bin")
+        np.asarray(mask, dtype=np.uint8).tofile(root / "train.mask.bin")
+        info = DatasetInfo(
+            root=root,
+            dtype="uint16",
+            vocab_size=64,
+            format=FORMAT_SFT,
+            splits=(SplitInfo(name="train", tokens=len(ids), documents=40),),
+        )
+        (root / META_NAME).write_text(json.dumps(info.to_dict()), encoding="utf-8")
+        return info
+
+    def test_every_window_has_something_to_learn_from(
+        self, tmp_path: Path, cpu_choice: DeviceChoice
+    ) -> None:
+        """Prompts eight times the window length: a naive draw lands in one often."""
+        from bloomery.train.loop import IGNORE_INDEX, BatchSampler
+
+        info = self._dataset(tmp_path, prompt_tokens=128, seq=16)
+        sampler = BatchSampler(info, "train", seq=16, seed=0)
+
+        for _ in range(40):
+            labels = sampler.batch(4, cpu_choice.device)["labels"]
+            per_row = (labels != IGNORE_INDEX).sum(dim=1)
+            assert int(per_row.min()) > 0, "a window came back with nothing supervised"
+
+    def test_the_loss_of_such_a_batch_is_finite(
+        self, tmp_path: Path, cpu_choice: DeviceChoice
+    ) -> None:
+        """The property that actually matters: the number reaching the user."""
+        import torch
+
+        from bloomery.train.loop import BatchSampler
+
+        info = self._dataset(tmp_path, prompt_tokens=128, seq=16)
+        model = build_model(spec_from_depth(1, vocab=64, seq=16), eos_token_id=0, seed=0)
+        sampler = BatchSampler(info, "train", seq=16, seed=1)
+
+        for _ in range(20):
+            with torch.no_grad():
+                loss = model(**sampler.batch(1, cpu_choice.device)).loss
+            assert torch.isfinite(loss), "an all-masked window produced a NaN loss"
+
+    def test_an_all_masked_window_would_have_been_nan(
+        self, tmp_path: Path, cpu_choice: DeviceChoice
+    ) -> None:
+        """Pins why the resampling is there, rather than trusting the comment."""
+        import torch
+
+        from bloomery.train.loop import IGNORE_INDEX
+
+        model = build_model(spec_from_depth(1, vocab=64, seq=16), eos_token_id=0, seed=0)
+        ids = torch.randint(0, 64, (1, 16))
+        with torch.no_grad():
+            loss = model(input_ids=ids, labels=torch.full_like(ids, IGNORE_INDEX)).loss
+        assert torch.isnan(loss)

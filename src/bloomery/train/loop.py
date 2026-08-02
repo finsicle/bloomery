@@ -254,6 +254,49 @@ class BatchSampler:
                 f"sequence length of {seq}. Use a shorter --seq or a larger corpus."
             )
         self._length = length
+        self._supervised_blocks = self._index_supervision(info, split, seq)
+
+    @staticmethod
+    def _index_supervision(info: DatasetInfo, split: str, seq: int) -> Any | None:
+        """Where in a masked corpus a window is guaranteed to find something.
+
+        Which windows carry a loss cannot be answered by redrawing and hoping:
+        with prompts several times the sequence length, most draws land in one,
+        and a bounded number of retries leaves a real chance of returning a
+        window with nothing supervised in it at all.
+
+        So the offsets that do work are recorded once. One entry per window-sized
+        block rather than per token — for a corpus of a billion tokens at a
+        sequence length of 512, two million entries instead of a billion — and
+        the mask is walked in chunks so indexing it never holds the whole thing.
+        """
+        import numpy as np
+
+        mask = open_mask(info, split)
+        if mask is None:
+            return None
+
+        blocks = len(mask) // seq
+        if blocks == 0:
+            return None
+
+        # Chunked so a large corpus is not materialised to build its own index.
+        per_chunk = max(1, (1 << 22) // seq)
+        flags: list[Any] = []
+        for start in range(0, blocks, per_chunk):
+            stop = min(start + per_chunk, blocks)
+            window = np.asarray(mask[start * seq : stop * seq]).reshape(stop - start, seq)
+            flags.append(window.any(axis=1))
+        usable = np.flatnonzero(np.concatenate(flags)) * seq
+
+        if usable.size == 0:
+            raise ValueError(
+                f"split {split!r} has no window of {seq} tokens containing anything to "
+                "learn from — every response is shorter than the gap between them. "
+                "Use a shorter --seq, or check that the corpus was packed against the "
+                "right chat template."
+            )
+        return usable
 
     @property
     def tokens(self) -> int:
@@ -270,16 +313,27 @@ class BatchSampler:
         The labels are deliberately not shifted. The model does that internally,
         so a shifted label tensor here would move the mask a position away from
         the token it belongs to.
+
+        A window holding no supervised token at all is redrawn. One prompt longer
+        than the sequence length is enough to produce one — and cross-entropy
+        over nothing but ignored positions is a mean of an empty set, which comes
+        back NaN. That NaN is not caught by the gradient (it arrives as zeros) but
+        it does reach the reported loss, run.jsonl and the final result, where it
+        looks like a diverged model rather than an unlucky draw.
         """
         import numpy as np
         import torch
 
         data = open_split(self._info, self._split)
+        mask = open_mask(self._info, self._split)
+
         starts = self._rng.integers(0, self._length - self._seq - 1, size=size)
+        if mask is not None:
+            starts = self._with_supervision(mask, starts)
+
         window = np.stack([data[i : i + self._seq] for i in starts]).astype(np.int64)
         inputs = torch.from_numpy(window).to(device, non_blocking=True)
 
-        mask = open_mask(self._info, self._split)
         if mask is None:
             return {"input_ids": inputs, "labels": inputs}
 
@@ -289,6 +343,27 @@ class BatchSampler:
             "input_ids": inputs,
             "labels": torch.from_numpy(labels).to(device, non_blocking=True),
         }
+
+    def _with_supervision(self, mask: Any, starts: Any) -> Any:
+        """Replace any window that would carry no loss at all.
+
+        The uniform draw stays the normal path, so ordinary sampling is unchanged
+        and windows are not biased toward responses. Only a barren row is moved,
+        and it is moved onto a recorded offset rather than redrawn — a redraw
+        might land in another prompt, and with prompts several times the sequence
+        length it usually would.
+        """
+        import numpy as np
+
+        if self._supervised_blocks is None:  # pragma: no cover - masked implies an index
+            return starts
+
+        barren = np.array([not mask[i : i + self._seq].any() for i in starts], dtype=bool)
+        if not barren.any():
+            return starts
+
+        replacements = self._rng.choice(self._supervised_blocks, size=len(starts))
+        return np.where(barren, replacements, starts)
 
 
 def lr_at(step: int, config: TrainConfig, peak: float) -> float:
@@ -514,6 +589,15 @@ def train(
                     # Average over accumulation so the gradient matches what a
                     # single large batch would have produced.
                     scaled = loss / config.grad_accum
+                if not torch.isfinite(scaled):
+                    # A microbatch with nothing supervised in it scores a mean
+                    # over an empty set. The sampler redraws such windows, so
+                    # reaching here means it could not find one — in which case
+                    # dropping the microbatch is right, and far better than
+                    # adding NaN to the step loss and publishing it as the run's
+                    # result. `evaluate` has guarded this since before masking;
+                    # the training step had not.
+                    continue
                 scaler.scale(scaled).backward()
                 step_loss += scaled.item()
                 # What the loss was actually computed over. With a conversation
