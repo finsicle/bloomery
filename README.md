@@ -60,7 +60,11 @@ libraries. There is nothing that is both.
 | LLaMA-Factory          |      ❌       |           ✅           |    ✅     |     ✅     |
 | Oumi                   |      ✅       |           ✅           |    ✅     |     ❌     |
 | nanochat               |      ✅       |           ✅           |    ✅     |     ❌     |
-| **bloomery**           |    **✅**     |        **✅**         |  **✅**   |  **✅**   |
+| **bloomery**           |    **✅**     |        **✅**         |    ~     |  **✅**   |
+
+Bloomery's `SFT / RL` is a tilde deliberately: supervised fine-tuning works,
+preference optimization does not exist yet. A checkmark there would claim half
+a column it has not earned.
 
 The tools with the capability are CLI and YAML. The tools with the interface
 start from someone else's weights. Bloomery is from-scratch first, with

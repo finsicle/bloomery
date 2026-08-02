@@ -727,3 +727,54 @@ class TestAdapterTraining:
 
         with pytest.raises(ModelLoadError, match="could not load a model"):
             load_model(tmp_path / "nothing")
+
+
+class TestTrainedTokensSurviveResume:
+    """The counter that says what the loss was computed over.
+
+    Its sibling tokens_seen is cumulative across a resume; if this one restarts
+    at zero, a resumed run reports a fraction of what it trained on, and the two
+    numbers contradict each other in the same file.
+    """
+
+    def test_the_checkpoint_carries_it(self, tmp_path: Path, tokenizer: Any) -> None:
+        import torch
+
+        from bloomery.train import checkpoint as ckpt
+
+        spec = spec_from_depth(1, vocab=64, seq=16)
+        model = build_model(spec, eos_token_id=0, seed=0)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        directory = ckpt.save(
+            tmp_path / "ckpt",
+            model=model,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            step=10,
+            tokens_seen=5000,
+            trained_tokens=1234,
+            best_val_loss=None,
+        )
+        assert ckpt.load_resume_state(directory).trained_tokens == 1234
+        assert json.loads((directory / "run.json").read_text())["trained_tokens"] == 1234
+
+    def test_a_checkpoint_from_before_masking_falls_back_to_the_window(
+        self, tmp_path: Path
+    ) -> None:
+        """Every token was trained on then, so the window count is the honest total.
+
+        Restarting at zero would make a resumed old run look like it had learned
+        from almost nothing.
+        """
+        import torch
+
+        from bloomery.train import checkpoint as ckpt
+
+        directory = tmp_path / "old"
+        directory.mkdir()
+        torch.save(
+            {"step": 7, "tokens_seen": 4096, "best_val_loss": None},
+            directory / ckpt.TRAINER_STATE,
+        )
+        assert ckpt.load_resume_state(directory).trained_tokens == 4096

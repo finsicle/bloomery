@@ -32,6 +32,10 @@ class ResumeState:
     step: int
     best_val_loss: float | None
     tokens_seen: int
+    # Tokens the loss was actually computed over. Restored alongside tokens_seen
+    # or a resumed run reports only the portion after the resume, while its
+    # sibling counter stays cumulative.
+    trained_tokens: int = 0
     # Per-component forgetting history. Without it a resumed run treats its first
     # evaluation as a baseline, so a component that was already degrading before
     # the checkpoint is reported as healthy.
@@ -53,6 +57,7 @@ def save(
     step: int,
     tokens_seen: int,
     best_val_loss: float | None,
+    trained_tokens: int = 0,
     component_best: dict[str, float] | None = None,
     component_first: dict[str, float] | None = None,
     extra: dict[str, Any] | None = None,
@@ -73,6 +78,7 @@ def save(
             "optimizer": optimizer.state_dict(),
             "step": step,
             "tokens_seen": tokens_seen,
+            "trained_tokens": trained_tokens,
             "best_val_loss": best_val_loss,
             "component_best": component_best or {},
             "component_first": component_first or {},
@@ -85,6 +91,7 @@ def save(
             {
                 "step": step,
                 "tokens_seen": tokens_seen,
+                "trained_tokens": trained_tokens,
                 "best_val_loss": best_val_loss,
                 **(extra or {}),
             },
@@ -119,6 +126,10 @@ def load_resume_state(
         step=int(payload.get("step", 0)),
         best_val_loss=payload.get("best_val_loss"),
         tokens_seen=int(payload.get("tokens_seen", 0)),
+        # Absent from a checkpoint written before masking existed, where every
+        # token was trained on; falling back to the window count keeps such a
+        # run's total honest rather than restarting it at zero.
+        trained_tokens=int(payload.get("trained_tokens", payload.get("tokens_seen", 0))),
         # Absent in checkpoints written before forgetting was tracked; an empty
         # history simply means the next evaluation establishes the baseline.
         component_best=dict(payload.get("component_best") or {}),

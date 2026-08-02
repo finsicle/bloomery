@@ -423,10 +423,19 @@ def prepare(
             f"responses  [bold]{share:.0%}[/bold] of tokens are trained on  "
             f"[dim]{train_split.documents:,} conversations; prompts are masked out[/dim]"
         )
+        # Warned at both ends, because both mean the boundaries were not found —
+        # and a corpus that trains on almost nothing packs and reports success
+        # exactly like one that worked.
         if share > 0.9:
             console.print(
                 "[yellow]           nearly everything is being trained on, which usually "
                 "means the prompts were not recognised[/yellow]"
+            )
+        elif share < 0.05:
+            console.print(
+                f"[yellow]           only {share:.1%} of tokens carry a loss, which usually "
+                "means the replies were not found where this model's chat template "
+                "puts them[/yellow]"
             )
     if tokenizer_from:
         # This corpus was packed for a specific model, so `train` is the wrong

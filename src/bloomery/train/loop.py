@@ -435,6 +435,7 @@ def train(
         resume_state = checkpoint.load_resume_state(resume_from, optimizer)
         start_step = resume_state.step
         tokens_seen = resume_state.tokens_seen
+        trained_tokens = resume_state.trained_tokens
         best_val = resume_state.best_val_loss
 
     # fp16 needs loss scaling to keep small gradients from flushing to zero.
@@ -541,6 +542,7 @@ def train(
                         loss=round(step_loss, 5),
                         lr=round(lr, 8),
                         tokens=tokens_seen,
+                        trained_tokens=trained_tokens,
                         tokens_per_second=round(rate, 1),
                     )
                 )
@@ -592,6 +594,7 @@ def train(
                     optimizer=optimizer,
                     step=step + 1,
                     tokens_seen=tokens_seen,
+                    trained_tokens=trained_tokens,
                     best_val_loss=best_val,
                     component_best=dict(tracker.best),
                     component_first=dict(tracker.first),
@@ -610,6 +613,7 @@ def train(
             optimizer=optimizer,
             step=config.steps,
             tokens_seen=tokens_seen,
+            trained_tokens=trained_tokens,
             best_val_loss=best_val,
             component_best=dict(tracker.best),
             component_first=dict(tracker.first),
@@ -627,6 +631,11 @@ def train(
                 final_loss=round(final_loss, 5),
                 best_val_loss=round(best_val, 5) if best_val is not None else None,
                 tokens=tokens_seen,
+                # Distinct from `tokens`, which counts the window. Under a
+                # completion mask most of that window is prompt, so publishing
+                # only the window overstates the run several-fold — which is the
+                # whole reason this counter exists.
+                trained_tokens=trained_tokens,
                 tokens_per_second=round(throughput.value or 0.0, 1),
                 checkpoint=str(final_path),
                 per_component={k: round(v, 5) for k, v in tracker.best.items()} or None,
