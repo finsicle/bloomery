@@ -139,6 +139,105 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+# --------------------------------------------------------------------------- #
+# shared by train and adapt
+# --------------------------------------------------------------------------- #
+#
+# Both commands run the same loop and report the same events, so the reporting
+# lives here rather than being written twice. It was written twice first, and the
+# copies had already drifted: one lost the note explaining why per-component
+# evaluation exists, and the other never gained the low-headroom warning.
+
+
+def _report_fit(fit: Any, *, force: bool) -> None:
+    """Print the memory estimate, and refuse the run if it will not fit."""
+    console.print(
+        f"memory     ~{fit.required / GIB:.1f} GiB needed of "
+        f"{fit.budget.total / GIB:.1f} GiB  [dim]{fit.budget.source}[/dim]"
+    )
+    if fit.fits:
+        if fit.spare < 0.25:
+            console.print(
+                f"[yellow]           only {fit.spare:.0%} spare — "
+                "an out-of-memory error is plausible[/yellow]"
+            )
+        return
+
+    lines = [
+        f"this configuration needs about {fit.required / GIB:.1f} GiB but only "
+        f"{fit.budget.total / GIB:.1f} GiB is available ({fit.budget.source}).",
+    ]
+    if fit.suggestions():
+        lines.append("\ntry one of:")
+        lines.extend(f"  {option}" for option in fit.suggestions())
+    lines.append(
+        "\nThe estimate is conservative and assumes AdamW in bf16. Pass --force to start anyway."
+    )
+    if not force:
+        _die("\n".join(lines))
+    console.print("[yellow]--force given; starting despite the estimate[/yellow]")
+
+
+def _training_events(progress: Any, task: Any) -> Any:
+    """Bridge the loop's events to the live display."""
+
+    def on_event(event: dict[str, Any]) -> None:
+        if event["event"] == "step":
+            progress.update(
+                task,
+                completed=event["step"],
+                description=(f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"),
+            )
+        elif event["event"] == "eval":
+            line = (
+                f"  [dim]step {event['step']}[/dim]  "
+                f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
+                f"ppl {event['perplexity']}"
+            )
+            per = event.get("per_component") or {}
+            if len(per) > 1:
+                line += (
+                    "  [dim]" + " ".join(f"{k} {v:.3f}" for k, v in sorted(per.items())) + "[/dim]"
+                )
+            progress.console.print(line)
+            # The point of per-component evaluation: name the corpus that is
+            # getting worse, while there is still time to raise its weight.
+            for component, delta in (event.get("regressed") or {}).items():
+                progress.console.print(
+                    f"  [yellow]forgetting[/yellow]  {component} is {delta:.4f} above its best"
+                )
+
+    return on_event
+
+
+def _report_result(result: Any, blend: Any, name: str) -> None:
+    """Print what the run achieved, and what to do about anything it forgot."""
+    console.print()
+    console.print(f"final loss [bold]{result.final_loss:.4f}[/bold]")
+    if result.best_val_loss is not None:
+        console.print(f"best val   [bold]{result.best_val_loss:.4f}[/bold]")
+    console.print(f"throughput {result.tokens_per_second:,.0f} tok/s")
+    if len(result.per_component_loss) > 1:
+        console.print()
+        console.print("per component")
+        for component, loss in sorted(result.per_component_loss.items()):
+            flag = (
+                f"  [yellow]+{result.regressed[component]:.4f} over best[/yellow]"
+                if component in result.regressed
+                else ""
+            )
+            console.print(f"  {component:<24} {loss:.4f}{flag}")
+        if result.regressed:
+            console.print(
+                "\n[yellow]Some components ended worse than their best.[/yellow] "
+                "Raise their weight, or mark them as replay:\n"
+                f"  [bold]bloomery mix add {blend.name} "
+                f"--replay {next(iter(result.regressed))}:0.2[/bold]"
+            )
+    console.print(f"checkpoint {result.checkpoint}")
+    console.print(f"\nnext:  [bold]bloomery chat --run {name}[/bold]")
+
+
 def _spec_summary(capability: Any, method: Method) -> dict[str, Any] | None:
     row = capability.largest_fitting(method)
     if row is None:
@@ -257,7 +356,17 @@ def prepare(
         f"tokens     [bold]{train_split.tokens:,}[/bold] train / "
         f"{val_split.tokens:,} val  ({info.dtype}) → {tokens_path}"
     )
-    console.print(f"\nnext:  [bold]bloomery train --data {name} --name run1[/bold]")
+    if tokenizer_from:
+        # This corpus was packed for a specific model, so `train` is the wrong
+        # next step: it would build a fresh random model around that model's
+        # vocabulary — for a large one, an expensive way to get nothing anybody
+        # wanted, and it would succeed, so nothing would signal the mistake.
+        console.print(
+            f"\nnext:  [bold]bloomery adapt --from {tokenizer_from} "
+            f"--data {name} --name adapt1[/bold]"
+        )
+    else:
+        console.print(f"\nnext:  [bold]bloomery train --data {name} --name run1[/bold]")
 
 
 # --------------------------------------------------------------------------- #
@@ -401,30 +510,7 @@ def train(
         gradient_checkpointing=grad_checkpoint,
         device_type=choice.type,
     )
-    console.print(
-        f"memory     ~{fit.required / GIB:.1f} GiB needed of "
-        f"{fit.budget.total / GIB:.1f} GiB  [dim]{fit.budget.source}[/dim]"
-    )
-    if not fit.fits:
-        lines = [
-            f"this configuration needs about {fit.required / GIB:.1f} GiB but only "
-            f"{fit.budget.total / GIB:.1f} GiB is available ({fit.budget.source}).",
-        ]
-        if fit.suggestions():
-            lines.append("\ntry one of:")
-            lines.extend(f"  {option}" for option in fit.suggestions())
-        lines.append(
-            "\nThe estimate is conservative and assumes AdamW in bf16. "
-            "Pass --force to start anyway."
-        )
-        if not force:
-            _die("\n".join(lines))
-        console.print("[yellow]--force given; starting despite the estimate[/yellow]")
-    elif fit.spare < 0.25:
-        console.print(
-            f"[yellow]           only {fit.spare:.0%} spare — "
-            "an out-of-memory error is plausible[/yellow]"
-        )
+    _report_fit(fit, force=force)
     console.print()
 
     columns = (
@@ -437,35 +523,7 @@ def train(
     with Progress(*columns, console=console) as progress:
         task = progress.add_task("training", total=steps, completed=0)
 
-        def on_event(event: dict[str, Any]) -> None:
-            if event["event"] == "step":
-                progress.update(
-                    task,
-                    completed=event["step"],
-                    description=(
-                        f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"
-                    ),
-                )
-            elif event["event"] == "eval":
-                line = (
-                    f"  [dim]step {event['step']}[/dim]  "
-                    f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
-                    f"ppl {event['perplexity']}"
-                )
-                per = event.get("per_component") or {}
-                if len(per) > 1:
-                    line += (
-                        "  [dim]"
-                        + " ".join(f"{k} {v:.3f}" for k, v in sorted(per.items()))
-                        + "[/dim]"
-                    )
-                progress.console.print(line)
-                # The point of per-component evaluation: name the corpus that is
-                # getting worse, while there is still time to raise its weight.
-                for component, delta in (event.get("regressed") or {}).items():
-                    progress.console.print(
-                        f"  [yellow]forgetting[/yellow]  {component} is {delta:.4f} above its best"
-                    )
+        on_event = _training_events(progress, task)
 
         try:
             result = run_training(
@@ -488,30 +546,7 @@ def train(
             console.print("\n[yellow]interrupted[/yellow] — no checkpoint written this step")
             raise typer.Exit(code=130) from None
 
-    console.print()
-    console.print(f"final loss [bold]{result.final_loss:.4f}[/bold]")
-    if result.best_val_loss is not None:
-        console.print(f"best val   [bold]{result.best_val_loss:.4f}[/bold]")
-    console.print(f"throughput {result.tokens_per_second:,.0f} tok/s")
-    if len(result.per_component_loss) > 1:
-        console.print()
-        console.print("per component")
-        for component, loss in sorted(result.per_component_loss.items()):
-            flag = (
-                f"  [yellow]+{result.regressed[component]:.4f} over best[/yellow]"
-                if component in result.regressed
-                else ""
-            )
-            console.print(f"  {component:<24} {loss:.4f}{flag}")
-        if result.regressed:
-            console.print(
-                "\n[yellow]Some components ended worse than their best.[/yellow] "
-                "Raise their weight, or mark them as replay:\n"
-                f"  [bold]bloomery mix add {blend.name} "
-                f"--replay {next(iter(result.regressed))}:0.2[/bold]"
-            )
-    console.print(f"checkpoint {result.checkpoint}")
-    console.print(f"\nnext:  [bold]bloomery chat --run {name}[/bold]")
+    _report_result(result, blend, name)
 
 
 # --------------------------------------------------------------------------- #
@@ -635,7 +670,9 @@ def adapt(
     with console.status(f"loading {from_model}"):
         try:
             model = load_model(from_model)
-            model_tokenizer = load_tokenizer(Path(from_model))
+            # Not Path(from_model): a repo id is not a path, and converting one
+            # rewrites its separator on Windows.
+            model_tokenizer = load_tokenizer(from_model)
         except ModelLoadError as exc:
             _die(str(exc))
         except Exception as exc:  # noqa: BLE001 - tokenizer loading raises many types
@@ -650,9 +687,15 @@ def adapt(
         _die(str(exc))
 
     trainable, total = trainable_fraction(model)
-    spec = spec_from_model_config(
-        model.config, seq=seq, batch=batch, params=total, label=str(from_model)
-    )
+    try:
+        spec = spec_from_model_config(
+            model.config, seq=seq, batch=batch, params=total, label=str(from_model)
+        )
+    except ValueError as exc:
+        # Reachable: from_pretrained accepts architectures whose config carries
+        # no attention-head count at all, so the model loads and only this fails.
+        # The message explains what is wrong, and a traceback would bury it.
+        _die(str(exc))
     adapter = (
         LoraSettings(r=lora_r, alpha=lora_alpha, dropout=lora_dropout)
         if chosen is Method.LORA
@@ -705,25 +748,7 @@ def adapt(
         device_type=choice.type,
         fixed_shape=True,
     )
-    console.print(
-        f"memory     ~{fit.required / GIB:.1f} GiB needed of "
-        f"{fit.budget.total / GIB:.1f} GiB  [dim]{fit.budget.source}[/dim]"
-    )
-    if not fit.fits:
-        lines = [
-            f"this configuration needs about {fit.required / GIB:.1f} GiB but only "
-            f"{fit.budget.total / GIB:.1f} GiB is available ({fit.budget.source}).",
-        ]
-        if fit.suggestions():
-            lines.append("\ntry one of:")
-            lines.extend(f"  {option}" for option in fit.suggestions())
-        lines.append(
-            "\nThe estimate is conservative and assumes AdamW in bf16. "
-            "Pass --force to start anyway."
-        )
-        if not force:
-            _die("\n".join(lines))
-        console.print("[yellow]--force given; starting despite the estimate[/yellow]")
+    _report_fit(fit, force=force)
 
     run_path = paths.run_dir(name)
     resume_from = None
@@ -745,33 +770,7 @@ def adapt(
     with Progress(*columns, console=console) as progress:
         task = progress.add_task("adapting", total=steps, completed=0)
 
-        def on_event(event: dict[str, Any]) -> None:
-            if event["event"] == "step":
-                progress.update(
-                    task,
-                    completed=event["step"],
-                    description=(
-                        f"loss {event['loss']:.3f}  {event['tokens_per_second']:,.0f} tok/s"
-                    ),
-                )
-            elif event["event"] == "eval":
-                line = (
-                    f"  [dim]step {event['step']}[/dim]  "
-                    f"val loss [bold]{event['val_loss']:.4f}[/bold]  "
-                    f"ppl {event['perplexity']}"
-                )
-                per = event.get("per_component") or {}
-                if len(per) > 1:
-                    line += (
-                        "  [dim]"
-                        + " ".join(f"{k} {v:.3f}" for k, v in sorted(per.items()))
-                        + "[/dim]"
-                    )
-                progress.console.print(line)
-                for component, delta in (event.get("regressed") or {}).items():
-                    progress.console.print(
-                        f"  [yellow]forgetting[/yellow]  {component} is {delta:.4f} above its best"
-                    )
+        on_event = _training_events(progress, task)
 
         try:
             result = run_training(
@@ -798,30 +797,7 @@ def adapt(
             console.print("\n[yellow]interrupted[/yellow] — no checkpoint written this step")
             raise typer.Exit(code=130) from None
 
-    console.print()
-    console.print(f"final loss [bold]{result.final_loss:.4f}[/bold]")
-    if result.best_val_loss is not None:
-        console.print(f"best val   [bold]{result.best_val_loss:.4f}[/bold]")
-    console.print(f"throughput {result.tokens_per_second:,.0f} tok/s")
-    if len(result.per_component_loss) > 1:
-        console.print()
-        console.print("per component")
-        for component, loss in sorted(result.per_component_loss.items()):
-            flag = (
-                f"  [yellow]+{result.regressed[component]:.4f} over best[/yellow]"
-                if component in result.regressed
-                else ""
-            )
-            console.print(f"  {component:<24} {loss:.4f}{flag}")
-        if result.regressed:
-            console.print(
-                "\n[yellow]Some components ended worse than their best.[/yellow] "
-                "Raise their weight, or mark them as replay:\n"
-                f"  [bold]bloomery mix add {blend.name} "
-                f"--replay {next(iter(result.regressed))}:0.2[/bold]"
-            )
-    console.print(f"checkpoint {result.checkpoint}")
-    console.print(f"\nnext:  [bold]bloomery chat --run {name}[/bold]")
+    _report_result(result, blend, name)
 
 
 # --------------------------------------------------------------------------- #

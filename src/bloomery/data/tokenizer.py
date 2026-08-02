@@ -95,8 +95,14 @@ def _batched(documents: Iterable[str]) -> Iterator[list[str]]:
         yield batch
 
 
-def load_tokenizer(path: Path) -> Tokenizer:
-    """Load a tokenizer previously saved by :func:`train_tokenizer`."""
+def load_tokenizer(path: str | Path) -> Tokenizer:
+    """Load a tokenizer from a directory or a Hugging Face repository id.
+
+    Takes ``str`` as well as ``Path`` because a repository id is not a path.
+    Routing ``Qwen/Qwen2-0.5B`` through ``Path`` rewrites the separator on
+    Windows and the lookup then fails, in a way that would never show up on a
+    machine where the separator happens to be a slash.
+    """
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(str(path))
@@ -140,15 +146,26 @@ def adopt_tokenizer(source: str | Path, out_dir: Path) -> Tokenizer:
 
 
 def id_space(tokenizer: Tokenizer) -> int:
-    """How many distinct ids this tokenizer can emit.
+    """The smallest array width that can hold every id this tokenizer emits.
 
-    ``vocab_size`` is the base vocabulary and excludes added tokens, while
-    ``len()`` includes them. Sizing the packed array from the smaller of the two
-    is how a base vocabulary just under 65,536 plus a handful of added special
-    tokens silently wraps in ``uint16``: the added ids come back as whatever they
-    collide with, and nothing reports it.
+    Counting entries is not enough. ``vocab_size`` excludes added tokens and
+    ``len()`` includes them, but both are counts, and an id is not bounded by
+    how many of them there are: a tokenizer can hold 32,001 entries where one
+    sits at id 128,255, which several published models do because they reserve a
+    block of special tokens at the top.
+
+    Sizing the packed array from a count is then how that token silently wraps in
+    ``uint16``, coming back as whatever it collides with, with nothing reporting
+    it. So take the highest id actually in use.
     """
-    return max(int(tokenizer.vocab_size), len(tokenizer))
+    counts = [int(tokenizer.vocab_size), len(tokenizer)]
+    # Guarded rather than assumed: every tokenizer `prepare` writes has this,
+    # but widening an array is a decision worth making from what is actually
+    # there, not from a call that might not exist on some future backend.
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    if callable(get_vocab):
+        counts.append(max(get_vocab().values(), default=-1) + 1)
+    return max(counts)
 
 
 def fingerprint(tokenizer: Tokenizer) -> str:

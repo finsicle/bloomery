@@ -238,11 +238,38 @@ class TestBuildDataset:
 class TestIdSpace:
     """Sizing the packed array from the wrong number wraps ids in silence."""
 
-    def test_counts_added_tokens(self, tokenizer: Any) -> None:
-        base = tokenizer.vocab_size
-        tokenizer.add_tokens(["<|extra_one|>", "<|extra_two|>"])
-        assert len(tokenizer) > base
-        assert id_space(tokenizer) == len(tokenizer)
+    def test_counts_added_tokens(self, documents: list[str], tmp_path: Path) -> None:
+        """Trains its own tokenizer: add_tokens mutates in place, and the shared
+        fixture is session-scoped, so doing this to it would leak the extra
+        tokens into every later test that touches it."""
+        from bloomery.data import train_tokenizer
+
+        local = train_tokenizer(documents[:200], vocab_size=300, out_dir=tmp_path / "local")
+        base = local.vocab_size
+        local.add_tokens(["<|extra_one|>", "<|extra_two|>"])
+
+        assert len(local) > base
+        assert id_space(local) == len(local)
+
+    def test_an_id_above_the_entry_count_still_widens_the_array(self) -> None:
+        """Counting entries is not the same as bounding ids.
+
+        A tokenizer can hold a few thousand entries with one of them at id
+        128,255 — several published models reserve a block of special tokens at
+        the top. Both counts then say uint16, and that token wraps.
+        """
+
+        class Sparse:
+            vocab_size = 32_000
+
+            def __len__(self) -> int:
+                return 32_001
+
+            def get_vocab(self) -> dict[str, int]:
+                return {"a": 0, "<|reserved|>": 128_255}
+
+        assert id_space(Sparse()) == 128_256
+        assert dtype_for_vocab(id_space(Sparse())) == "uint32"
 
     def test_a_vocabulary_just_under_the_limit_is_not_packed_as_uint16(self) -> None:
         """The concrete failure: base vocab below 65,536, added tokens above it.

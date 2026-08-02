@@ -146,9 +146,14 @@ def check_tokenizer_matches(resolved: ResolvedMixture, model_tokenizer: Any, sou
         f"tokenizer {fingerprint(resolved.tokenizer)}\n"
         f"  model   {source}: {id_space(model_tokenizer):,} ids, "
         f"tokenizer {fingerprint(model_tokenizer)}\n"
-        "Re-pack the corpus against the model's own tokenizer:\n"
-        f"  bloomery prepare --name {resolved.mixture.datasets[0]} "
-        f"--source ... --tokenizer {source}"
+        # Every component, not just the first. A replay blend is the arrangement
+        # this is most often used with, and naming one of its datasets sends the
+        # user round the same refusal again for the next.
+        "Re-pack every component against the model's own tokenizer:\n"
+        + "\n".join(
+            f"  bloomery prepare --name {name} --source ... --tokenizer {source}"
+            for name in resolved.mixture.datasets
+        )
     )
 
 

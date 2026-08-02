@@ -179,7 +179,14 @@ def _load_adapted(path: Path) -> Any:
             "Adapters are a diff against a base model; the base has to be available too."
         ) from exc
 
-    return PeftModel.from_pretrained(model, str(path), is_trainable=True)
+    try:
+        return PeftModel.from_pretrained(model, str(path), is_trainable=True)
+    except Exception as exc:  # noqa: BLE001 - peft raises many types here
+        raise ModelLoadError(
+            f"the adapters in {path} could not be applied to {base!r}: {exc}\n"
+            "They may have been trained against a different model, or the adapter "
+            "file may be incomplete."
+        ) from exc
 
 
 def attach_adapter(model: Any, settings: LoraSettings) -> Any:
