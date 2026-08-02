@@ -333,3 +333,66 @@ class TestFingerprint:
         small = train_tokenizer(documents, vocab_size=300, out_dir=tmp_path / "a")
         large = train_tokenizer(documents, vocab_size=500, out_dir=tmp_path / "b")
         assert fingerprint(small) != fingerprint(large)
+
+
+class TestFingerprintWithoutAFastBackend:
+    """A tokenizer with no fast backend has no canonical serialisation.
+
+    Reachable: AutoTokenizer returns a slow tokenizer for any model shipping no
+    fast implementation, and ``adopt_tokenizer`` takes whatever it is given.
+    Hashing the vocabulary alone would be unsafe in the worst direction, because
+    normalisation happens before the lookup — so two tokenizers can share a
+    vocabulary and still assign different ids to the same text.
+    """
+
+    class Slow:
+        """Only the surface ``fingerprint`` uses, and deliberately no backend."""
+
+        def __init__(self, vocab: dict[str, int], *, lowercase: bool) -> None:
+            self._vocab = vocab
+            self._lowercase = lowercase
+
+        def get_vocab(self) -> dict[str, int]:
+            return dict(self._vocab)
+
+        def __call__(self, text: str, **_: Any) -> dict[str, list[int]]:
+            prepared = text.lower() if self._lowercase else text
+            return {"input_ids": [self._vocab.get(ch, 0) for ch in prepared]}
+
+    VOCAB = {"A": 1, "a": 2, "B": 3, "b": 4}
+
+    def test_the_same_vocabulary_with_different_normalisation_differs(self) -> None:
+        """The case that made the vocabulary-only fingerprint unsafe.
+
+        A false match here does not raise. It lets the run start on ids that
+        address the wrong symbols, which is what this comparison exists to stop.
+        """
+        folding = self.Slow(self.VOCAB, lowercase=True)
+        faithful = self.Slow(self.VOCAB, lowercase=False)
+
+        assert folding.get_vocab() == faithful.get_vocab()
+        assert fingerprint(folding) != fingerprint(faithful)
+
+    def test_two_identical_slow_tokenizers_still_match(self) -> None:
+        """Failing safe must not mean failing always."""
+        assert fingerprint(self.Slow(self.VOCAB, lowercase=True)) == fingerprint(
+            self.Slow(self.VOCAB, lowercase=True)
+        )
+
+    def test_a_different_vocabulary_still_differs(self) -> None:
+        other = dict(self.VOCAB) | {"C": 5}
+        assert fingerprint(self.Slow(self.VOCAB, lowercase=False)) != fingerprint(
+            self.Slow(other, lowercase=False)
+        )
+
+    def test_a_tokenizer_that_cannot_encode_does_not_crash_the_comparison(self) -> None:
+        """A refusal to encode is itself a difference worth recording."""
+
+        class Broken(TestFingerprintWithoutAFastBackend.Slow):
+            def __call__(self, text: str, **_: Any) -> dict[str, list[int]]:
+                raise RuntimeError("no")
+
+        assert fingerprint(Broken(self.VOCAB, lowercase=False))
+        assert fingerprint(Broken(self.VOCAB, lowercase=False)) != fingerprint(
+            self.Slow(self.VOCAB, lowercase=False)
+        )

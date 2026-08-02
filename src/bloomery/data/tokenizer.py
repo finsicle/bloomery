@@ -168,6 +168,20 @@ def id_space(tokenizer: Tokenizer) -> int:
     return max(counts)
 
 
+# Text the fallback fingerprint runs through a tokenizer to see what it does with
+# it. Chosen to move under the transformations that separate two tokenizers
+# sharing a vocabulary: letter case, accents and other combining marks, runs of
+# whitespace, punctuation attachment, digit grouping, and non-Latin scripts.
+_PROBE = (
+    "The Quick brown FOX\n"
+    "  spaced\tout  \n"
+    "café CAFÉ café\n"
+    "hello, world! (don't) [x]=1;\n"
+    "1234567890 3.14 -7\n"
+    "日本語 Ελληνικά Привет 🙂\n"
+)
+
+
 def fingerprint(tokenizer: Tokenizer) -> str:
     """Identify a tokenizer by what it does, not by the file it came from.
 
@@ -180,15 +194,46 @@ def fingerprint(tokenizer: Tokenizer) -> str:
     original even though the tokenizer is the same. Hashing the backend's own
     canonical form compares the vocabulary and merges instead, which is what
     actually has to match.
+
+    A tokenizer with no fast backend has no such canonical form, and that case is
+    reachable: ``AutoTokenizer`` returns a slow tokenizer for any model that
+    ships no fast implementation, and ``adopt_tokenizer`` will happily take one.
+    Hashing its vocabulary alone would be unsafe in the worst direction — two
+    tokenizers can share a vocabulary and still assign different ids to the same
+    text, because normalisation happens before the lookup. One that lowercases
+    and one that does not would fingerprint identically, and this comparison is
+    what stands between a user and training on ids that mean nothing to their
+    model.
+
+    So the fallback also asks the tokenizer what it actually produces for a fixed
+    probe. That captures normalisation, case folding and pre-tokenisation by
+    observing them rather than by trying to enumerate them. It is not a proof of
+    equality — two tokenizers agreeing on the probe could still differ on some
+    other input — but it fails in the safe direction far more often, and a
+    difference it does see is a real one.
     """
     import hashlib
 
     backend = getattr(tokenizer, "backend_tokenizer", None)
     if backend is not None:
         canonical = backend.to_str()
-    else:  # pragma: no cover - only for slow tokenizers, which prepare never writes
-        canonical = repr(sorted(tokenizer.get_vocab().items()))
+    else:
+        canonical = repr(
+            (
+                sorted(tokenizer.get_vocab().items()),
+                _probe_ids(tokenizer),
+            )
+        )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
+def _probe_ids(tokenizer: Tokenizer) -> list[int] | str:
+    """What this tokenizer makes of :data:`_PROBE`, for the fallback fingerprint."""
+    try:
+        encoded = tokenizer(_PROBE, add_special_tokens=False)["input_ids"]
+    except Exception as exc:  # noqa: BLE001 - a tokenizer that cannot encode is a difference too
+        return f"unencodable: {type(exc).__name__}"
+    return [int(i) for i in encoded]
 
 
 def eot_id(tokenizer: Tokenizer) -> int:
