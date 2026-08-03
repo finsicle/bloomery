@@ -306,10 +306,11 @@ class TestPreferenceScoring:
         from bloomery.train.device import DeviceChoice, select_precision
         from bloomery.train.objective import IGNORE_INDEX
 
-        drawn = preference_batch(pairs=4)
+        pairs = 16
+        drawn = preference_batch(pairs=pairs)
         # Shorten the rejected half: mask most of its scored positions away.
         labels = drawn["labels"].clone()
-        labels[4:, 6:] = IGNORE_INDEX
+        labels[pairs:, 6:] = IGNORE_INDEX
         drawn = {**drawn, "labels": labels}
 
         class OneBatch:
@@ -320,11 +321,21 @@ class TestPreferenceScoring:
         choice = DeviceChoice(
             device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
         )
-        by_sum, by_token, _ = score_preferences(plain, OneBatch(), choice, batch=4, batches=1)
+        by_sum, by_token, _ = score_preferences(plain, OneBatch(), choice, batch=pairs, batches=1)
 
-        # The short answers accumulate fewer negative terms, so they win on the
-        # sum. Per token, length buys them nothing.
-        assert by_sum < by_token, f"length bias did not show: {by_sum} vs {by_token}"
+        # Two assertions rather than `by_sum < by_token`, because that comparison
+        # conflates a deterministic fact with a stochastic one and a failure
+        # would not say which broke.
+        #
+        # The sum is deterministic: an answer a third the length accumulates a
+        # third the negative terms, so the short side wins every pair. Measured
+        # at exactly 0.00 across five model seeds at 4, 16 and 32 pairs.
+        assert by_sum == 0.0, f"length should win the sum outright, got {by_sum}"
+        # The per-token figure is a coin toss for an untrained model — 0.31 to
+        # 0.56 over those same seeds — so it is bounded away from the floor
+        # rather than pinned to a value. What matters is that length did not
+        # drag it down with the sum.
+        assert by_token > 0.15, f"length bias reached the per-token measure too: {by_token}"
 
 
 class TestCausalLoss:

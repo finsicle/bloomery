@@ -118,8 +118,10 @@ a milestone are not built yet — see [Roadmap](#roadmap).
   otherwise a silent failure. Pair it with a replay mixture and the
   per-component evaluation names whatever starts getting worse.
 - **Web UI and job queue** — `bloomery serve` opens a page that queues prepare,
-  train and bench jobs, streams their state live, tails their logs and cancels
-  them. Per-job CPU, memory and GPU limits. It binds to localhost by default.
+  train, adapt, export, eval and bench jobs, streams their state live, tails
+  their logs and cancels them. Per-job CPU, memory and GPU limits. It binds to
+  localhost by default. The form offers exactly the flags the runner accepts,
+  and a test fails when the two drift apart.
 
 ### Not built yet
 - **Preference optimization beyond DPO** — IPO, KTO, SimPO, PPO. Not scheduled.
