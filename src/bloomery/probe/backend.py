@@ -166,7 +166,11 @@ def arch_issues(gpus: list[GpuInfo]) -> list[Issue]:
     it is not "rough edges", it is a run that cannot start.
     """
     issues: list[Issue] = []
-    overridden = bool(os.environ.get(HSA_OVERRIDE, "").strip())
+    # The value, not merely whether one is set. An override naming a different
+    # architecture than this card needs is no better than none — the card still
+    # takes the process down on its first operation — so treating "set" as "safe"
+    # would wave through the exact failure this check exists to catch.
+    setting = os.environ.get(HSA_OVERRIDE, "").strip()
     for gpu in gpus:
         if gpu.vendor is not Vendor.AMD or not gpu.arch:
             continue
@@ -174,7 +178,7 @@ def arch_issues(gpus: list[GpuInfo]) -> list[Issue]:
         if arch in ROCM_SUPPORTED_ARCHS:
             continue
         override = override_hint(arch)
-        if override and overridden:
+        if override and setting == override:
             issues.append(
                 Issue(
                     level="info",
@@ -182,6 +186,22 @@ def arch_issues(gpus: list[GpuInfo]) -> list[Issue]:
                     hint=(
                         "Not an officially supported ROCm target, so expect rough edges — "
                         "but the override is set and the card should work."
+                    ),
+                )
+            )
+        elif override and setting:
+            issues.append(
+                Issue(
+                    level="error",
+                    message=(
+                        f"{HSA_OVERRIDE} is set to {setting}, but {gpu.name} ({arch}) "
+                        f"needs {override}. The wrong architecture is no safer than none: "
+                        "operations on this GPU will still crash the process."
+                    ),
+                    hint=(
+                        f"export {HSA_OVERRIDE}={override}\n"
+                        "  One variable covers the whole process, so a machine with two "
+                        "cards wanting different values can only run one of them at a time."
                     ),
                 )
             )

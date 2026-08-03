@@ -142,7 +142,7 @@ class TestArchIssues:
         assert issues[0].level == "error"
         assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in (issues[0].hint or "")
 
-    def test_rdna2_with_the_override_set_is_only_a_note(
+    def test_rdna2_with_the_matching_override_is_only_a_note(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Otherwise doctor exits 1 on a machine that trains perfectly well."""
@@ -150,6 +150,24 @@ class TestArchIssues:
         issues = arch_issues([gpu(Vendor.AMD, arch="gfx1030", name="RX 6900 XT")])
         assert len(issues) == 1
         assert issues[0].level == "info"
+
+    def test_an_override_for_a_different_card_is_still_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Set is not the same as correct.
+
+        A value copied from another machine, left over from a different card, or
+        simply mistyped leaves the GPU exactly as unusable as no override at all
+        — and reporting it as fine would wave through the failure this check
+        exists to catch.
+        """
+        monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+        issues = arch_issues([gpu(Vendor.AMD, arch="gfx1030", name="RX 6900 XT")])
+        assert len(issues) == 1
+        assert issues[0].level == "error"
+        # Both numbers, or the message does not say what to change it from.
+        assert "11.0.0" in issues[0].message
+        assert "10.3.0" in issues[0].message
 
     def test_a_supported_card_is_silent_either_way(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
