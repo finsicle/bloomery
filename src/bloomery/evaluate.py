@@ -161,31 +161,47 @@ def score_preferences(
     wins_by_token = 0.0
     scored = 0
 
-    with torch.no_grad():
-        for _ in range(batches):
-            drawn = sampler.batch(batch, choice.device)
-            half = drawn["input_ids"].shape[0] // 2
-            with autocast_for(choice):
-                totals = sequence_logprobs(model, drawn)
+    def wins(chosen: Any, rejected: Any) -> float:
+        # Ties count as half, for the reason they do during training: two
+        # answers the model cannot separate are undecided, not wrong.
+        return float(((chosen > rejected).float() + 0.5 * (chosen == rejected).float()).sum())
 
-            lengths = (drawn["labels"][:, 1:] != IGNORE_INDEX).sum(dim=-1).clamp(min=1)
-            per_token = totals / lengths
+    try:
+        with torch.no_grad():
+            for _ in range(batches):
+                drawn = sampler.batch(batch, choice.device)
+                half = drawn["input_ids"].shape[0] // 2
+                with autocast_for(choice):
+                    totals = sequence_logprobs(model, drawn)
 
-            for values, bucket in ((totals, "sum"), (per_token, "token")):
-                chosen, rejected = values[:half], values[half:]
-                # Ties count as half, for the reason they do during training: two
-                # answers the model cannot separate are undecided, not wrong.
-                won = float(
-                    ((chosen > rejected).float() + 0.5 * (chosen == rejected).float()).sum()
-                )
-                if bucket == "sum":
-                    wins_by_sum += won
-                else:
-                    wins_by_token += won
-            scored += half
+                # A pair either side of which came back non-finite is dropped,
+                # not counted as a loss. Every comparison against NaN is False,
+                # so such a pair would contribute nothing to the wins and a full
+                # unit to the denominator — quietly deflating the accuracy of a
+                # diverged checkpoint, which is exactly the one being measured to
+                # find out what went wrong. The causal path drops its batches for
+                # the same reason; this is the half that did not.
+                usable = torch.isfinite(totals)
+                usable = usable[:half] & usable[half:]
+                if not bool(usable.any()):
+                    continue
 
-    if was_training:
-        model.train()
+                lengths = (drawn["labels"][:, 1:] != IGNORE_INDEX).sum(dim=-1).clamp(min=1)
+                per_token = totals / lengths
+
+                wins_by_sum += wins(totals[:half][usable], totals[half:][usable])
+                wins_by_token += wins(per_token[:half][usable], per_token[half:][usable])
+                scored += int(usable.sum())
+    finally:
+        # In a finally, so an exception mid-scoring cannot leave a model the
+        # caller handed over in training mode stranded in eval.
+        if was_training:
+            model.train()
+
     if not scored:
-        raise EvalError("no preference pairs were scored; the split may be empty")
+        raise EvalError(
+            "no preference pairs could be scored. The split may be empty, or the "
+            "model may produce non-finite log-probabilities for every pair — which "
+            "is what a diverged checkpoint does."
+        )
     return wins_by_sum / scored, wins_by_token / scored, scored

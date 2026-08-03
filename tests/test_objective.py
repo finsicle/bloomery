@@ -294,6 +294,86 @@ class TestPreferenceScoring:
         assert after > before, f"the score did not follow the model: {before} -> {after}"
         assert after == pytest.approx(1.0), "it was trained on exactly these pairs"
 
+    def test_a_pair_that_scores_non_finite_is_dropped_not_lost(
+        self, plain: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise a diverged checkpoint reads as merely a bad one.
+
+        Every comparison against NaN is False, so such a pair contributes no
+        wins and a full unit to the denominator. The accuracy then falls for a
+        reason that has nothing to do with preference — on exactly the model
+        somebody is measuring to find out what went wrong.
+        """
+        from bloomery.evaluate import EvalError, score_preferences
+        from bloomery.train import objective as objective_mod
+        from bloomery.train.device import DeviceChoice, select_precision
+
+        drawn = preference_batch(pairs=4)
+
+        class OneBatch:
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                return drawn
+
+        dtype, autocast, reason = select_precision(torch.device("cpu"))
+        choice = DeviceChoice(
+            device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
+        )
+
+        # Patched where it is defined: evaluate imports it inside the function,
+        # so there is no module attribute on bloomery.evaluate to replace.
+        real = objective_mod.sequence_logprobs
+
+        def with_one_bad(model: Any, batch: dict[str, Any]) -> Any:
+            values = real(model, batch).clone()
+            # Poison the chosen side of the first pair only.
+            values[0] = float("nan")
+            return values
+
+        # Baseline: nothing poisoned.
+        clean, _, clean_pairs = score_preferences(plain, OneBatch(), choice, batch=4, batches=1)
+        assert clean_pairs == 4
+
+        monkeypatch.setattr(objective_mod, "sequence_logprobs", with_one_bad)
+        poisoned, _, poisoned_pairs = score_preferences(
+            plain, OneBatch(), choice, batch=4, batches=1
+        )
+
+        assert poisoned_pairs == 3, "the unscoreable pair must leave the denominator"
+        # Whatever the remaining three did, they did it before as well: dropping
+        # one pair may not drag the figure toward zero the way counting it would.
+        assert poisoned >= clean
+
+        def all_bad(model: Any, batch: dict[str, Any]) -> Any:
+            return real(model, batch) * float("nan")
+
+        monkeypatch.setattr(objective_mod, "sequence_logprobs", all_bad)
+        with pytest.raises(EvalError, match="non-finite"):
+            score_preferences(plain, OneBatch(), choice, batch=4, batches=1)
+
+    def test_the_model_mode_survives_a_failure_mid_scoring(self, plain: Any) -> None:
+        """A raise must not strand a training model in eval mode."""
+        from bloomery.evaluate import score_preferences
+        from bloomery.train.device import DeviceChoice, select_precision
+
+        class Exploding:
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                raise RuntimeError("the sampler failed")
+
+        dtype, autocast, reason = select_precision(torch.device("cpu"))
+        choice = DeviceChoice(
+            device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
+        )
+
+        plain.train()
+        with pytest.raises(RuntimeError, match="the sampler failed"):
+            score_preferences(plain, Exploding(), choice, batch=2, batches=1)
+        assert plain.training, "left in eval mode after a failure"
+
+        plain.eval()
+        with pytest.raises(RuntimeError, match="the sampler failed"):
+            score_preferences(plain, Exploding(), choice, batch=2, batches=1)
+        assert not plain.training, "a model that arrived in eval mode was switched"
+
     def test_the_two_measures_can_disagree(self, plain: Any) -> None:
         """Which is the whole reason both are reported.
 
