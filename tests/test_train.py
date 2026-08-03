@@ -669,7 +669,11 @@ class TestUnusableAccelerator:
 
         assert choice.type == "cpu"
         assert "gfx1031" in choice.reason
-        assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in choice.reason
+        # The remedy is carried separately, not inside the reason. On real
+        # hardware the reason prints beside the device name and the terminal
+        # truncated it at exactly "— Set ", losing the variable it was naming.
+        assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in (choice.remedy or "")
+        assert len(choice.reason) < 60, "long enough to be truncated where it is printed"
 
     def test_a_working_card_is_never_probed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The probe costs a subprocess, so supported hardware must not pay for it."""

@@ -660,6 +660,10 @@ def train(
         f"{format_params(actual_param_count(spec))} params"
     )
     console.print(f"device     {choice.label()}  [dim]{choice.reason}[/dim]")
+    if choice.remedy:
+        # On its own line, in yellow: this is the sentence that turns a silent
+        # downgrade into something the user can act on.
+        console.print(f"[yellow]           {choice.remedy}[/yellow]")
     console.print(
         f"data       {train_tokens:,} train tokens  "
         f"[dim]{config.tokens_per_step:,} tokens/step[/dim]"
@@ -948,6 +952,10 @@ def adapt(
             f"{sequences} sequences per step[/dim]"
         )
     console.print(f"device     {choice.label()}  [dim]{choice.reason}[/dim]")
+    if choice.remedy:
+        # On its own line, in yellow: this is the sentence that turns a silent
+        # downgrade into something the user can act on.
+        console.print(f"[yellow]           {choice.remedy}[/yellow]")
     console.print(
         f"data       {train_tokens:,} train tokens  "
         f"[dim]{config.tokens_per_step:,} tokens/step[/dim]"

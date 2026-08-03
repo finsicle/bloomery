@@ -79,6 +79,11 @@ class DeviceChoice:
     # the parameters themselves. Master weights stay fp32 either way.
     autocast: bool
     reason: str
+    # What to do about it, when this choice was forced by something the user can
+    # fix. Kept apart from ``reason`` because the reason prints inline beside the
+    # device and is truncated at the terminal width — which on the first run of
+    # this swallowed the environment variable, the only part anybody needed.
+    remedy: str | None = None
 
     @property
     def type(self) -> str:
@@ -425,23 +430,28 @@ def choose(prefer: str | None = None) -> DeviceChoice:
     if arch is not None and not _device_executes(device):
         override = override_hint(arch)
         remedy = (
-            f"Set {HSA_OVERRIDE}={override} and try again."
+            f"set {HSA_OVERRIDE}={override} to use this GPU"
             if override
-            else "Check the ROCm compatibility matrix for this card."
+            else f"check ROCm's compatibility matrix for {arch}"
         )
-        detail = f"this {arch} GPU cannot execute anything — {remedy}"
         if prefer:
             raise DeviceUnusableError(
-                f"{prefer} was requested, but {detail}\n"
+                f"{prefer} was requested, but this {arch} GPU cannot execute anything.\n"
                 "Every operation on it takes the process down, so the run would "
-                "die on its first step."
+                "die on its first step.\n"
+                f"  {remedy}"
             )
         import torch
 
         device = torch.device("cpu")
         dtype, autocast, _ = select_precision(device)
         return DeviceChoice(
-            device=device, dtype=dtype, autocast=autocast, reason=f"{detail} Using cpu."
+            device=device,
+            dtype=dtype,
+            autocast=autocast,
+            # Short enough to survive being printed beside the device name.
+            reason=f"{arch} GPU cannot execute; using cpu",
+            remedy=remedy,
         )
 
     dtype, autocast, reason = select_precision(device)
