@@ -128,11 +128,40 @@ class TestArchIssues:
     def test_case_insensitive(self) -> None:
         assert arch_issues([gpu(Vendor.AMD, arch="GFX1100")]) == []
 
-    def test_rdna2_gets_override_hint(self) -> None:
+    def test_rdna2_without_the_override_is_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Measured, not assumed: this is a run that cannot start, not a caution.
+
+        On an RX 6700 XT with ROCm 7.1 and no override set, torch reports the
+        device as available and bf16-capable, and the first matmul of any dtype
+        segfaults. Calling that a warning understates it by the whole distance
+        between "rough edges" and "core dumped".
+        """
+        monkeypatch.delenv("HSA_OVERRIDE_GFX_VERSION", raising=False)
         issues = arch_issues([gpu(Vendor.AMD, arch="gfx1030", name="RX 6900 XT")])
         assert len(issues) == 1
-        assert issues[0].level == "warn"
+        assert issues[0].level == "error"
         assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in (issues[0].hint or "")
+
+    def test_rdna2_with_the_override_set_is_only_a_note(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise doctor exits 1 on a machine that trains perfectly well."""
+        monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+        issues = arch_issues([gpu(Vendor.AMD, arch="gfx1030", name="RX 6900 XT")])
+        assert len(issues) == 1
+        assert issues[0].level == "info"
+
+    def test_a_supported_card_is_silent_either_way(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
+        assert arch_issues([gpu(Vendor.AMD, arch="gfx1100")]) == []
+
+    def test_the_gfx_name_may_carry_feature_suffixes(self) -> None:
+        """torch reports gfx1031:sramecc-:xnack-, not the bare name."""
+        from bloomery.probe.backend import override_hint
+
+        assert override_hint("gfx1031:sramecc-:xnack-") == "10.3.0"
+        assert override_hint("gfx1100") is None
+        assert override_hint(None) is None
 
     def test_unknown_arch_gets_generic_warning(self) -> None:
         issues = arch_issues([gpu(Vendor.AMD, arch="gfx1250")])

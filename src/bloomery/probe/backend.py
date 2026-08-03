@@ -14,7 +14,15 @@ and a silent ``auto`` cannot tell them that.
 
 from __future__ import annotations
 
+import os
+
 from bloomery.probe.types import Backend, GpuInfo, Issue, Vendor
+
+# The variable that makes an unsupported AMD card present itself as a supported
+# one. Read here rather than only suggested, because whether it is already set
+# is the difference between a card that trains and a card that dies on its first
+# operation.
+HSA_OVERRIDE = "HSA_OVERRIDE_GFX_VERSION"
 
 # nvidia-smi reports the highest CUDA version the installed driver supports.
 # Highest match wins. CUDA 12 minor-version compatibility means any 12.x driver
@@ -131,24 +139,65 @@ def resolve(
     return Backend.CPU, "no supported GPU detected"
 
 
+def override_hint(arch: str | None) -> str | None:
+    """The ``HSA_OVERRIDE_GFX_VERSION`` value that usually makes this card work.
+
+    ``None`` for a card that is either already supported or not one we have a
+    known answer for. The gfx name may carry feature suffixes — torch reports
+    ``gfx1031:sramecc-:xnack-`` — so only the part before the first colon is
+    matched.
+    """
+    if not arch:
+        return None
+    return _OVERRIDE_HINTS.get(arch.split(":")[0].strip().lower())
+
+
 def arch_issues(gpus: list[GpuInfo]) -> list[Issue]:
-    """Warn about AMD cards outside ROCm's supported set."""
+    """Report AMD cards outside ROCm's supported set.
+
+    The level depends on whether the override is already in effect, because the
+    two states could hardly be further apart. Measured on an RX 6700 XT
+    (gfx1031) running ROCm 7.1 with torch 2.13+rocm7.2: with the variable set,
+    training runs at 80,000 tokens/second. Without it, ``torch.cuda.is_available()``
+    still returns True, ``is_bf16_supported()`` still returns True, and the first
+    matmul of any dtype segfaults the process.
+
+    So an unsupported card with no override is an error rather than a caution —
+    it is not "rough edges", it is a run that cannot start.
+    """
     issues: list[Issue] = []
+    overridden = bool(os.environ.get(HSA_OVERRIDE, "").strip())
     for gpu in gpus:
         if gpu.vendor is not Vendor.AMD or not gpu.arch:
             continue
         arch = gpu.arch.lower()
         if arch in ROCM_SUPPORTED_ARCHS:
             continue
-        override = _OVERRIDE_HINTS.get(arch)
-        if override:
+        override = override_hint(arch)
+        if override and overridden:
             issues.append(
                 Issue(
-                    level="warn",
-                    message=f"{gpu.name} ({arch}) is not an officially supported ROCm target.",
+                    level="info",
+                    message=f"{gpu.name} ({arch}) is running through {HSA_OVERRIDE}.",
                     hint=(
-                        f"It usually works with HSA_OVERRIDE_GFX_VERSION={override}. "
-                        "Expect rough edges."
+                        "Not an officially supported ROCm target, so expect rough edges — "
+                        "but the override is set and the card should work."
+                    ),
+                )
+            )
+        elif override:
+            issues.append(
+                Issue(
+                    level="error",
+                    message=(
+                        f"{gpu.name} ({arch}) is not a supported ROCm target, and "
+                        f"{HSA_OVERRIDE} is not set. Any operation on this GPU will "
+                        "crash the process."
+                    ),
+                    hint=(
+                        f"export {HSA_OVERRIDE}={override}\n"
+                        "  Then re-run. This makes the card present itself as a "
+                        "supported one, which is what ROCm's kernels are built for."
                     ),
                 )
             )
@@ -159,7 +208,7 @@ def arch_issues(gpus: list[GpuInfo]) -> list[Issue]:
                     message=f"{gpu.name} ({arch}) is not in ROCm's supported target list.",
                     hint=(
                         "Check the ROCm compatibility matrix for your card. "
-                        "HSA_OVERRIDE_GFX_VERSION may help."
+                        f"{HSA_OVERRIDE} may help."
                     ),
                 )
             )

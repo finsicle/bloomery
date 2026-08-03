@@ -617,6 +617,106 @@ class TestDeviceSelection:
         assert reason
 
 
+class TestUnusableAccelerator:
+    """A GPU that answers every question and then dies on its first operation.
+
+    Measured on an RX 6700 XT (gfx1031), ROCm 7.1, torch 2.13+rocm7.2, with no
+    HSA_OVERRIDE_GFX_VERSION set:
+
+        torch.cuda.is_available()                     True
+        torch.cuda.get_device_name(0)                 AMD Radeon RX 6700 XT
+        torch.cuda.is_bf16_supported(emulation=False) True
+        a = torch.randn(512, 512, device="cuda"); a @ a
+        Segmentation fault (core dumped)
+
+    fp32, fp16 and bf16 alike, so it is not a precision question. Before this,
+    `train` printed a device line, printed a memory estimate that fit, and then
+    core-dumped on step one with nothing said about why.
+    """
+
+    def unusable(self, monkeypatch: pytest.MonkeyPatch) -> Any:
+        """Stand in for that card: flagged as unsupported, probe never survives."""
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        monkeypatch.setattr(device_mod, "unsupported_rocm_arch", lambda d: "gfx1031")
+        monkeypatch.setattr(device_mod, "_device_executes", lambda d, **k: False)
+        monkeypatch.setattr(device_mod, "select_device", lambda prefer=None: torch.device("cuda"))
+        device_mod.clear_precision_cache()
+        return device_mod
+
+    def test_asking_for_it_by_name_is_refused_with_the_remedy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--device cuda must not silently become cpu; the user asked for cuda."""
+        from bloomery.train.device import DeviceUnusableError
+
+        device_mod = self.unusable(monkeypatch)
+        with pytest.raises(DeviceUnusableError) as caught:
+            device_mod.choose("cuda")
+
+        message = str(caught.value)
+        assert "gfx1031" in message
+        # The remedy, not just the diagnosis.
+        assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in message
+
+    def test_choosing_it_on_the_user_s_behalf_falls_back_and_says_why(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        device_mod = self.unusable(monkeypatch)
+        choice = device_mod.choose()
+
+        assert choice.type == "cpu"
+        assert "gfx1031" in choice.reason
+        assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in choice.reason
+
+    def test_a_working_card_is_never_probed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The probe costs a subprocess, so supported hardware must not pay for it."""
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        probed: list[str] = []
+        monkeypatch.setattr(device_mod, "unsupported_rocm_arch", lambda d: None)
+        monkeypatch.setattr(
+            device_mod, "_device_executes", lambda d, **k: probed.append("probed") or True
+        )
+        monkeypatch.setattr(device_mod, "select_device", lambda prefer=None: torch.device("cpu"))
+        device_mod.clear_precision_cache()
+
+        device_mod.choose()
+        assert probed == [], "spent a subprocess on hardware there was no reason to doubt"
+
+    def test_the_probe_reports_a_survivable_device(self) -> None:
+        """The probe itself, on this machine, which does work."""
+        from bloomery.train import device as device_mod
+
+        device_mod.clear_precision_cache()
+        assert device_mod._device_executes(__import__("torch").device("cpu")) is True
+
+    def test_a_probe_that_cannot_run_gives_the_device_the_benefit_of_the_doubt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unlike the bf16 probe, where failing to ask costs only speed.
+
+        Treating "could not spawn the probe" as "the GPU is dead" would refuse a
+        working card because the machine was briefly out of process handles.
+        """
+        import subprocess
+
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        def refuse(*_: Any, **__: Any) -> None:
+            raise OSError("cannot fork")
+
+        device_mod.clear_precision_cache()
+        monkeypatch.setattr(subprocess, "run", refuse)
+        assert device_mod._device_executes(torch.device("cuda")) is True
+
+
 class TestCpuBf16Gate:
     """Capability is read, never discovered by running a bf16 matmul.
 
