@@ -159,9 +159,16 @@ class TestPreferenceLoss:
         probe. Asking only whether the CPU claims bf16 is not enough; a runner
         that claimed it survived an 8x8 matmul and died on a 384x384 one.
         """
-        from bloomery.train.device import select_precision
+        from bloomery.train.device import _probe_precision
 
-        dtype, _, reason = select_precision(torch.device("cpu"))
+        # _probe_precision, not select_precision. The latter honours
+        # BLOOMERY_PRECISION first and returns the forced answer without probing
+        # anything — so `BLOOMERY_PRECISION=bf16` on a CPU that cannot do it
+        # would walk straight past this guard into the trap it exists to
+        # prevent. That variable is a user asserting something about their
+        # hardware, and a test must not take anyone's word for a claim that can
+        # kill the process.
+        dtype, _, reason = _probe_precision(torch.device("cpu"))
         if dtype is not torch.bfloat16:
             pytest.skip(f"bf16 is not usable on this CPU: {reason}")
         # See test_the_autocast_asymmetry_this_relies_on for the part of this
