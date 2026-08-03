@@ -147,7 +147,39 @@ class TestPreferenceLoss:
 
         Guards the cross_entropy formulation: swapping it for log_softmax puts
         these back in bf16 and nothing else in the suite would notice.
+
+        Runs only where bf16 is genuinely usable on this CPU. A bf16 matmul on a
+        CPU whose kernels use instructions it does not implement does not raise —
+        it takes an illegal-instruction trap and kills the process where it
+        stands. This test did exactly that to a Windows CI runner: `0xc000001d`,
+        exit 132, pytest dead at 72% through the suite.
+
+        The gate is ``_probe_precision`` and not ``select_precision``, which are
+        different questions. ``select_precision`` answers "what will bloomery
+        use here", and honours ``BLOOMERY_PRECISION`` before probing anything —
+        so a forced ``bf16`` on a CPU that cannot do it would walk straight past
+        this guard into the trap it exists to prevent. ``_probe_precision``
+        answers "can this CPU actually do it", which is the only question that
+        keeps the process alive. An environment variable is a user asserting
+        something about their hardware, and a test must not take anyone's word
+        for a claim that can kill the process rather than fail it.
+
+        Both halves of the probe matter: a runner that *claimed* bf16 survived an
+        8x8 matmul and died on a 384x384 one, which is why the capability check
+        alone is not the gate.
+
+        A consequence worth naming: on hardware without usable bf16 this body
+        does not run at all, and at the time of writing that included every CI
+        platform here. So it cannot be the only thing guarding the formulation —
+        see :meth:`test_the_autocast_asymmetry_this_relies_on`, which pins the
+        same premise with no matmul and therefore runs everywhere.
         """
+        from bloomery.train.device import _probe_precision
+
+        dtype, _, reason = _probe_precision(torch.device("cpu"))
+        if dtype is not torch.bfloat16:
+            pytest.skip(f"bf16 is not usable on this CPU: {reason}")
+
         model = self.adapted(plain)
         try:
             with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -156,6 +188,30 @@ class TestPreferenceLoss:
                 assert preference_loss(model, drawn, beta=0.1).loss.dtype is torch.float32
         finally:
             model.unload()
+
+    def test_the_autocast_asymmetry_this_relies_on(self) -> None:
+        """The premise behind choosing cross_entropy, checked without a matmul.
+
+        `sequence_logprobs` returns float32 under autocast for exactly one
+        reason: torch promotes `cross_entropy` to fp32 and leaves `log_softmax`
+        in bf16. That is a property of torch, not of this code — but this code
+        depends on it, so if it ever changed the precision would regress
+        silently and every other assertion here would still pass.
+
+        No model and no matmul, so unlike the test above this runs everywhere,
+        including on the CPUs where a bf16 matmul is fatal rather than slow.
+        """
+        import torch.nn.functional as functional
+
+        logits = torch.randn(4, 16, dtype=torch.bfloat16)
+        targets = torch.randint(0, 16, (4,))
+
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            promoted = functional.cross_entropy(logits, targets, reduction="none")
+            left_alone = functional.log_softmax(logits, dim=-1)
+
+        assert promoted.dtype is torch.float32, "cross_entropy is no longer promoted"
+        assert left_alone.dtype is torch.bfloat16, "log_softmax is no longer the risky one"
 
     def test_training_it_raises_the_margin_rather_than_lowering_it(self, plain: Any) -> None:
         """Pins the sign, which the ln(2) identity cannot: at zero it is symmetric.

@@ -27,6 +27,8 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from bloomery.probe.backend import HSA_OVERRIDE, ROCM_SUPPORTED_ARCHS, override_hint
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
 
@@ -39,11 +41,14 @@ ENV_BF16_PROBE = "BLOOMERY_BF16_PROBE"
 # Memoised because the timing probe costs up to a second on Metal — negligible
 # once per training run, not once per call. See _cache_key for the identity used.
 _PRECISION_CACHE: dict[str, Any] = {}
+# Same reasoning, for the "can this device execute at all" probe.
+_EXECUTES_CACHE: dict[str, bool] = {}
 
 
 def clear_precision_cache() -> None:
     """Forget memoised precision decisions. For tests."""
     _PRECISION_CACHE.clear()
+    _EXECUTES_CACHE.clear()
 
 
 def _cache_key(device: torch.device) -> str:
@@ -73,6 +78,11 @@ class DeviceChoice:
     # the parameters themselves. Master weights stay fp32 either way.
     autocast: bool
     reason: str
+    # What to do about it, when this choice was forced by something the user can
+    # fix. Kept apart from ``reason`` because the reason prints inline beside the
+    # device and is truncated at the terminal width — which on the first run of
+    # this swallowed the environment variable, the only part anybody needed.
+    remedy: str | None = None
 
     @property
     def type(self) -> str:
@@ -345,9 +355,135 @@ def _probe_precision(device: torch.device) -> tuple[torch.dtype, bool, str]:
     return torch.float32, False, "cpu bf16 not usably faster; using fp32"
 
 
+class DeviceUnusableError(RuntimeError):
+    """A device was asked for by name and cannot execute anything."""
+
+
+def unsupported_rocm_arch(device: torch.device) -> str | None:
+    """This device's gfx name, when there is reason to doubt it can be used.
+
+    ``None`` for anything else, including every NVIDIA card — ``gcnArchName`` is
+    a ROCm-only property, so this costs one attribute read on a CUDA box and
+    nothing at all on CPU or Metal.
+
+    A cheap gate in front of an expensive probe, the same shape as the CPU path:
+    ask the free question first, and spend a subprocess only where the answer
+    gives reason to doubt.
+
+    Two such reasons. The first is the obvious one: an architecture outside
+    ROCm's supported set. The second is that ``HSA_OVERRIDE_GFX_VERSION`` is set
+    at all — because making the card claim a different architecture is precisely
+    what that variable does, so the name torch reports is no longer evidence
+    about the hardware. An RX 6700 XT with the override at 11.0.0 reports itself
+    as gfx1100, which is on the supported list, and then hangs on its first real
+    work. Asking torch cannot catch that; running something can.
+    """
+    import torch
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    arch = str(getattr(torch.cuda.get_device_properties(index), "gcnArchName", "") or "")
+    arch = arch.split(":")[0].strip().lower()
+    if not arch:
+        return None
+    if arch in ROCM_SUPPORTED_ARCHS and not os.environ.get(HSA_OVERRIDE, "").strip():
+        return None
+    return arch
+
+
+def _device_executes(device: torch.device, *, timeout: float = 60.0) -> bool:
+    """Run one operation on this device in a child process, and see if it lives.
+
+    Only called for hardware :func:`unsupported_rocm_arch` has flagged, so a
+    supported card never pays for it.
+
+    Sixty seconds is generous by a wide margin. Measured on an RX 6700 XT: 2.5
+    seconds when the card works, nearly all of it creating the device context.
+    The timeout is what bounds the other case, where a misconfigured card hangs
+    forever — that path refuses after about 65 seconds, which is slow for an
+    error message and finite, where before it was neither.
+
+    Erring long is deliberate. Refusing a working GPU because a cold context took
+    longer than expected is a worse failure than a slow refusal of a broken one.
+    """
+    key = _cache_key(device)
+    cached = _EXECUTES_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    command = [sys.executable, "-m", "bloomery.train._device_probe", str(device)]
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            command, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        alive = completed.returncode == 0
+        if not alive:
+            log.info("device probe exited with %s on %s", completed.returncode, device)
+    except subprocess.TimeoutExpired:
+        # A timeout is an answer, not a failure to get one. An RX 6700 XT given
+        # an override naming the wrong architecture does not crash — it hangs,
+        # and so does everything downstream of it. This branch used to share the
+        # OSError case below and wave the device through, so the training run
+        # inherited the hang and sat there indefinitely.
+        log.info("device probe timed out on %s; treating it as unusable", device)
+        alive = False
+    except OSError:
+        # Genuinely could not ask: no process could be spawned. Unlike the case
+        # above, that says nothing about the device, and calling it dead would
+        # refuse a working GPU because the machine was briefly out of handles.
+        log.debug("device probe could not run on %s; assuming it works", device)
+        alive = True
+
+    _EXECUTES_CACHE[key] = alive
+    return alive
+
+
 def choose(prefer: str | None = None) -> DeviceChoice:
-    """Select a device and precision together."""
+    """Select a device and precision together.
+
+    An accelerator that cannot execute anything is caught here rather than at
+    the first training step. It is a real state and not a hypothetical one: an
+    unsupported AMD card without ``HSA_OVERRIDE_GFX_VERSION`` answers yes to
+    every question torch can be asked and then segfaults on its first matmul.
+    Asked for by name, that is refused; chosen on the user's behalf, it falls
+    back to the CPU and says why.
+    """
     device = select_device(prefer)
+
+    arch = unsupported_rocm_arch(device)
+    if arch is not None and not _device_executes(device):
+        override = override_hint(arch)
+        setting = os.environ.get(HSA_OVERRIDE, "").strip()
+        if setting:
+            # Already set, so "set it" is no help — and the arch above came from
+            # torch, which the override has made unreliable. doctor reads the
+            # real one out of sysfs, so send them there rather than guessing.
+            remedy = f"{HSA_OVERRIDE}={setting} may be wrong for this card; run bloomery doctor"
+        elif override:
+            remedy = f"set {HSA_OVERRIDE}={override} to use this GPU"
+        else:
+            remedy = f"check ROCm's compatibility matrix for {arch}"
+        if prefer:
+            raise DeviceUnusableError(
+                f"{prefer} was requested, but this {arch} GPU cannot execute anything.\n"
+                "Every operation on it takes the process down, so the run would "
+                "die on its first step.\n"
+                f"  {remedy}"
+            )
+        import torch
+
+        device = torch.device("cpu")
+        dtype, autocast, _ = select_precision(device)
+        return DeviceChoice(
+            device=device,
+            dtype=dtype,
+            autocast=autocast,
+            # Short enough to survive being printed beside the device name.
+            reason=f"{arch} GPU cannot execute; using cpu",
+            remedy=remedy,
+        )
+
     dtype, autocast, reason = select_precision(device)
     return DeviceChoice(device=device, dtype=dtype, autocast=autocast, reason=reason)
 

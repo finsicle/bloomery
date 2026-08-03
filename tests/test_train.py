@@ -617,6 +617,171 @@ class TestDeviceSelection:
         assert reason
 
 
+class TestUnusableAccelerator:
+    """A GPU that answers every question and then dies on its first operation.
+
+    Measured on an RX 6700 XT (gfx1031), ROCm 7.1, torch 2.13+rocm7.2, with no
+    HSA_OVERRIDE_GFX_VERSION set:
+
+        torch.cuda.is_available()                     True
+        torch.cuda.get_device_name(0)                 AMD Radeon RX 6700 XT
+        torch.cuda.is_bf16_supported(emulation=False) True
+        a = torch.randn(512, 512, device="cuda"); a @ a
+        Segmentation fault (core dumped)
+
+    fp32, fp16 and bf16 alike, so it is not a precision question. Before this,
+    `train` printed a device line, printed a memory estimate that fit, and then
+    core-dumped on step one with nothing said about why.
+    """
+
+    def unusable(self, monkeypatch: pytest.MonkeyPatch) -> Any:
+        """Stand in for that card: flagged as unsupported, probe never survives."""
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        monkeypatch.setattr(device_mod, "unsupported_rocm_arch", lambda d: "gfx1031")
+        monkeypatch.setattr(device_mod, "_device_executes", lambda d, **k: False)
+        monkeypatch.setattr(device_mod, "select_device", lambda prefer=None: torch.device("cuda"))
+        device_mod.clear_precision_cache()
+        return device_mod
+
+    def test_asking_for_it_by_name_is_refused_with_the_remedy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--device cuda must not silently become cpu; the user asked for cuda."""
+        from bloomery.train.device import DeviceUnusableError
+
+        device_mod = self.unusable(monkeypatch)
+        with pytest.raises(DeviceUnusableError) as caught:
+            device_mod.choose("cuda")
+
+        message = str(caught.value)
+        assert "gfx1031" in message
+        # The remedy, not just the diagnosis.
+        assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in message
+
+    def test_choosing_it_on_the_user_s_behalf_falls_back_and_says_why(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        device_mod = self.unusable(monkeypatch)
+        choice = device_mod.choose()
+
+        assert choice.type == "cpu"
+        assert "gfx1031" in choice.reason
+        # The remedy is carried separately, not inside the reason. On real
+        # hardware the reason prints beside the device name and the terminal
+        # truncated it at exactly "— Set ", losing the variable it was naming.
+        assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in (choice.remedy or "")
+        assert len(choice.reason) < 60, "long enough to be truncated where it is printed"
+
+    def test_an_override_makes_the_reported_arch_untrustworthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The variable's whole purpose is to make the card claim to be something else.
+
+        An RX 6700 XT with HSA_OVERRIDE_GFX_VERSION=11.0.0 reports gfx1100 —
+        which is on ROCm's supported list — and then hangs on its first real
+        work. Gating the probe on the reported name alone means the override
+        defeats the check whose job is to catch it.
+        """
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        properties = type("P", (), {"gcnArchName": "gfx1100:sramecc-:xnack-"})()
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: properties)
+
+        monkeypatch.delenv("HSA_OVERRIDE_GFX_VERSION", raising=False)
+        assert device_mod.unsupported_rocm_arch(torch.device("cuda")) is None
+
+        monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+        assert device_mod.unsupported_rocm_arch(torch.device("cuda")) == "gfx1100"
+
+    def test_the_remedy_does_not_tell_you_to_set_what_is_already_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+        device_mod = self.unusable(monkeypatch)
+        choice = device_mod.choose()
+
+        assert choice.type == "cpu"
+        assert "11.0.0" in (choice.remedy or "")
+        assert "doctor" in (choice.remedy or "")
+        assert "set HSA_OVERRIDE" not in (choice.remedy or "")
+
+    def test_a_working_card_is_never_probed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The probe costs a subprocess, so supported hardware must not pay for it."""
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        probed: list[str] = []
+        monkeypatch.setattr(device_mod, "unsupported_rocm_arch", lambda d: None)
+        monkeypatch.setattr(
+            device_mod, "_device_executes", lambda d, **k: probed.append("probed") or True
+        )
+        monkeypatch.setattr(device_mod, "select_device", lambda prefer=None: torch.device("cpu"))
+        device_mod.clear_precision_cache()
+
+        device_mod.choose()
+        assert probed == [], "spent a subprocess on hardware there was no reason to doubt"
+
+    def test_the_probe_reports_a_survivable_device(self) -> None:
+        """The probe itself, on this machine, which does work."""
+        from bloomery.train import device as device_mod
+
+        device_mod.clear_precision_cache()
+        assert device_mod._device_executes(__import__("torch").device("cpu")) is True
+
+    def test_a_probe_that_cannot_run_gives_the_device_the_benefit_of_the_doubt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unlike the bf16 probe, where failing to ask costs only speed.
+
+        Treating "could not spawn the probe" as "the GPU is dead" would refuse a
+        working card because the machine was briefly out of process handles.
+        """
+        import subprocess
+
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        def refuse(*_: Any, **__: Any) -> None:
+            raise OSError("cannot fork")
+
+        device_mod.clear_precision_cache()
+        monkeypatch.setattr(subprocess, "run", refuse)
+        assert device_mod._device_executes(torch.device("cuda")) is True
+
+    def test_a_probe_that_times_out_means_the_device_is_unusable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hang is an answer, and a different one from "could not ask".
+
+        Measured: an RX 6700 XT given an override naming the wrong architecture
+        does not segfault, it hangs — and so does everything downstream. This
+        branch originally shared the OSError case above and waved the device
+        through, so `train` inherited the hang and sat spinning for ten minutes
+        rather than refusing in one second.
+        """
+        import subprocess
+
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        def hang(*_: Any, **__: Any) -> None:
+            raise subprocess.TimeoutExpired(cmd="probe", timeout=60.0)
+
+        device_mod.clear_precision_cache()
+        monkeypatch.setattr(subprocess, "run", hang)
+        assert device_mod._device_executes(torch.device("cuda")) is False
+
+
 class TestCpuBf16Gate:
     """Capability is read, never discovered by running a bf16 matmul.
 

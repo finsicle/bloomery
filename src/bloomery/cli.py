@@ -588,7 +588,7 @@ def train(
     from bloomery.capability import check_fit
     from bloomery.probe import probe_host_report
     from bloomery.train import checkpoint as ckpt
-    from bloomery.train.device import choose, thread_limit
+    from bloomery.train.device import DeviceUnusableError, choose, thread_limit
     from bloomery.train.loop import TrainConfig
     from bloomery.train.loop import train as run_training
     from bloomery.train.mixing import resolve as resolve_mixture
@@ -628,7 +628,10 @@ def train(
         _die(str(exc))
 
     thread_limit(cores)
-    choice = choose(device)
+    try:
+        choice = choose(device)
+    except DeviceUnusableError as exc:
+        _die(str(exc))
 
     run_path = paths.run_dir(name)
     resume_from = None
@@ -657,6 +660,10 @@ def train(
         f"{format_params(actual_param_count(spec))} params"
     )
     console.print(f"device     {choice.label()}  [dim]{choice.reason}[/dim]")
+    if choice.remedy:
+        # On its own line, in yellow: this is the sentence that turns a silent
+        # downgrade into something the user can act on.
+        console.print(f"[yellow]           {choice.remedy}[/yellow]")
     console.print(
         f"data       {train_tokens:,} train tokens  "
         f"[dim]{config.tokens_per_step:,} tokens/step[/dim]"
@@ -810,7 +817,7 @@ def adapt(
     from bloomery.capability import check_fit
     from bloomery.data import load_tokenizer
     from bloomery.train import checkpoint as ckpt
-    from bloomery.train.device import choose, thread_limit
+    from bloomery.train.device import DeviceUnusableError, choose, thread_limit
     from bloomery.train.loop import (
         LoraSettings,
         ModelLoadError,
@@ -868,7 +875,10 @@ def adapt(
             )
 
     thread_limit(cores)
-    choice = choose(device)
+    try:
+        choice = choose(device)
+    except DeviceUnusableError as exc:
+        _die(str(exc))
 
     # Loaded before anything else is reported, because everything reported about
     # the model comes off the real thing rather than off a preset.
@@ -942,6 +952,10 @@ def adapt(
             f"{sequences} sequences per step[/dim]"
         )
     console.print(f"device     {choice.label()}  [dim]{choice.reason}[/dim]")
+    if choice.remedy:
+        # On its own line, in yellow: this is the sentence that turns a silent
+        # downgrade into something the user can act on.
+        console.print(f"[yellow]           {choice.remedy}[/yellow]")
     console.print(
         f"data       {train_tokens:,} train tokens  "
         f"[dim]{config.tokens_per_step:,} tokens/step[/dim]"
@@ -1425,7 +1439,7 @@ def bench(
     _quiet_transformers()
     from bloomery import bench as bench_mod
     from bloomery.arch import resolve_spec
-    from bloomery.train.device import choose, thread_limit
+    from bloomery.train.device import DeviceUnusableError, choose, thread_limit
 
     if not size and not depth:
         size = "d12"
@@ -1436,7 +1450,10 @@ def bench(
         _die(str(exc))
 
     thread_limit(cores)
-    choice = choose(device)
+    try:
+        choice = choose(device)
+    except DeviceUnusableError as exc:
+        _die(str(exc))
 
     with console.status(f"benchmarking {spec.label} on {choice.label()}"):
         try:
@@ -1504,7 +1521,7 @@ def demo(
         train_tokenizer,
     )
     from bloomery.generate import SamplingConfig, complete, load
-    from bloomery.train.device import choose
+    from bloomery.train.device import DeviceUnusableError, choose
     from bloomery.train.loop import TrainConfig
     from bloomery.train.loop import train as run_training
 
@@ -1527,7 +1544,10 @@ def demo(
     console.print(f"[bold]3/4[/bold] packed {info.split('train').tokens:,} training tokens")
 
     spec = resolve_spec(depth=depth, vocab=len(tokenizer), seq=128, batch=16)
-    choice = choose(device)
+    try:
+        choice = choose(device)
+    except DeviceUnusableError as exc:
+        _die(str(exc))
     console.print(
         f"[bold]4/4[/bold] training {format_params(actual_param_count(spec))} params "
         f"on {choice.label()}"
