@@ -303,6 +303,13 @@ class TestPreferenceScoring:
         wins and a full unit to the denominator. The accuracy then falls for a
         reason that has nothing to do with preference — on exactly the model
         somebody is measuring to find out what went wrong.
+
+        The log-probabilities are stubbed rather than measured, so both figures
+        are arithmetic. An earlier version compared the poisoned score against
+        the clean one and asserted it had not fallen, which is not true in
+        general: dropping a pair the chosen side *won* lowers the average, as it
+        does here — 3/4 becomes 2/3. That assertion passed only because of where
+        the seeded model happened to land.
         """
         from bloomery.evaluate import EvalError, score_preferences
         from bloomery.train import objective as objective_mod
@@ -319,19 +326,23 @@ class TestPreferenceScoring:
             device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
         )
 
-        # Patched where it is defined: evaluate imports it inside the function,
-        # so there is no module attribute on bloomery.evaluate to replace.
-        real = objective_mod.sequence_logprobs
+        # Chosen wins the first three pairs and loses the fourth, so a correct
+        # clean score is exactly 0.75. Patched where it is defined: evaluate
+        # imports it inside the function, so there is no attribute on
+        # bloomery.evaluate to replace.
+        def fixed(_model: Any, _batch: dict[str, Any]) -> Any:
+            return torch.tensor([10.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0, 10.0])
 
-        def with_one_bad(model: Any, batch: dict[str, Any]) -> Any:
-            values = real(model, batch).clone()
-            # Poison the chosen side of the first pair only.
-            values[0] = float("nan")
-            return values
-
-        # Baseline: nothing poisoned.
+        monkeypatch.setattr(objective_mod, "sequence_logprobs", fixed)
         clean, _, clean_pairs = score_preferences(plain, OneBatch(), choice, batch=4, batches=1)
         assert clean_pairs == 4
+        assert clean == pytest.approx(0.75)
+
+        def with_one_bad(model: Any, batch: dict[str, Any]) -> Any:
+            values = fixed(model, batch).clone()
+            # Poison the chosen side of the first pair — one the chosen side won.
+            values[0] = float("nan")
+            return values
 
         monkeypatch.setattr(objective_mod, "sequence_logprobs", with_one_bad)
         poisoned, _, poisoned_pairs = score_preferences(
@@ -339,12 +350,12 @@ class TestPreferenceScoring:
         )
 
         assert poisoned_pairs == 3, "the unscoreable pair must leave the denominator"
-        # Whatever the remaining three did, they did it before as well: dropping
-        # one pair may not drag the figure toward zero the way counting it would.
-        assert poisoned >= clean
+        # Two of the remaining three, not three of four minus a win counted as a
+        # loss — which is 0.5 and is what the bug produced.
+        assert poisoned == pytest.approx(2 / 3)
 
         def all_bad(model: Any, batch: dict[str, Any]) -> Any:
-            return real(model, batch) * float("nan")
+            return fixed(model, batch) * float("nan")
 
         monkeypatch.setattr(objective_mod, "sequence_logprobs", all_bad)
         with pytest.raises(EvalError, match="non-finite"):
