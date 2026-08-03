@@ -549,6 +549,10 @@ class EvalResult:
 
     loss: float
     extras: dict[str, float] = field(default_factory=dict)
+    # Batches that actually contributed. Not the number asked for: a batch whose
+    # loss came back non-finite is dropped, so a caller reporting how much was
+    # measured has to be told rather than assume.
+    counted: int = 0
 
 
 def evaluate(
@@ -583,6 +587,7 @@ def evaluate(
     return EvalResult(
         loss=total / counted,
         extras={name: value / counted for name, value in extras.items()},
+        counted=counted,
     )
 
 

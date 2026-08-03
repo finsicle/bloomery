@@ -71,7 +71,6 @@ class EvalReport:
 
 def run(
     model: Any,
-    tokenizer: Any,
     dataset: Any,
     *,
     name: str,
@@ -92,7 +91,6 @@ def run(
     from bloomery.data.shards import FORMAT_DPO
     from bloomery.train.loop import evaluate, sampler_for
 
-    del tokenizer  # loaded by the caller for its own checks; not needed here
     model.to(choice.device)
 
     try:
@@ -116,7 +114,10 @@ def run(
 
     result = evaluate(model, sampler, choice, batch=batch, batches=batches)
     return EvalReport(
-        examples=batch * batches,
+        # What was scored, not what was requested. evaluate() drops a batch
+        # whose loss came back non-finite, and the preference branch above
+        # reports its true count — one field cannot mean two things.
+        examples=result.counted * batch,
         loss=result.loss,
         # exp() of a loss is a perplexity only because this loss is a
         # log-likelihood — see _perplexity in the training loop, which refuses
@@ -154,6 +155,7 @@ def score_preferences(
     from bloomery.train.loop import autocast_for
     from bloomery.train.objective import IGNORE_INDEX, sequence_logprobs
 
+    was_training = model.training
     model.eval()
     wins_by_sum = 0.0
     wins_by_token = 0.0
@@ -182,7 +184,8 @@ def score_preferences(
                     wins_by_token += won
             scored += half
 
-    model.train()
+    if was_training:
+        model.train()
     if not scored:
         raise EvalError("no preference pairs were scored; the split may be empty")
     return wins_by_sum / scored, wins_by_token / scored, scored

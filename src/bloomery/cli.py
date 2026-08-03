@@ -1348,7 +1348,6 @@ def eval_command(
     try:
         report = evaluate_mod.run(
             model,
-            model_tokenizer,
             resolved.datasets[data],
             name=data,
             checkpoint=str(target),

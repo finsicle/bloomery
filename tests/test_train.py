@@ -617,6 +617,44 @@ class TestDeviceSelection:
         assert reason
 
 
+class TestEvaluateReportsWhatItMeasured:
+    """A batch that scored nothing must not be counted as though it had.
+
+    `evaluate` drops a batch whose loss comes back non-finite — an unplaceable
+    window, or a diverging model. Anything reporting how much was measured has
+    to be told the real number rather than assume it got what it asked for.
+    """
+
+    def test_counted_is_the_batches_that_contributed(
+        self, dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        from bloomery.train.loop import BatchSampler, evaluate
+        from bloomery.train.objective import LossParts
+
+        model = build_model(
+            spec_from_depth(1, vocab=dataset.vocab_size, seq=32), eos_token_id=0, seed=0
+        )
+        sampler = BatchSampler(dataset, "train", seq=32, seed=0)
+
+        calls = {"n": 0}
+
+        def sometimes_barren(_model: Any, drawn: Any) -> Any:
+            import torch
+
+            calls["n"] += 1
+            # Every other batch scores nothing, as an unplaceable window does.
+            value = float("nan") if calls["n"] % 2 else 1.5
+            return LossParts(loss=torch.tensor(value), supervised_tokens=0)
+
+        result = evaluate(
+            model, sampler, cpu_choice, batch=2, batches=4, objective=sometimes_barren
+        )
+
+        assert calls["n"] == 4, "the sampler should still have been drawn from four times"
+        assert result.counted == 2, "only the finite batches may be counted"
+        assert result.loss == pytest.approx(1.5)
+
+
 class TestUnusableAccelerator:
     """A GPU that answers every question and then dies on its first operation.
 
