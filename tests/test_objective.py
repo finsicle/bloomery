@@ -148,33 +148,37 @@ class TestPreferenceLoss:
         Guards the cross_entropy formulation: swapping it for log_softmax puts
         these back in bf16 and nothing else in the suite would notice.
 
-        Skipped unless bloomery would itself choose bf16 on this CPU. A bf16
-        matmul on a CPU whose kernels use instructions it does not implement
-        does not raise — it takes an illegal-instruction trap and kills the
-        process where it stands. This test did exactly that to a Windows CI
-        runner: `0xc000001d`, exit 132, pytest dead at 72% through the suite.
+        Runs only where bf16 is genuinely usable on this CPU. A bf16 matmul on a
+        CPU whose kernels use instructions it does not implement does not raise —
+        it takes an illegal-instruction trap and kills the process where it
+        stands. This test did exactly that to a Windows CI runner: `0xc000001d`,
+        exit 132, pytest dead at 72% through the suite.
 
-        `select_precision` is the right gate because it is the product's own
-        full answer — the capability check *and* the out-of-process timing
-        probe. Asking only whether the CPU claims bf16 is not enough; a runner
-        that claimed it survived an 8x8 matmul and died on a 384x384 one.
+        The gate is ``_probe_precision`` and not ``select_precision``, which are
+        different questions. ``select_precision`` answers "what will bloomery
+        use here", and honours ``BLOOMERY_PRECISION`` before probing anything —
+        so a forced ``bf16`` on a CPU that cannot do it would walk straight past
+        this guard into the trap it exists to prevent. ``_probe_precision``
+        answers "can this CPU actually do it", which is the only question that
+        keeps the process alive. An environment variable is a user asserting
+        something about their hardware, and a test must not take anyone's word
+        for a claim that can kill the process rather than fail it.
+
+        Both halves of the probe matter: a runner that *claimed* bf16 survived an
+        8x8 matmul and died on a 384x384 one, which is why the capability check
+        alone is not the gate.
+
+        A consequence worth naming: on hardware without usable bf16 this body
+        does not run at all, and at the time of writing that included every CI
+        platform here. So it cannot be the only thing guarding the formulation —
+        see :meth:`test_the_autocast_asymmetry_this_relies_on`, which pins the
+        same premise with no matmul and therefore runs everywhere.
         """
         from bloomery.train.device import _probe_precision
 
-        # _probe_precision, not select_precision. The latter honours
-        # BLOOMERY_PRECISION first and returns the forced answer without probing
-        # anything — so `BLOOMERY_PRECISION=bf16` on a CPU that cannot do it
-        # would walk straight past this guard into the trap it exists to
-        # prevent. That variable is a user asserting something about their
-        # hardware, and a test must not take anyone's word for a claim that can
-        # kill the process.
         dtype, _, reason = _probe_precision(torch.device("cpu"))
         if dtype is not torch.bfloat16:
             pytest.skip(f"bf16 is not usable on this CPU: {reason}")
-        # See test_the_autocast_asymmetry_this_relies_on for the part of this
-        # that runs everywhere. Gating on real hardware means this body skips on
-        # all three CI platforms, so it cannot be the only thing guarding the
-        # formulation.
 
         model = self.adapted(plain)
         try:
