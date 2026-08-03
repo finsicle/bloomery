@@ -72,6 +72,17 @@ const FIELDS = {
     { key: "name", label: "Export name", hint: "defaults to the run's" },
     { key: "quantize", label: "Format", choices: ["f16", "q8_0", "q4_0"] },
   ],
+  eval: [
+    { key: "data", label: "Data", hint: "dataset to score against" },
+    { key: "run", label: "Run", hint: "a run name from train or adapt" },
+    { key: "checkpoint", label: "Checkpoint", hint: "a path — one of these two, not both" },
+    { key: "split", label: "Split", choices: ["val", "train"] },
+    { key: "batch", label: "Batch", type: "number", min: 1 },
+    { key: "seq", label: "Sequence length", type: "number", min: 1 },
+    { key: "batches", label: "Batches", type: "number", min: 1 },
+    { key: "device", label: "Device", choices: ["cuda", "mps", "cpu"] },
+    { key: "seed", label: "Seed", type: "number" },
+  ],
   bench: [
     { key: "size", label: "Size", choices: SIZES, hint: "named preset" },
     { key: "depth", label: "Depth", type: "number", min: 1 },
@@ -99,6 +110,7 @@ const SWITCHES = {
   ],
   // Empty, but required: SWITCHES[kind] is subscripted directly below.
   export: [],
+  eval: [],
   bench: [{ key: "grad_checkpoint", label: "Gradient checkpointing" }],
 };
 

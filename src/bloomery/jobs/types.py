@@ -28,6 +28,7 @@ class JobKind(StrEnum):
     ADAPT = "adapt"
     BENCH = "bench"
     EXPORT = "export"
+    EVAL = "eval"
 
 
 class JobStatus(StrEnum):

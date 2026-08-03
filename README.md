@@ -89,6 +89,16 @@ a milestone are not built yet — see [Roadmap](#roadmap).
   at f16, q8_0 or q4_0. LoRA adapters are folded in first, since GGUF has no
   notion of an adapter. The K-quants need llama.cpp's `llama-quantize`, and the
   command says so rather than pretending otherwise.
+- **Score a checkpoint** — `eval` runs any checkpoint against any prepared
+  dataset, so two of them can be compared. A training run's validation loss says
+  whether that run was still improving; it cannot say whether this checkpoint is
+  better than that one, because two runs report losses over their own splits. A
+  text corpus is scored by loss and perplexity, a preference corpus by how often
+  the model ranks the better answer higher — reported both as summed
+  log-probability, which is what DPO optimises, and per token, which is what
+  removes the bias toward whichever answer is shorter. No HellaSwag or MMLU:
+  models this size score at chance on them, so the numbers would look like rigour
+  and carry nothing.
 - **Teach it which answer is better** — `prepare --preference` packs
   `{prompt, chosen, rejected}` records and `adapt` trains DPO on them, against a
   reference that is the same model with its adapters switched off, so no second

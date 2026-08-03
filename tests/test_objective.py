@@ -248,6 +248,85 @@ class TestPreferenceLoss:
         assert parts.supervised_tokens == int((drawn["labels"] != IGNORE_INDEX).sum())
 
 
+class TestPreferenceScoring:
+    """The eval metric has to move when the model's preference moves.
+
+    Every other test of it checks shape and range, which a function returning a
+    constant 0.5 would also satisfy.
+    """
+
+    def test_it_tracks_which_answer_the_model_actually_prefers(self, plain: Any) -> None:
+        from bloomery.evaluate import score_preferences
+        from bloomery.train.device import DeviceChoice, select_precision
+        from bloomery.train.loop import LoraSettings, attach_adapter
+
+        drawn = preference_batch(pairs=4)
+
+        class OneBatch:
+            """A sampler that keeps handing back the same pairs, so the only
+            thing that changes between measurements is the model."""
+
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                return drawn
+
+        dtype, autocast, reason = select_precision(torch.device("cpu"))
+        choice = DeviceChoice(
+            device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
+        )
+
+        model = attach_adapter(plain, LoraSettings(r=4, alpha=8, dropout=0.0))
+        try:
+            before, _, pairs = score_preferences(model, OneBatch(), choice, batch=4, batches=1)
+            assert pairs == 4
+
+            # Train it to prefer the chosen half of this very batch. Whatever it
+            # scored before, it must score higher after.
+            optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=2.0)
+            for _ in range(30):
+                optimizer.zero_grad()
+                preference_loss(model, drawn, beta=0.1).loss.backward()
+                optimizer.step()
+
+            after, _, _ = score_preferences(model, OneBatch(), choice, batch=4, batches=1)
+        finally:
+            model.unload()
+
+        assert after > before, f"the score did not follow the model: {before} -> {after}"
+        assert after == pytest.approx(1.0), "it was trained on exactly these pairs"
+
+    def test_the_two_measures_can_disagree(self, plain: Any) -> None:
+        """Which is the whole reason both are reported.
+
+        Summed log-probability falls as an answer lengthens, so a model can win
+        on the sum by preferring brevity. Here the rejected answers are made
+        much shorter than the chosen ones, so the sum favours them while the
+        per-token mean is unaffected by the length difference.
+        """
+        from bloomery.evaluate import score_preferences
+        from bloomery.train.device import DeviceChoice, select_precision
+        from bloomery.train.objective import IGNORE_INDEX
+
+        drawn = preference_batch(pairs=4)
+        # Shorten the rejected half: mask most of its scored positions away.
+        labels = drawn["labels"].clone()
+        labels[4:, 6:] = IGNORE_INDEX
+        drawn = {**drawn, "labels": labels}
+
+        class OneBatch:
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                return drawn
+
+        dtype, autocast, reason = select_precision(torch.device("cpu"))
+        choice = DeviceChoice(
+            device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
+        )
+        by_sum, by_token, _ = score_preferences(plain, OneBatch(), choice, batch=4, batches=1)
+
+        # The short answers accumulate fewer negative terms, so they win on the
+        # sum. Per token, length buys them nothing.
+        assert by_sum < by_token, f"length bias did not show: {by_sum} vs {by_token}"
+
+
 class TestCausalLoss:
     def test_it_is_the_model_s_own_loss(self, plain: Any) -> None:
         drawn = preference_batch()

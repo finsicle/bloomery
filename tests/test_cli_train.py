@@ -1472,6 +1472,119 @@ class TestSupervisedFineTuning:
         assert "preference data" in output
         assert "--preference" in output
 
+    def test_eval_scores_a_checkpoint_on_preference_pairs(
+        self, instruct: Path, tmp_path: Path
+    ) -> None:
+        """The number that says whether preference training did anything.
+
+        A DPO run reports reward accuracy relative to where it started. This is
+        the model as it stands, so two checkpoints can be compared.
+        """
+        assert self._prepare_pairs(instruct, tmp_path).exit_code == 0
+        result = _invoke(
+            "eval",
+            "--run",
+            "b",
+            "--data",
+            "pref",
+            "--split",
+            "train",
+            "--batch",
+            "2",
+            "--batches",
+            "3",
+            "--seq",
+            "64",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        output = plain(result.stdout)
+        assert "prefers" in output
+        assert "per token" in output, "the length-bias-free number must be shown too"
+
+    def test_eval_reports_loss_on_a_text_corpus(self, instruct: Path, tmp_path: Path) -> None:
+        """Same command, different dataset, different question — as training does."""
+        # Packed against the checkpoint's own tokenizer. The `c` dataset was
+        # packed before the fixture re-saved that tokenizer with a chat
+        # template, so its bytes no longer match and the guard rightly refuses.
+        assert (
+            _invoke(
+                "prepare", "--name", "prose", "--synthetic", "400", "--tokenizer", str(instruct)
+            ).exit_code
+            == 0
+        )
+        result = _invoke(
+            "eval",
+            "--run",
+            "b",
+            "--data",
+            "prose",
+            "--split",
+            "val",
+            "--batch",
+            "2",
+            "--batches",
+            "2",
+            "--seq",
+            "32",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        output = plain(result.stdout)
+        assert "loss" in output and "perplexity" in output
+        assert "prefers" not in output, "a text corpus cannot answer a preference question"
+
+    def test_eval_json_carries_only_the_measures_that_apply(
+        self, instruct: Path, tmp_path: Path
+    ) -> None:
+        assert self._prepare_pairs(instruct, tmp_path).exit_code == 0
+        result = _invoke(
+            "eval",
+            "--run",
+            "b",
+            "--data",
+            "pref",
+            "--split",
+            "train",
+            "--json",
+            "--batch",
+            "2",
+            "--batches",
+            "2",
+            "--seq",
+            "64",
+            "--device",
+            "cpu",
+        )
+        assert result.exit_code == 0, plain(result.stdout)
+        payload = json.loads(plain(result.stdout))
+        assert payload["format"] == "dpo"
+        assert 0.0 <= payload["accuracy"] <= 1.0
+        assert "accuracy_per_token" in payload
+        # A preference loss is not a log-likelihood, so neither key belongs here.
+        assert "loss" not in payload and "perplexity" not in payload
+
+    def test_eval_refuses_a_corpus_the_model_cannot_read(
+        self, instruct: Path, isolated_home: Path, tmp_path: Path
+    ) -> None:
+        """The guard adapt applies, for the reason adapt applies it."""
+        assert (
+            _invoke("prepare", "--name", "other", "--synthetic", "400", "--vocab", "300").exit_code
+            == 0
+        )
+        result = _invoke("eval", "--run", "b", "--data", "other", "--device", "cpu")
+        assert result.exit_code == 1
+        assert "tokenizer" in plain(result.stdout)
+
+    def test_eval_needs_exactly_one_of_run_or_checkpoint(self, instruct: Path) -> None:
+        both = _invoke("eval", "--run", "b", "--checkpoint", str(instruct), "--data", "c")
+        assert both.exit_code == 1
+        assert "exactly one" in plain(both.stdout)
+        neither = _invoke("eval", "--data", "c")
+        assert neither.exit_code == 1
+
     def test_each_flag_names_the_other_when_handed_the_other_s_data(
         self, instruct: Path, tmp_path: Path
     ) -> None:

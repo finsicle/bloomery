@@ -1271,6 +1271,139 @@ def chat(
         console.print()
 
 
+@app.command("eval")
+def eval_command(
+    data: str = typer.Option(..., "--data", "-d", help="Prepared dataset to score against."),
+    run: str | None = typer.Option(None, "--run", "-r", help="Run name to load."),
+    checkpoint: Path | None = typer.Option(
+        None, "--checkpoint", "-c", help="Path to a checkpoint directory."
+    ),
+    split: str = typer.Option("val", "--split", help="Which split to score: val or train."),
+    batch: int = typer.Option(8, "--batch", help="Examples per batch."),
+    seq: int = typer.Option(512, "--seq", help="Tokens per sequence."),
+    batches: int = typer.Option(20, "--batches", help="Batches to score."),
+    seed: int = typer.Option(1337, "--seed"),
+    device: str | None = typer.Option(None, "--device", help="Force cuda / mps / cpu."),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable output."),
+) -> None:
+    """Score a checkpoint against a dataset.
+
+    Training prints a validation loss as it goes, which says whether that run was
+    still improving. It cannot say whether one checkpoint is better than another,
+    because two runs report losses over their own splits. This scores whatever
+    checkpoint you name against whatever dataset you name, so the numbers can be
+    compared.
+
+    What comes back depends on the dataset. A corpus of text is scored by how
+    well the model predicts it. A corpus of preference pairs is scored by whether
+    the model ranks the better answer higher — which is a question about
+    behaviour, and the one worth asking after `adapt` on preference data.
+    """
+    _quiet_transformers()
+    from bloomery import evaluate as evaluate_mod
+    from bloomery import mixture as mix_mod
+    from bloomery.data import load_tokenizer
+    from bloomery.train import checkpoint as ckpt
+    from bloomery.train.device import DeviceUnusableError, choose, thread_limit
+    from bloomery.train.loop import ModelLoadError, load_model
+    from bloomery.train.mixing import check_tokenizer_matches
+    from bloomery.train.mixing import resolve as resolve_mixture
+
+    if bool(run) == bool(checkpoint):
+        _die("give exactly one of --run or --checkpoint")
+    if split not in ("train", "val"):
+        _die(f"unknown split {split!r}; choose train or val")
+
+    target = checkpoint if checkpoint else ckpt.checkpoint_dir(paths.run_dir(run or ""))
+    target = ckpt.resolve(target)
+
+    try:
+        resolved = resolve_mixture(mix_mod.single(data))
+    except (mix_mod.MixtureError, FileNotFoundError) as exc:
+        _die(str(exc))
+
+    thread_limit(None)
+    try:
+        choice = choose(device)
+    except DeviceUnusableError as exc:
+        _die(str(exc))
+
+    with console.status(f"loading {target}"):
+        try:
+            model = load_model(target)
+            model_tokenizer = load_tokenizer(target)
+        except ModelLoadError as exc:
+            _die(str(exc))
+        except Exception as exc:  # noqa: BLE001 - tokenizer loading raises many types
+            _die(f"could not load the tokenizer for {target}: {exc}")
+
+    # The same guard adapt applies, for the same reason: a corpus packed with
+    # another tokenizer indexes this model's embedding table with ids that mean
+    # something else, and the loss it produces would be a number about nothing.
+    try:
+        check_tokenizer_matches(resolved, model_tokenizer, str(target))
+    except mix_mod.MixtureError as exc:
+        _die(str(exc))
+
+    try:
+        report = evaluate_mod.run(
+            model,
+            model_tokenizer,
+            resolved.datasets[data],
+            name=data,
+            checkpoint=str(target),
+            choice=choice,
+            split=split,
+            batch=batch,
+            seq=seq,
+            batches=batches,
+            seed=seed,
+        )
+    except evaluate_mod.EvalError as exc:
+        _die(str(exc))
+
+    if as_json:
+        console.print_json(json.dumps(report.to_dict()))
+        return
+    _report_eval(report)
+
+
+def _report_eval(report: Any) -> None:
+    console.print(f"checkpoint [bold]{report.checkpoint}[/bold]")
+    console.print(f"data       {report.dataset}  [dim]{report.format} · {report.split} split[/dim]")
+    console.print(f"device     {report.device}")
+
+    if report.accuracy is not None:
+        console.print(
+            f"prefers    [bold]{report.accuracy:.1%}[/bold] of {report.examples:,} pairs  "
+            f"[dim]by total log-probability[/dim]"
+        )
+        console.print(
+            f"           [bold]{report.accuracy_per_token:.1%}[/bold] per token  "
+            "[dim]length bias removed[/dim]"
+        )
+        # Summed log-probability falls as an answer gets longer, so a model can
+        # raise it by preferring brevity rather than quality. When the two
+        # disagree, that gap is what the run actually learned.
+        if abs(report.accuracy - report.accuracy_per_token) > 0.1:
+            console.print(
+                "[yellow]           the two disagree by more than 10 points, which usually "
+                "means length is doing the work rather than content[/yellow]"
+            )
+        if report.accuracy < 0.55 and report.accuracy_per_token < 0.55:
+            console.print(
+                "[yellow]           close to chance — this model does not separate the "
+                "two answers[/yellow]"
+            )
+        return
+
+    console.print(
+        f"loss       [bold]{report.loss:.4f}[/bold]  [dim]over {report.examples:,} windows[/dim]"
+    )
+    if report.perplexity is not None:
+        console.print(f"perplexity [bold]{report.perplexity:.2f}[/bold]")
+
+
 # --------------------------------------------------------------------------- #
 # export
 # --------------------------------------------------------------------------- #

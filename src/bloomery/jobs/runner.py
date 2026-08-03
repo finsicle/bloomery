@@ -165,6 +165,17 @@ _FLAGS: dict[JobKind, dict[str, str]] = {
         "name": "--name",
         "quantize": "--quantize",
     },
+    JobKind.EVAL: {
+        "data": "--data",
+        "run": "--run",
+        "checkpoint": "--checkpoint",
+        "split": "--split",
+        "batch": "--batch",
+        "seq": "--seq",
+        "batches": "--batches",
+        "device": "--device",
+        "seed": "--seed",
+    },
     JobKind.BENCH: {
         "size": "--size",
         "depth": "--depth",
@@ -194,6 +205,7 @@ _SWITCHES: dict[JobKind, dict[str, str]] = {
     # below, so a missing kind raises KeyError inside the supervisor rather
     # than a clean launch error.
     JobKind.EXPORT: {},
+    JobKind.EVAL: {},
     JobKind.BENCH: {"grad_checkpoint": "--grad-checkpoint"},
 }
 
