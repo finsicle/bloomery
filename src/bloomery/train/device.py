@@ -398,9 +398,14 @@ def _device_executes(device: torch.device, *, timeout: float = 60.0) -> bool:
     Only called for hardware :func:`unsupported_rocm_arch` has flagged, so a
     supported card never pays for it.
 
-    Sixty seconds is already generous: the probe multiplies two 512×512 matrices,
-    and the only slow part is creating the device context. A card needing longer
-    than that is not one anybody wants to train on.
+    Sixty seconds is generous by a wide margin. Measured on an RX 6700 XT: 2.5
+    seconds when the card works, nearly all of it creating the device context.
+    The timeout is what bounds the other case, where a misconfigured card hangs
+    forever — that path refuses after about 65 seconds, which is slow for an
+    error message and finite, where before it was neither.
+
+    Erring long is deliberate. Refusing a working GPU because a cold context took
+    longer than expected is a worse failure than a slow refusal of a broken one.
     """
     key = _cache_key(device)
     cached = _EXECUTES_CACHE.get(key)
