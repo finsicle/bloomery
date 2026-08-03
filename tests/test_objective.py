@@ -164,6 +164,10 @@ class TestPreferenceLoss:
         dtype, _, reason = select_precision(torch.device("cpu"))
         if dtype is not torch.bfloat16:
             pytest.skip(f"bf16 is not usable on this CPU: {reason}")
+        # See test_the_autocast_asymmetry_this_relies_on for the part of this
+        # that runs everywhere. Gating on real hardware means this body skips on
+        # all three CI platforms, so it cannot be the only thing guarding the
+        # formulation.
 
         model = self.adapted(plain)
         try:
@@ -173,6 +177,30 @@ class TestPreferenceLoss:
                 assert preference_loss(model, drawn, beta=0.1).loss.dtype is torch.float32
         finally:
             model.unload()
+
+    def test_the_autocast_asymmetry_this_relies_on(self) -> None:
+        """The premise behind choosing cross_entropy, checked without a matmul.
+
+        `sequence_logprobs` returns float32 under autocast for exactly one
+        reason: torch promotes `cross_entropy` to fp32 and leaves `log_softmax`
+        in bf16. That is a property of torch, not of this code — but this code
+        depends on it, so if it ever changed the precision would regress
+        silently and every other assertion here would still pass.
+
+        No model and no matmul, so unlike the test above this runs everywhere,
+        including on the CPUs where a bf16 matmul is fatal rather than slow.
+        """
+        import torch.nn.functional as functional
+
+        logits = torch.randn(4, 16, dtype=torch.bfloat16)
+        targets = torch.randint(0, 16, (4,))
+
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            promoted = functional.cross_entropy(logits, targets, reduction="none")
+            left_alone = functional.log_softmax(logits, dim=-1)
+
+        assert promoted.dtype is torch.float32, "cross_entropy is no longer promoted"
+        assert left_alone.dtype is torch.bfloat16, "log_softmax is no longer the risky one"
 
     def test_training_it_raises_the_margin_rather_than_lowering_it(self, plain: Any) -> None:
         """Pins the sign, which the ln(2) identity cannot: at zero it is symmetric.
