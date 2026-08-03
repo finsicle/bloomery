@@ -28,7 +28,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from bloomery.probe.backend import HSA_OVERRIDE, ROCM_SUPPORTED_ARCHS, override_hint
-from bloomery.train import _device_probe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
@@ -383,11 +382,15 @@ def unsupported_rocm_arch(device: torch.device) -> str | None:
     return arch
 
 
-def _device_executes(device: torch.device, *, timeout: float = 180.0) -> bool:
+def _device_executes(device: torch.device, *, timeout: float = 60.0) -> bool:
     """Run one operation on this device in a child process, and see if it lives.
 
     Only called for hardware :func:`unsupported_rocm_arch` has flagged, so a
     supported card never pays for it.
+
+    Sixty seconds is already generous: the probe multiplies two 512×512 matrices,
+    and the only slow part is creating the device context. A card needing longer
+    than that is not one anybody wants to train on.
     """
     key = _cache_key(device)
     cached = _EXECUTES_CACHE.get(key)
@@ -399,14 +402,21 @@ def _device_executes(device: torch.device, *, timeout: float = 180.0) -> bool:
         completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
             command, capture_output=True, text=True, timeout=timeout, check=False
         )
-        alive = completed.returncode == 0 and _device_probe.VERDICT_OK in completed.stdout
+        alive = completed.returncode == 0
         if not alive:
             log.info("device probe exited with %s on %s", completed.returncode, device)
-    except (OSError, subprocess.TimeoutExpired):
-        # Could not run the probe at all. Unlike the bf16 probe — where a
-        # failure to ask means "assume no" and costs only speed — assuming the
-        # device is dead here would refuse a working GPU. Give it the benefit of
-        # the doubt; the run will fail loudly if we were wrong.
+    except subprocess.TimeoutExpired:
+        # A timeout is an answer, not a failure to get one. An RX 6700 XT given
+        # an override naming the wrong architecture does not crash — it hangs,
+        # and so does everything downstream of it. This branch used to share the
+        # OSError case below and wave the device through, so the training run
+        # inherited the hang and sat there indefinitely.
+        log.info("device probe timed out on %s; treating it as unusable", device)
+        alive = False
+    except OSError:
+        # Genuinely could not ask: no process could be spawned. Unlike the case
+        # above, that says nothing about the device, and calling it dead would
+        # refuse a working GPU because the machine was briefly out of handles.
         log.debug("device probe could not run on %s; assuming it works", device)
         alive = True
 

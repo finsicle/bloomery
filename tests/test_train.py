@@ -720,6 +720,30 @@ class TestUnusableAccelerator:
         monkeypatch.setattr(subprocess, "run", refuse)
         assert device_mod._device_executes(torch.device("cuda")) is True
 
+    def test_a_probe_that_times_out_means_the_device_is_unusable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A hang is an answer, and a different one from "could not ask".
+
+        Measured: an RX 6700 XT given an override naming the wrong architecture
+        does not segfault, it hangs — and so does everything downstream. This
+        branch originally shared the OSError case above and waved the device
+        through, so `train` inherited the hang and sat spinning for ten minutes
+        rather than refusing in one second.
+        """
+        import subprocess
+
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        def hang(*_: Any, **__: Any) -> None:
+            raise subprocess.TimeoutExpired(cmd="probe", timeout=60.0)
+
+        device_mod.clear_precision_cache()
+        monkeypatch.setattr(subprocess, "run", hang)
+        assert device_mod._device_executes(torch.device("cuda")) is False
+
 
 class TestCpuBf16Gate:
     """Capability is read, never discovered by running a bf16 matmul.
