@@ -174,7 +174,12 @@ def arch_issues(gpus: list[GpuInfo]) -> list[Issue]:
     for gpu in gpus:
         if gpu.vendor is not Vendor.AMD or not gpu.arch:
             continue
-        arch = gpu.arch.lower()
+        # Normalised once, for both lookups. A gfx name can carry feature
+        # suffixes — gfx1100:sramecc-:xnack- — and stripping them for the
+        # override table while matching the supported set against the raw string
+        # meant a fully supported card fell through to "not in ROCm's supported
+        # target list", which is a warning about nothing.
+        arch = gpu.arch.split(":")[0].strip().lower()
         if arch in ROCM_SUPPORTED_ARCHS:
             continue
         override = override_hint(arch)

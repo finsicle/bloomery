@@ -128,6 +128,14 @@ class TestArchIssues:
     def test_case_insensitive(self) -> None:
         assert arch_issues([gpu(Vendor.AMD, arch="GFX1100")]) == []
 
+    def test_a_supported_arch_with_feature_suffixes_is_still_supported(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise a fully supported card is warned about for no reason."""
+        monkeypatch.delenv("HSA_OVERRIDE_GFX_VERSION", raising=False)
+        assert arch_issues([gpu(Vendor.AMD, arch="gfx1100:sramecc-:xnack-")]) == []
+        assert arch_issues([gpu(Vendor.AMD, arch="gfx942:sramecc+:xnack-")]) == []
+
     def test_rdna2_without_the_override_is_an_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Measured, not assumed: this is a run that cannot start, not a caution.
 

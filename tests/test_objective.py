@@ -147,7 +147,24 @@ class TestPreferenceLoss:
 
         Guards the cross_entropy formulation: swapping it for log_softmax puts
         these back in bf16 and nothing else in the suite would notice.
+
+        Skipped unless bloomery would itself choose bf16 on this CPU. A bf16
+        matmul on a CPU whose kernels use instructions it does not implement
+        does not raise — it takes an illegal-instruction trap and kills the
+        process where it stands. This test did exactly that to a Windows CI
+        runner: `0xc000001d`, exit 132, pytest dead at 72% through the suite.
+
+        `select_precision` is the right gate because it is the product's own
+        full answer — the capability check *and* the out-of-process timing
+        probe. Asking only whether the CPU claims bf16 is not enough; a runner
+        that claimed it survived an 8x8 matmul and died on a 384x384 one.
         """
+        from bloomery.train.device import select_precision
+
+        dtype, _, reason = select_precision(torch.device("cpu"))
+        if dtype is not torch.bfloat16:
+            pytest.skip(f"bf16 is not usable on this CPU: {reason}")
+
         model = self.adapted(plain)
         try:
             with torch.autocast("cpu", dtype=torch.bfloat16):
