@@ -360,15 +360,23 @@ class DeviceUnusableError(RuntimeError):
 
 
 def unsupported_rocm_arch(device: torch.device) -> str | None:
-    """This device's gfx name, when it is an AMD card ROCm does not support.
+    """This device's gfx name, when there is reason to doubt it can be used.
 
     ``None`` for anything else, including every NVIDIA card — ``gcnArchName`` is
     a ROCm-only property, so this costs one attribute read on a CUDA box and
     nothing at all on CPU or Metal.
 
     A cheap gate in front of an expensive probe, the same shape as the CPU path:
-    ask the free question first, and only spend a subprocess where the answer
+    ask the free question first, and spend a subprocess only where the answer
     gives reason to doubt.
+
+    Two such reasons. The first is the obvious one: an architecture outside
+    ROCm's supported set. The second is that ``HSA_OVERRIDE_GFX_VERSION`` is set
+    at all — because making the card claim a different architecture is precisely
+    what that variable does, so the name torch reports is no longer evidence
+    about the hardware. An RX 6700 XT with the override at 11.0.0 reports itself
+    as gfx1100, which is on the supported list, and then hangs on its first real
+    work. Asking torch cannot catch that; running something can.
     """
     import torch
 
@@ -377,7 +385,9 @@ def unsupported_rocm_arch(device: torch.device) -> str | None:
     index = device.index if device.index is not None else torch.cuda.current_device()
     arch = str(getattr(torch.cuda.get_device_properties(index), "gcnArchName", "") or "")
     arch = arch.split(":")[0].strip().lower()
-    if not arch or arch in ROCM_SUPPORTED_ARCHS:
+    if not arch:
+        return None
+    if arch in ROCM_SUPPORTED_ARCHS and not os.environ.get(HSA_OVERRIDE, "").strip():
         return None
     return arch
 
@@ -439,11 +449,16 @@ def choose(prefer: str | None = None) -> DeviceChoice:
     arch = unsupported_rocm_arch(device)
     if arch is not None and not _device_executes(device):
         override = override_hint(arch)
-        remedy = (
-            f"set {HSA_OVERRIDE}={override} to use this GPU"
-            if override
-            else f"check ROCm's compatibility matrix for {arch}"
-        )
+        setting = os.environ.get(HSA_OVERRIDE, "").strip()
+        if setting:
+            # Already set, so "set it" is no help — and the arch above came from
+            # torch, which the override has made unreliable. doctor reads the
+            # real one out of sysfs, so send them there rather than guessing.
+            remedy = f"{HSA_OVERRIDE}={setting} may be wrong for this card; run bloomery doctor"
+        elif override:
+            remedy = f"set {HSA_OVERRIDE}={override} to use this GPU"
+        else:
+            remedy = f"check ROCm's compatibility matrix for {arch}"
         if prefer:
             raise DeviceUnusableError(
                 f"{prefer} was requested, but this {arch} GPU cannot execute anything.\n"

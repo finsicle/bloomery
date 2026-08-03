@@ -675,6 +675,43 @@ class TestUnusableAccelerator:
         assert "HSA_OVERRIDE_GFX_VERSION=10.3.0" in (choice.remedy or "")
         assert len(choice.reason) < 60, "long enough to be truncated where it is printed"
 
+    def test_an_override_makes_the_reported_arch_untrustworthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The variable's whole purpose is to make the card claim to be something else.
+
+        An RX 6700 XT with HSA_OVERRIDE_GFX_VERSION=11.0.0 reports gfx1100 —
+        which is on ROCm's supported list — and then hangs on its first real
+        work. Gating the probe on the reported name alone means the override
+        defeats the check whose job is to catch it.
+        """
+        import torch
+
+        from bloomery.train import device as device_mod
+
+        properties = type("P", (), {"gcnArchName": "gfx1100:sramecc-:xnack-"})()
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "get_device_properties", lambda i: properties)
+
+        monkeypatch.delenv("HSA_OVERRIDE_GFX_VERSION", raising=False)
+        assert device_mod.unsupported_rocm_arch(torch.device("cuda")) is None
+
+        monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+        assert device_mod.unsupported_rocm_arch(torch.device("cuda")) == "gfx1100"
+
+    def test_the_remedy_does_not_tell_you_to_set_what_is_already_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+        device_mod = self.unusable(monkeypatch)
+        choice = device_mod.choose()
+
+        assert choice.type == "cpu"
+        assert "11.0.0" in (choice.remedy or "")
+        assert "doctor" in (choice.remedy or "")
+        assert "set HSA_OVERRIDE" not in (choice.remedy or "")
+
     def test_a_working_card_is_never_probed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The probe costs a subprocess, so supported hardware must not pay for it."""
         import torch
