@@ -617,6 +617,86 @@ class TestDeviceSelection:
         assert reason
 
 
+class TestEvaluateReportsWhatItMeasured:
+    """A batch that scored nothing must not be counted as though it had.
+
+    `evaluate` drops a batch whose loss comes back non-finite — an unplaceable
+    window, or a diverging model. Anything reporting how much was measured has
+    to be told the real number rather than assume it got what it asked for.
+    """
+
+    def test_counted_is_the_batches_that_contributed(
+        self, dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        from bloomery.train.loop import BatchSampler, evaluate
+        from bloomery.train.objective import LossParts
+
+        model = build_model(
+            spec_from_depth(1, vocab=dataset.vocab_size, seq=32), eos_token_id=0, seed=0
+        )
+        sampler = BatchSampler(dataset, "train", seq=32, seed=0)
+
+        calls = {"n": 0}
+
+        def sometimes_barren(_model: Any, drawn: Any) -> Any:
+            import torch
+
+            calls["n"] += 1
+            # Every other batch scores nothing, as an unplaceable window does.
+            value = float("nan") if calls["n"] % 2 else 1.5
+            return LossParts(loss=torch.tensor(value), supervised_tokens=0)
+
+        result = evaluate(
+            model, sampler, cpu_choice, batch=2, batches=4, objective=sometimes_barren
+        )
+
+        assert calls["n"] == 4, "the sampler should still have been drawn from four times"
+        assert result.counted == 2, "only the finite batches may be counted"
+        assert result.loss == pytest.approx(1.5)
+
+    def test_it_leaves_the_model_in_the_mode_it_found(
+        self, dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        """This used to end with a bare model.train().
+
+        Invisible from the training loop, which keeps the model training anyway.
+        Not invisible from `eval`, which loads a checkpoint — from_pretrained
+        hands it over in eval mode — and would have had it switched underneath.
+        """
+        from bloomery.train.loop import BatchSampler, evaluate
+
+        model = build_model(
+            spec_from_depth(1, vocab=dataset.vocab_size, seq=32), eos_token_id=0, seed=0
+        )
+        sampler = BatchSampler(dataset, "train", seq=32, seed=0)
+
+        model.eval()
+        evaluate(model, sampler, cpu_choice, batch=2, batches=1)
+        assert not model.training, "a model that arrived in eval mode was switched"
+
+        model.train()
+        evaluate(model, sampler, cpu_choice, batch=2, batches=1)
+        assert model.training, "a model that arrived in training mode was left in eval"
+
+    def test_the_mode_survives_a_failure_mid_evaluation(
+        self, dataset: Any, cpu_choice: DeviceChoice
+    ) -> None:
+        """A raise between eval() and the restore must not strand it."""
+        from bloomery.train.loop import evaluate
+
+        class Exploding:
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                raise RuntimeError("the sampler failed")
+
+        model = build_model(
+            spec_from_depth(1, vocab=dataset.vocab_size, seq=32), eos_token_id=0, seed=0
+        )
+        model.train()
+        with pytest.raises(RuntimeError, match="the sampler failed"):
+            evaluate(model, Exploding(), cpu_choice, batch=2, batches=1)
+        assert model.training, "left in eval mode after a failure"
+
+
 class TestUnusableAccelerator:
     """A GPU that answers every question and then dies on its first operation.
 

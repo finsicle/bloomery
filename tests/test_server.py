@@ -510,9 +510,32 @@ class TestWebUi:
                 f"only in runner: {sorted(expected - offered)}"
             )
 
+    def test_the_readme_names_every_kind_the_queue_accepts(self) -> None:
+        """The one mirror of this table that a person maintains by hand.
 
-# --------------------------------------------------------------------------- #
-# the stream
+        The form and the runner are checked against each other above, and the
+        page's own `<option>` list is checked by the API refusing an unknown
+        kind. The README sentence describing what the queue can run was checked
+        by nothing, and had been wrong since `export` shipped — it still said
+        "prepare, train and bench" two milestones later. A reader who wanted to
+        queue an export was told the queue could not do it.
+        """
+        import re
+        from pathlib import Path
+
+        from bloomery.jobs.types import JobKind
+
+        readme = Path(__file__).resolve().parent.parent / "README.md"
+        text = readme.read_text(encoding="utf-8")
+
+        match = re.search(r"queues ([^.]+?) jobs", text, re.DOTALL)
+        assert match, "the README no longer describes what the queue runs"
+        listed = set(re.findall(r"[a-z]+", match.group(1)))
+
+        missing = {kind.value for kind in JobKind} - listed
+        assert not missing, f"the README does not mention {sorted(missing)} among the queue's kinds"
+
+
 # --------------------------------------------------------------------------- #
 
 

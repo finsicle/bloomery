@@ -549,6 +549,10 @@ class EvalResult:
 
     loss: float
     extras: dict[str, float] = field(default_factory=dict)
+    # Batches that actually contributed. Not the number asked for: a batch whose
+    # loss came back non-finite is dropped, so a caller reporting how much was
+    # measured has to be told rather than assume.
+    counted: int = 0
 
 
 def evaluate(
@@ -563,26 +567,37 @@ def evaluate(
     """Mean loss over a fixed number of held-out batches."""
     import torch
 
+    was_training = model.training
     model.eval()
     total = 0.0
     counted = 0
     extras: dict[str, float] = {}
-    with torch.no_grad():
-        for _ in range(batches):
-            drawn = sampler.batch(batch, choice.device)
-            with autocast_for(choice):
-                parts = objective(model, drawn)
-            if torch.isfinite(parts.loss):
-                total += parts.loss.item()
-                counted += 1
-                for name, value in parts.extras.items():
-                    extras[name] = extras.get(name, 0.0) + value
-    model.train()
+    try:
+        with torch.no_grad():
+            for _ in range(batches):
+                drawn = sampler.batch(batch, choice.device)
+                with autocast_for(choice):
+                    parts = objective(model, drawn)
+                if torch.isfinite(parts.loss):
+                    total += parts.loss.item()
+                    counted += 1
+                    for name, value in parts.extras.items():
+                        extras[name] = extras.get(name, 0.0) + value
+    finally:
+        # Restored, not assumed. This used to end with a bare model.train(),
+        # which put a model that arrived in eval mode into training mode — and
+        # left one that arrived in training mode stuck in eval if anything here
+        # raised. Called mid-run the first is invisible because the loop keeps
+        # the model training anyway; called from `eval` on a freshly loaded
+        # checkpoint it silently changes what the caller handed over.
+        if was_training:
+            model.train()
     if not counted:
         return EvalResult(loss=float("nan"))
     return EvalResult(
         loss=total / counted,
         extras={name: value / counted for name, value in extras.items()},
+        counted=counted,
     )
 
 

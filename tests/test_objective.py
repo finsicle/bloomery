@@ -248,6 +248,187 @@ class TestPreferenceLoss:
         assert parts.supervised_tokens == int((drawn["labels"] != IGNORE_INDEX).sum())
 
 
+class TestPreferenceScoring:
+    """The eval metric has to move when the model's preference moves.
+
+    Every other test of it checks shape and range, which a function returning a
+    constant 0.5 would also satisfy.
+    """
+
+    def test_it_tracks_which_answer_the_model_actually_prefers(self, plain: Any) -> None:
+        from bloomery.evaluate import score_preferences
+        from bloomery.train.device import DeviceChoice, select_precision
+        from bloomery.train.loop import LoraSettings, attach_adapter
+
+        drawn = preference_batch(pairs=4)
+
+        class OneBatch:
+            """A sampler that keeps handing back the same pairs, so the only
+            thing that changes between measurements is the model."""
+
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                return drawn
+
+        dtype, autocast, reason = select_precision(torch.device("cpu"))
+        choice = DeviceChoice(
+            device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
+        )
+
+        model = attach_adapter(plain, LoraSettings(r=4, alpha=8, dropout=0.0))
+        try:
+            before, _, pairs = score_preferences(model, OneBatch(), choice, batch=4, batches=1)
+            assert pairs == 4
+
+            # Train it to prefer the chosen half of this very batch. Whatever it
+            # scored before, it must score higher after.
+            optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=2.0)
+            for _ in range(30):
+                optimizer.zero_grad()
+                preference_loss(model, drawn, beta=0.1).loss.backward()
+                optimizer.step()
+
+            after, _, _ = score_preferences(model, OneBatch(), choice, batch=4, batches=1)
+        finally:
+            model.unload()
+
+        assert after > before, f"the score did not follow the model: {before} -> {after}"
+        assert after == pytest.approx(1.0), "it was trained on exactly these pairs"
+
+    def test_a_pair_that_scores_non_finite_is_dropped_not_lost(
+        self, plain: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise a diverged checkpoint reads as merely a bad one.
+
+        Every comparison against NaN is False, so such a pair contributes no
+        wins and a full unit to the denominator. The accuracy then falls for a
+        reason that has nothing to do with preference — on exactly the model
+        somebody is measuring to find out what went wrong.
+
+        The log-probabilities are stubbed rather than measured, so both figures
+        are arithmetic. An earlier version compared the poisoned score against
+        the clean one and asserted it had not fallen, which is not true in
+        general: dropping a pair the chosen side *won* lowers the average, as it
+        does here — 3/4 becomes 2/3. That assertion passed only because of where
+        the seeded model happened to land.
+        """
+        from bloomery.evaluate import EvalError, score_preferences
+        from bloomery.train import objective as objective_mod
+        from bloomery.train.device import DeviceChoice, select_precision
+
+        drawn = preference_batch(pairs=4)
+
+        class OneBatch:
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                return drawn
+
+        dtype, autocast, reason = select_precision(torch.device("cpu"))
+        choice = DeviceChoice(
+            device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
+        )
+
+        # Chosen wins the first three pairs and loses the fourth, so a correct
+        # clean score is exactly 0.75. Patched where it is defined: evaluate
+        # imports it inside the function, so there is no attribute on
+        # bloomery.evaluate to replace.
+        def fixed(_model: Any, _batch: dict[str, Any]) -> Any:
+            return torch.tensor([10.0, 10.0, 10.0, 1.0, 1.0, 1.0, 1.0, 10.0])
+
+        monkeypatch.setattr(objective_mod, "sequence_logprobs", fixed)
+        clean, _, clean_pairs = score_preferences(plain, OneBatch(), choice, batch=4, batches=1)
+        assert clean_pairs == 4
+        assert clean == pytest.approx(0.75)
+
+        def with_one_bad(model: Any, batch: dict[str, Any]) -> Any:
+            values = fixed(model, batch).clone()
+            # Poison the chosen side of the first pair — one the chosen side won.
+            values[0] = float("nan")
+            return values
+
+        monkeypatch.setattr(objective_mod, "sequence_logprobs", with_one_bad)
+        poisoned, _, poisoned_pairs = score_preferences(
+            plain, OneBatch(), choice, batch=4, batches=1
+        )
+
+        assert poisoned_pairs == 3, "the unscoreable pair must leave the denominator"
+        # Two of the remaining three, not three of four minus a win counted as a
+        # loss — which is 0.5 and is what the bug produced.
+        assert poisoned == pytest.approx(2 / 3)
+
+        def all_bad(model: Any, batch: dict[str, Any]) -> Any:
+            return fixed(model, batch) * float("nan")
+
+        monkeypatch.setattr(objective_mod, "sequence_logprobs", all_bad)
+        with pytest.raises(EvalError, match="non-finite"):
+            score_preferences(plain, OneBatch(), choice, batch=4, batches=1)
+
+    def test_the_model_mode_survives_a_failure_mid_scoring(self, plain: Any) -> None:
+        """A raise must not strand a training model in eval mode."""
+        from bloomery.evaluate import score_preferences
+        from bloomery.train.device import DeviceChoice, select_precision
+
+        class Exploding:
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                raise RuntimeError("the sampler failed")
+
+        dtype, autocast, reason = select_precision(torch.device("cpu"))
+        choice = DeviceChoice(
+            device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
+        )
+
+        plain.train()
+        with pytest.raises(RuntimeError, match="the sampler failed"):
+            score_preferences(plain, Exploding(), choice, batch=2, batches=1)
+        assert plain.training, "left in eval mode after a failure"
+
+        plain.eval()
+        with pytest.raises(RuntimeError, match="the sampler failed"):
+            score_preferences(plain, Exploding(), choice, batch=2, batches=1)
+        assert not plain.training, "a model that arrived in eval mode was switched"
+
+    def test_the_two_measures_can_disagree(self, plain: Any) -> None:
+        """Which is the whole reason both are reported.
+
+        Summed log-probability falls as an answer lengthens, so a model can win
+        on the sum by preferring brevity. Here the rejected answers are made
+        much shorter than the chosen ones, so the sum favours them while the
+        per-token mean is unaffected by the length difference.
+        """
+        from bloomery.evaluate import score_preferences
+        from bloomery.train.device import DeviceChoice, select_precision
+        from bloomery.train.objective import IGNORE_INDEX
+
+        pairs = 16
+        drawn = preference_batch(pairs=pairs)
+        # Shorten the rejected half: mask most of its scored positions away.
+        labels = drawn["labels"].clone()
+        labels[pairs:, 6:] = IGNORE_INDEX
+        drawn = {**drawn, "labels": labels}
+
+        class OneBatch:
+            def batch(self, size: int, device: Any) -> dict[str, Any]:
+                return drawn
+
+        dtype, autocast, reason = select_precision(torch.device("cpu"))
+        choice = DeviceChoice(
+            device=torch.device("cpu"), dtype=dtype, autocast=autocast, reason=reason
+        )
+        by_sum, by_token, _ = score_preferences(plain, OneBatch(), choice, batch=pairs, batches=1)
+
+        # Two assertions rather than `by_sum < by_token`, because that comparison
+        # conflates a deterministic fact with a stochastic one and a failure
+        # would not say which broke.
+        #
+        # The sum is deterministic: an answer a third the length accumulates a
+        # third the negative terms, so the short side wins every pair. Measured
+        # at exactly 0.00 across five model seeds at 4, 16 and 32 pairs.
+        assert by_sum == 0.0, f"length should win the sum outright, got {by_sum}"
+        # The per-token figure is a coin toss for an untrained model — 0.31 to
+        # 0.56 over those same seeds — so it is bounded away from the floor
+        # rather than pinned to a value. What matters is that length did not
+        # drag it down with the sum.
+        assert by_token > 0.15, f"length bias reached the per-token measure too: {by_token}"
+
+
 class TestCausalLoss:
     def test_it_is_the_model_s_own_loss(self, plain: Any) -> None:
         drawn = preference_batch()
