@@ -125,14 +125,22 @@ a milestone are not built yet — see [Roadmap](#roadmap).
 | macOS (Apple Silicon)   | training verified on an M1 via Metal, small models only    |
 | CPU only                | training verified; toy models only                         |
 | Linux + NVIDIA          | detection covered by tests; training not yet run on real hardware |
-| Linux + AMD (ROCm)      | detection covered by tests; training not yet run on real hardware |
+| Linux + AMD (ROCm)      | training verified on an RX 6700 XT via the gfx1030 override |
 | Windows (WSL2)          | detection covered by tests; supported path on Windows      |
 | Windows (native)        | best-effort                                                |
 
 Being precise rather than optimistic: the GPU probe is exercised against captured
-vendor output on every CI run across three operating systems, but only Metal and
-CPU have had a real model trained on them so far. If you have NVIDIA or AMD
-hardware, `bloomery doctor --json` in an issue is genuinely useful.
+vendor output on every CI run across three operating systems, and Metal, CPU and
+one AMD card have had a real model trained on them. NVIDIA has not. If you have
+NVIDIA hardware, `bloomery doctor --json` in an issue is genuinely useful.
+
+The AMD run was on Ubuntu 26.04 with archive-packaged ROCm 7.1 and an RX 6700 XT
+— a card ROCm does not officially support, which needs
+`HSA_OVERRIDE_GFX_VERSION=10.3.0`. Without that variable the card answers yes to
+every question PyTorch can ask and then segfaults on its first matmul, so
+`doctor` reports it as an error and `train` refuses rather than starting a run
+that cannot finish. With it, training runs at roughly 2.5× the speed of this
+machine's CPU. An officially supported card (RDNA3 or later) needs none of this.
 
 ## Roadmap
 
