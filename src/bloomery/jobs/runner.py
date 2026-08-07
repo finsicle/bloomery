@@ -52,6 +52,76 @@ TERMINATE_GRACE_SECONDS = 10.0
 LOG_CAP_BYTES = 32 * 1024 * 1024
 LOG_KEEP_BYTES = 8 * 1024 * 1024
 
+
+def _open_log(path: Path) -> tuple[Any, bool]:
+    """Open a job's log for appending, and say whether the append is real.
+
+    Returns ``(handle, true_append)``.
+
+    Everywhere but Windows, ``open("ab")`` means ``O_APPEND``: append mode
+    belongs to the open file description, the kernel puts every write at the
+    file's current end, and truncating underneath the writer is safe.
+
+    Windows' C runtime only emulates that, by seeking to the end before each
+    write inside whichever process holds the handle. A child inheriting it
+    carries its own file pointer, so a truncation leaves its next write at the
+    old offset — NUL padding to get there, and the file instantly back to the
+    size it was.
+
+    The kernel can do the real thing. A handle opened for ``FILE_APPEND_DATA``
+    *without* ``FILE_WRITE_DATA`` has its writes redirected to end-of-file by
+    the file system, and the file pointer is ignored outright — which is
+    O_APPEND, enforced a layer below the runtime that was faking it. That is
+    what this asks for, so that a log can be bounded while its job runs rather
+    than only once the job has exited.
+
+    Falls back to the emulated open if any of it fails, and says so, because
+    being wrong in that direction costs an unbounded log while being wrong in
+    the other corrupts one.
+    """
+    if os.name != "nt":
+        return path.open("ab", buffering=0), True
+
+    try:  # pragma: no cover - exercised on the Windows matrix
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class _Security(ctypes.Structure):
+            _fields_ = (
+                ("nLength", wintypes.DWORD),
+                ("lpSecurityDescriptor", wintypes.LPVOID),
+                ("bInheritHandle", wintypes.BOOL),
+            )
+
+        file_append_data = 0x0004
+        share_all = 0x00000001 | 0x00000002 | 0x00000004
+        open_always = 4
+        normal = 0x80
+        invalid = ctypes.c_void_p(-1).value
+
+        security = _Security(ctypes.sizeof(_Security), None, True)
+        create = ctypes.windll.kernel32.CreateFileW  # type: ignore[attr-defined]
+        create.restype = wintypes.HANDLE
+        raw = create(
+            str(path),
+            file_append_data,
+            share_all,
+            ctypes.byref(security),
+            open_always,
+            normal,
+            None,
+        )
+        if raw is None or raw == invalid:
+            raise OSError(f"CreateFileW refused {path}")
+
+        descriptor = msvcrt.open_osfhandle(raw, os.O_APPEND | os.O_BINARY)  # type: ignore[attr-defined]
+        return os.fdopen(descriptor, "wb", buffering=0), True
+    except Exception:  # noqa: BLE001 - any failure means "use the emulated open"
+        log.debug("no kernel append available for %s; logs bound at exit only", path)
+        return path.open("ab", buffering=0), False
+
+
 # Whether a log can be trimmed while the job is still writing to it.
 #
 # It can wherever O_APPEND means what POSIX says: append mode belongs to the
@@ -59,19 +129,20 @@ LOG_KEEP_BYTES = 8 * 1024 * 1024
 # what happened to it in between. Truncating underneath a running job is then
 # safe — its next line simply arrives at the new end.
 #
-# Windows does not give that for an inherited handle. There, append is emulated
-# by the C runtime seeking to the end before each write, inside the process that
-# opened the file. The child receives the handle as its stdout and writes through
-# it directly, carrying its own file pointer. Truncate underneath it and the next
-# write lands at the old offset: the gap between is filled with NULs and the file
-# is immediately back to the size it was, so the trim achieves nothing and
-# corrupts the log on the way. Confirmed on the Windows matrix, which is why the
-# check is here rather than in a comment.
+# Windows' C runtime only emulates that, by seeking to the end before each write
+# inside the process holding the handle. A child inheriting it carries its own
+# file pointer, so a truncation leaves its next write at the old offset — NULs
+# filling the gap, the file instantly back to the size it was, the trim achieving
+# nothing and corrupting the log on the way. Confirmed on the Windows matrix.
 #
-# So on Windows a log is only trimmed once its job has exited and nothing holds
-# the file. That leaves a run unbounded while it is going, which is no worse than
-# before this existed, and native Windows is best-effort here anyway — under WSL2
-# this is Linux and gets the full behaviour.
+# `_open_log` asks the kernel for the real thing there, and this records whether
+# it got it. A measured fact rather than a platform guess: the emulated open is
+# still the fallback, and a log opened that way must not be trimmed underneath
+# its writer whatever the operating system is called.
+#
+# Set at launch rather than probed at import. Probing would answer for a scratch
+# file in some other directory, and the question that matters is whether the
+# handle this job is actually writing through has kernel append.
 CAN_TRIM_WHILE_WRITING = os.name != "nt"
 
 
@@ -320,7 +391,13 @@ def launch(
             command = [*prefix, *command]
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = log_path.open("ab", buffering=0)
+    handle, true_append = _open_log(log_path)
+    if not true_append:
+        # One job's log without kernel append disables trimming for all of them.
+        # The supervisor trims by path and has no per-job handle to consult, and
+        # being wrong here corrupts a log rather than merely growing one.
+        global CAN_TRIM_WHILE_WRITING  # noqa: PLW0603 - a measured capability
+        CAN_TRIM_WHILE_WRITING = False
 
     # A new session (POSIX) or process group (Windows) means the whole tree can
     # be signalled as one. Without it, killing the worker leaves any dataloader

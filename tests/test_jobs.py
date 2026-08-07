@@ -984,22 +984,25 @@ class TestLogCompaction:
         assert runner.compact_log(path, cap=4096, keep=2048) > 0
         assert path.stat().st_size < len(before)
 
-    @pytest.mark.skipif(
-        not runner.CAN_TRIM_WHILE_WRITING,
-        reason="no O_APPEND for an inherited handle on this platform",
-    )
     def test_a_job_keeps_writing_where_the_log_was_cut(self, tmp_path: Path) -> None:
         """The reason this truncates in place instead of replacing the file.
 
         The job holds an open descriptor. Renaming a replacement over the top
         would leave it writing to an unlinked inode and everything it logged
         afterwards would go nowhere. Truncating the file it already has works
-        because the runner opens the log with "ab": under O_APPEND every write
-        lands at the current end, so a shorter file just means the next line
-        arrives at the new end.
+        because every write lands at the file's current end, so a shorter file
+        just means the next line arrives at the new end.
+
+        Opened through `_open_log` rather than with "ab", which is the whole
+        point on Windows: the C runtime's emulated append would put the child's
+        next write at a stale offset. This skips only when that fallback is what
+        was returned — a property of the handle, not of the platform, so the
+        case is exercised wherever the kernel will do a real append.
         """
         path = tmp_path / "job.log"
-        handle = path.open("ab", buffering=0)
+        handle, true_append = runner._open_log(path)
+        if not true_append:
+            pytest.skip("this platform gave an emulated append, so a cut is unsafe")
         child = subprocess.Popen(
             [
                 sys.executable,
