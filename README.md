@@ -2,9 +2,12 @@
 
 **Train a language model from nothing, on your own machine.**
 
-> ⚠️ **Status: pre-alpha.** Pretraining from scratch works today, end to end:
-> tokenizer, packing, training, checkpoint, generation. No web UI yet, and no
-> support for adapting existing models. See [Roadmap](#roadmap).
+> ⚠️ **Status: pre-alpha.** The whole path works today: train a tokenizer, pack
+> a corpus, pretrain from random weights, continue someone else's checkpoint,
+> fine-tune on conversations or preference pairs, score the result and export it
+> for llama.cpp. There is a web UI and a job queue. What "pre-alpha" means here
+> is that only Metal, CPU and one AMD card have had a real model trained on
+> them — see [Hardware](#hardware) — not that pieces are missing.
 
 ```bash
 bloomery demo
@@ -69,8 +72,7 @@ at step one.
 
 The tools with the capability are CLI and YAML. The tools with the interface
 start from someone else's weights. Bloomery is from-scratch first, with
-fine-tuning as the natural next step rather than the headline. Cells marked with
-a milestone are not built yet — see [Roadmap](#roadmap).
+fine-tuning as the natural next step rather than the headline.
 
 ### Working today
 
@@ -139,7 +141,7 @@ a milestone are not built yet — see [Roadmap](#roadmap).
 | Linux + NVIDIA          | detection covered by tests; training not yet run on real hardware |
 | Linux + AMD (ROCm)      | training verified on an RX 6700 XT via the gfx1030 override |
 | Windows (WSL2)          | detection covered by tests; supported path on Windows      |
-| Windows (native)        | best-effort                                                |
+| Windows (native)        | job logs bounded; training not run on real hardware        |
 
 Being precise rather than optimistic: the GPU probe is exercised against captured
 vendor output on every CI run across three operating systems, and Metal, CPU and
@@ -166,7 +168,7 @@ machine's CPU. An officially supported card (RDNA3 or later) needs none of this.
 | **M4.1**  | Supervised fine-tuning on conversations                             | done |
 | **M5**    | Export — GGUF, quantization, Ollama                                | done |
 | **M6**    | Preference optimization — DPO on chosen/rejected pairs             | done |
-| **M7**    | AMD hardening on real hardware, Windows, evaluation                |        |
+| **M7**    | AMD hardening on real hardware, Windows, evaluation                | done |
 
 M2 came before the web UI because weighted replay is what makes "keep adding
 datasets" work instead of quietly degrading the model — and it is the part no
