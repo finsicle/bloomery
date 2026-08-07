@@ -115,8 +115,22 @@ def _open_log(path: Path) -> tuple[Any, bool]:
         if raw is None or raw == invalid:
             raise OSError(f"CreateFileW refused {path}")
 
-        descriptor = msvcrt.open_osfhandle(raw, os.O_APPEND | os.O_BINARY)  # type: ignore[attr-defined]
-        return os.fdopen(descriptor, "wb", buffering=0), True
+        # Ownership moves in two steps and each has to be unwound at the right
+        # one. open_osfhandle transfers the handle to the C runtime, so before
+        # it returns the raw handle is ours to close and afterwards it is not —
+        # closing both would be a double free, closing neither leaks a handle
+        # that keeps this log file locked for as long as the process lives.
+        try:
+            descriptor = msvcrt.open_osfhandle(raw, os.O_APPEND | os.O_BINARY)  # type: ignore[attr-defined]
+        except Exception:
+            ctypes.windll.kernel32.CloseHandle(raw)  # type: ignore[attr-defined]
+            raise
+        try:
+            return os.fdopen(descriptor, "wb", buffering=0), True
+        except Exception:
+            # The descriptor owns the handle now, so this closes both.
+            os.close(descriptor)
+            raise
     except Exception:  # noqa: BLE001 - any failure means "use the emulated open"
         log.debug("no kernel append available for %s; logs bound at exit only", path)
         return path.open("ab", buffering=0), False
@@ -155,6 +169,12 @@ class Launched:
     process: subprocess.Popen[bytes]
     command: list[str]
     limits_note: str | None
+    # Whether this job's log handle appends at the kernel's insistence rather
+    # than the C runtime's. Carried per job because it is a fact about one open
+    # handle: a global set at launch would let one job that fell back disable
+    # trimming for every other job in the process, permanently and in whatever
+    # order they happened to start.
+    true_append: bool = True
 
     @property
     def pid(self) -> int:
@@ -392,12 +412,6 @@ def launch(
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handle, true_append = _open_log(log_path)
-    if not true_append:
-        # One job's log without kernel append disables trimming for all of them.
-        # The supervisor trims by path and has no per-job handle to consult, and
-        # being wrong here corrupts a log rather than merely growing one.
-        global CAN_TRIM_WHILE_WRITING  # noqa: PLW0603 - a measured capability
-        CAN_TRIM_WHILE_WRITING = False
 
     # A new session (POSIX) or process group (Windows) means the whole tree can
     # be signalled as one. Without it, killing the worker leaves any dataloader
@@ -429,7 +443,9 @@ def launch(
         # otherwise keep the log file open for the lifetime of the supervisor.
         handle.close()
 
-    return Launched(process=process, command=command, limits_note=limits_note)
+    return Launched(
+        process=process, command=command, limits_note=limits_note, true_append=true_append
+    )
 
 
 def _readable(count: int) -> str:
@@ -452,15 +468,22 @@ def compact_log(
     cap: int | None = None,
     keep: int | None = None,
     still_writing: bool = False,
+    true_append: bool | None = None,
 ) -> int:
     """Trim an oversized log in place, keeping its most recent lines.
 
     Returns the number of bytes dropped, or 0 if nothing needed doing.
 
-    Pass ``still_writing`` when the job that owns this log is alive. On a
-    platform where truncating underneath a writer is unsafe the call then does
-    nothing, rather than corrupting the log to enforce a limit — see
-    ``CAN_TRIM_WHILE_WRITING``.
+    Pass ``still_writing`` when the job that owns this log is alive, and
+    ``true_append`` for whether its handle appends at the kernel's insistence
+    rather than the C runtime's — the property that makes truncating underneath
+    a writer safe. ``None`` means nobody knows, which is the case for a job
+    adopted from a supervisor that is gone, and resolves to the platform's
+    default: safe everywhere O_APPEND is real, unsafe on Windows where the
+    handle may have been the emulated kind.
+
+    Getting this wrong in one direction leaves a log growing; in the other it
+    corrupts one. So anything unproven counts as unsafe.
 
     The bounds are read at call time rather than bound as default arguments, so
     that setting ``runner.LOG_CAP_BYTES`` actually takes effect. A default
@@ -479,8 +502,10 @@ def compact_log(
     megabytes, and the alternative is stopping the job to take a lock on its own
     diagnostic output.
     """
-    if still_writing and not CAN_TRIM_WHILE_WRITING:
-        return 0
+    if still_writing:
+        appends = CAN_TRIM_WHILE_WRITING if true_append is None else true_append
+        if not appends:
+            return 0
 
     cap = LOG_CAP_BYTES if cap is None else cap
     keep = LOG_KEEP_BYTES if keep is None else keep

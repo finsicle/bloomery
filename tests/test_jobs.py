@@ -1072,6 +1072,48 @@ class TestLogCompaction:
         assert path.stat().st_size < oversized
         assert path.read_text(encoding="utf-8").startswith("[bloomery]")
 
+    def test_the_capability_is_per_job_not_per_process(self, tmp_path: Path) -> None:
+        """One job falling back must not disable trimming for every other job.
+
+        The first version of this set a module-level flag from `launch`, so a
+        single log that could not get a kernel append turned trimming off for
+        the whole process — permanently, and depending on which job happened to
+        start first.
+        """
+        path = tmp_path / "job.log"
+        path.write_bytes(b"line\n" * 4000)
+        before = path.stat().st_size
+
+        # Proven kernel append: safe to cut underneath the writer.
+        assert runner.compact_log(path, cap=200, keep=100, still_writing=True, true_append=True) > 0
+        assert path.stat().st_size < before
+
+        path.write_bytes(b"line\n" * 4000)
+        # Emulated append on this job, whatever any other job managed.
+        assert (
+            runner.compact_log(path, cap=200, keep=100, still_writing=True, true_append=False) == 0
+        )
+        assert path.stat().st_size == before
+
+    def test_an_unknown_handle_falls_back_to_the_platform(self, tmp_path: Path) -> None:
+        """A job adopted from a supervisor that is gone: nobody knows how it opened.
+
+        Unproven counts as unsafe, so this resolves to what the platform can be
+        relied on to do — which keeps the long-lived adopted runs bounded on
+        POSIX without risking a corrupted log on Windows.
+        """
+        path = tmp_path / "job.log"
+        path.write_bytes(b"line\n" * 4000)
+
+        dropped = runner.compact_log(path, cap=200, keep=100, still_writing=True, true_append=None)
+        assert (dropped > 0) is runner.CAN_TRIM_WHILE_WRITING
+
+    def test_a_finished_job_is_trimmed_whatever_its_handle_was(self, tmp_path: Path) -> None:
+        """Nothing holds the file, so how it was opened stopped mattering."""
+        path = tmp_path / "job.log"
+        path.write_bytes(b"line\n" * 4000)
+        assert runner.compact_log(path, cap=200, keep=100, true_append=False) > 0
+
     @pytest.mark.skipif(
         not runner.CAN_TRIM_WHILE_WRITING,
         reason="an unadopted job is still writing, so its log waits for the next restart",

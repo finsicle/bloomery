@@ -252,8 +252,11 @@ class Supervisor:
         bounded when the job exits instead.
         """
         with self._lock:
-            entries = [(entry.job_id, entry.log_path) for entry in self._running.values()]
-        adopted = {job_id for job_id, _ in entries}
+            entries: list[tuple[str, Path, bool | None]] = [
+                (entry.job_id, entry.log_path, entry.launched.true_append)
+                for entry in self._running.values()
+            ]
+        adopted = {job_id for job_id, _, _ in entries}
 
         # Jobs the store calls running that this supervisor did not start. A run
         # survives a restart, reconcile() deliberately leaves it alone rather
@@ -262,12 +265,15 @@ class Supervisor:
         # longest-lived runs, which is to say the ones whose logs get large.
         for job in self.store.running():
             if job.id not in adopted and job.log_path:
-                entries.append((job.id, Path(job.log_path)))
+                # Started by a supervisor that is gone, so nothing here knows how
+                # its handle was opened. None means "unknown", which compact_log
+                # resolves conservatively.
+                entries.append((job.id, Path(job.log_path), None))
 
         # Deliberately outside the lock: this touches the filesystem, and
         # scheduling should not wait behind a multi-megabyte rewrite.
-        for job_id, path in entries:
-            dropped = runner.compact_log(path, still_writing=True)
+        for job_id, path, appends in entries:
+            dropped = runner.compact_log(path, still_writing=True, true_append=appends)
             if dropped:
                 log.info("dropped %d bytes from the log for job %s", dropped, job_id)
 
