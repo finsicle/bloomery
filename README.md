@@ -2,12 +2,14 @@
 
 **Train a language model from nothing, on your own machine.**
 
-> ⚠️ **Status: pre-alpha.** The whole path works today: train a tokenizer, pack
-> a corpus, pretrain from random weights, continue someone else's checkpoint,
-> fine-tune on conversations or preference pairs, score the result and export it
-> for llama.cpp. There is a web UI and a job queue. What "pre-alpha" means here
-> is that only Metal, CPU and one AMD card have had a real model trained on
-> them — see [Hardware](#hardware) — not that pieces are missing.
+> ⚠️ **Status: pre-alpha.** The whole path works from the command line: train a
+> tokenizer, pack a corpus, pretrain from random weights, continue someone
+> else's checkpoint, fine-tune on conversations or preference pairs, score the
+> result and export it for llama.cpp. The web UI queues most of that but cannot
+> yet prepare conversation or preference data — see [Not built
+> yet](#not-built-yet). What "pre-alpha" means beyond that is that only Metal,
+> CPU and one AMD card have had a real model trained on them; see
+> [Hardware](#hardware).
 
 ```bash
 bloomery demo
@@ -141,7 +143,7 @@ fine-tuning as the natural next step rather than the headline.
 | Linux + NVIDIA          | detection covered by tests; training not yet run on real hardware |
 | Linux + AMD (ROCm)      | training verified on an RX 6700 XT via the gfx1030 override |
 | Windows (WSL2)          | detection covered by tests; supported path on Windows      |
-| Windows (native)        | job logs bounded; training not run on real hardware        |
+| Windows (native)        | job logs bounded live, except across a supervisor restart; training not run on real hardware |
 
 Being precise rather than optimistic: the GPU probe is exercised against captured
 vendor output on every CI run across three operating systems, and Metal, CPU and
