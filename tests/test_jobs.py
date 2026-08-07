@@ -984,22 +984,25 @@ class TestLogCompaction:
         assert runner.compact_log(path, cap=4096, keep=2048) > 0
         assert path.stat().st_size < len(before)
 
-    @pytest.mark.skipif(
-        not runner.CAN_TRIM_WHILE_WRITING,
-        reason="no O_APPEND for an inherited handle on this platform",
-    )
     def test_a_job_keeps_writing_where_the_log_was_cut(self, tmp_path: Path) -> None:
         """The reason this truncates in place instead of replacing the file.
 
         The job holds an open descriptor. Renaming a replacement over the top
         would leave it writing to an unlinked inode and everything it logged
         afterwards would go nowhere. Truncating the file it already has works
-        because the runner opens the log with "ab": under O_APPEND every write
-        lands at the current end, so a shorter file just means the next line
-        arrives at the new end.
+        because every write lands at the file's current end, so a shorter file
+        just means the next line arrives at the new end.
+
+        Opened through `_open_log` rather than with "ab", which is the whole
+        point on Windows: the C runtime's emulated append would put the child's
+        next write at a stale offset. This skips only when that fallback is what
+        was returned — a property of the handle, not of the platform, so the
+        case is exercised wherever the kernel will do a real append.
         """
         path = tmp_path / "job.log"
-        handle = path.open("ab", buffering=0)
+        handle, true_append = runner._open_log(path)
+        if not true_append:
+            pytest.skip("this platform gave an emulated append, so a cut is unsafe")
         child = subprocess.Popen(
             [
                 sys.executable,
@@ -1068,6 +1071,48 @@ class TestLogCompaction:
         assert store.get(job.id).status is JobStatus.INTERRUPTED
         assert path.stat().st_size < oversized
         assert path.read_text(encoding="utf-8").startswith("[bloomery]")
+
+    def test_the_capability_is_per_job_not_per_process(self, tmp_path: Path) -> None:
+        """One job falling back must not disable trimming for every other job.
+
+        The first version of this set a module-level flag from `launch`, so a
+        single log that could not get a kernel append turned trimming off for
+        the whole process — permanently, and depending on which job happened to
+        start first.
+        """
+        path = tmp_path / "job.log"
+        path.write_bytes(b"line\n" * 4000)
+        before = path.stat().st_size
+
+        # Proven kernel append: safe to cut underneath the writer.
+        assert runner.compact_log(path, cap=200, keep=100, still_writing=True, true_append=True) > 0
+        assert path.stat().st_size < before
+
+        path.write_bytes(b"line\n" * 4000)
+        # Emulated append on this job, whatever any other job managed.
+        assert (
+            runner.compact_log(path, cap=200, keep=100, still_writing=True, true_append=False) == 0
+        )
+        assert path.stat().st_size == before
+
+    def test_an_unknown_handle_falls_back_to_the_platform(self, tmp_path: Path) -> None:
+        """A job adopted from a supervisor that is gone: nobody knows how it opened.
+
+        Unproven counts as unsafe, so this resolves to what the platform can be
+        relied on to do — which keeps the long-lived adopted runs bounded on
+        POSIX without risking a corrupted log on Windows.
+        """
+        path = tmp_path / "job.log"
+        path.write_bytes(b"line\n" * 4000)
+
+        dropped = runner.compact_log(path, cap=200, keep=100, still_writing=True, true_append=None)
+        assert (dropped > 0) is runner.CAN_TRIM_WHILE_WRITING
+
+    def test_a_finished_job_is_trimmed_whatever_its_handle_was(self, tmp_path: Path) -> None:
+        """Nothing holds the file, so how it was opened stopped mattering."""
+        path = tmp_path / "job.log"
+        path.write_bytes(b"line\n" * 4000)
+        assert runner.compact_log(path, cap=200, keep=100, true_append=False) > 0
 
     @pytest.mark.skipif(
         not runner.CAN_TRIM_WHILE_WRITING,
